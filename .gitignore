@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+# Models generated during training
+models/
+*/models/
+*.pth
+*.pt
+*.h5
+*.keras
+*.onnx
+
+# Training history and logs
+training_history.json
+training_curve.png
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
