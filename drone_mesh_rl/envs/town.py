@@ -3,12 +3,18 @@ town.py — Seeded damaged-town layout: streets, buildings, rubble, overpasses.
 
 Buildings and overpasses are axis-aligned boxes (AABB) so collision and
 line-of-sight stay vectorized numpy — no PyBullet raycasts.
+
+Downtown buildings are street-aligned typed volumes (shop, row, mid-rise,
+tower, L-shape, setback) with cheap visual detail overlays.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pybullet as p
+
+# Nominal story height for typed buildings
+STORY = 3.5
 
 # Styles → RGBA for GUI only
 BUILDING_COLORS = {
@@ -20,6 +26,28 @@ BUILDING_COLORS = {
 }
 
 ROAD_COLOR = [0.18, 0.18, 0.20, 1.0]
+
+BUILDING_TYPE_NAMES = ("shop", "row", "midrise", "tower", "lshape", "setback")
+
+
+def _scale_rgb(rgba, factor):
+    return [
+        float(np.clip(rgba[0] * factor, 0.0, 1.0)),
+        float(np.clip(rgba[1] * factor, 0.0, 1.0)),
+        float(np.clip(rgba[2] * factor, 0.0, 1.0)),
+        float(rgba[3]),
+    ]
+
+
+def _sample_heightmap(terrain, x, y):
+    """Nearest heightmap sample; works without Terrain helpers."""
+    half_x = terrain.size_x / 2.0
+    half_y = terrain.size_y / 2.0
+    j = int((x + half_x) / terrain.resolution)
+    i = int((y + half_y) / terrain.resolution)
+    j = int(np.clip(j, 0, terrain.grid_x - 1))
+    i = int(np.clip(i, 0, terrain.grid_y - 1))
+    return float(terrain.heightmap[i, j])
 
 
 class TownLayout:
@@ -54,6 +82,12 @@ class TownLayout:
         self.styles: list[str] = []
         self.roads: list[tuple] = []
         self.overpass_indices: list[int] = []
+        # Logical downtown buildings (one entry per structure, may map to >1 AABB)
+        self.building_types: list[str] = []
+        self.buildings: list[dict] = []
+        # Visual-only detail AABBs: (xmin, ymin, zmin, xmax, ymax, zmax, rgba)
+        self.detail_parts: list[tuple] = []
+        self._ground_applied = False
 
         self._build_street_grid(half)
         self._place_buildings(half)
@@ -112,77 +146,493 @@ class TownLayout:
         self.styles.append(style)
         return len(self.styles) - 1
 
+    def _add_detail(self, xmin, ymin, zmin, xmax, ymax, zmax, rgba):
+        self.detail_parts.append(
+            (
+                float(xmin),
+                float(ymin),
+                float(zmin),
+                float(xmax),
+                float(ymax),
+                float(zmax),
+                [float(c) for c in rgba],
+            )
+        )
+
+    @staticmethod
+    def _rects_overlap(a, b, pad=0.0):
+        ax0, ax1, ay0, ay1 = a
+        bx0, bx1, by0, by1 = b
+        return not (
+            ax1 + pad <= bx0
+            or ax0 - pad >= bx1
+            or ay1 + pad <= by0
+            or ay0 - pad >= by1
+        )
+
+    def _pick_style(self, damaged=False):
+        if damaged:
+            return "charred"
+        return "brick" if self.rng.random() < 0.35 else "concrete"
+
+    def _register_building(self, btype, footprints, box_indices, style, height):
+        self.building_types.append(btype)
+        self.buildings.append(
+            {
+                "type": btype,
+                "footprints": [(float(a), float(b), float(c), float(d)) for a, b, c, d in footprints],
+                "box_indices": list(box_indices),
+                "style": style,
+                "height": float(height),
+            }
+        )
+
+    def _add_building_details(self, footprints, height, style, btype):
+        """Cheap silhouette detail: darker ground floor, roof lip, inset tone."""
+        base = BUILDING_COLORS.get(style, BUILDING_COLORS["concrete"])
+        ground_rgba = _scale_rgb(base, 0.72)
+        inset_rgba = _scale_rgb(base, 1.12 if style != "charred" else 0.85)
+        lip_rgba = _scale_rgb(base, 0.88)
+        gf_h = min(STORY, height * 0.45)
+        lip_t = 0.35
+        lip_over = 0.45
+
+        for xmin, xmax, ymin, ymax in footprints:
+            # Darker ground-floor band (slightly proud so it reads)
+            if height > 2.5:
+                self._add_detail(
+                    xmin - 0.05,
+                    ymin - 0.05,
+                    0.0,
+                    xmax + 0.05,
+                    ymax + 0.05,
+                    gf_h,
+                    ground_rgba,
+                )
+            # Thin roof lip past the walls
+            self._add_detail(
+                xmin - lip_over,
+                ymin - lip_over,
+                height - lip_t,
+                xmax + lip_over,
+                ymax + lip_over,
+                height + 0.05,
+                lip_rgba,
+            )
+
+        # Inset volume so tall boxes are not one solid color (esp. towers)
+        if btype in ("tower", "midrise", "setback") and height > 10.0:
+            primary = footprints[0]
+            xmin, xmax, ymin, ymax = primary
+            inset = 1.2 if btype == "tower" else 0.8
+            z0 = max(gf_h + 0.5, height * 0.28)
+            z1 = height - lip_t - 0.2
+            if z1 > z0 + 2.0 and (xmax - xmin) > 2 * inset + 2.0 and (ymax - ymin) > 2 * inset + 2.0:
+                self._add_detail(
+                    xmin + inset,
+                    ymin + inset,
+                    z0,
+                    xmax - inset,
+                    ymax - inset,
+                    z1,
+                    inset_rgba,
+                )
+        elif btype in ("shop", "row", "lshape") and height > 5.0:
+            # Subtle upper-band inset on the longest footprint
+            primary = max(footprints, key=lambda f: (f[1] - f[0]) * (f[3] - f[2]))
+            xmin, xmax, ymin, ymax = primary
+            inset = 0.55
+            z0 = gf_h + 0.3
+            z1 = height - lip_t - 0.15
+            if z1 > z0 + 1.0:
+                self._add_detail(
+                    xmin + inset,
+                    ymin + inset,
+                    z0,
+                    xmax - inset,
+                    ymax - inset,
+                    z1,
+                    inset_rgba,
+                )
+
+    def _footprint_free(self, xmin, xmax, ymin, ymax, placed, pad=1.2):
+        probe = (xmin, xmax, ymin, ymax)
+        for other in placed:
+            if self._rects_overlap(probe, other, pad=pad):
+                return False
+        if self._footprint_overlaps(xmin, xmax, ymin, ymax, pad=pad):
+            return False
+        return True
+
+    def _place_rect_building(
+        self,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        height,
+        btype,
+        style,
+        placed,
+    ):
+        if not self._footprint_free(xmin, xmax, ymin, ymax, placed):
+            return False
+        idx = self._add_box(xmin, ymin, 0.0, xmax, ymax, height, style)
+        fps = [(xmin, xmax, ymin, ymax)]
+        self._register_building(btype, fps, [idx], style, height)
+        self._add_building_details(fps, height, style, btype)
+        placed.append((xmin, xmax, ymin, ymax))
+        return True
+
+    def _place_lshape(
+        self,
+        edge,
+        along0,
+        depth_limit,
+        block,
+        style,
+        placed,
+        damaged=False,
+    ):
+        """Two ground boxes sharing a corner, flush to the street edge."""
+        x0, x1, y0, y1 = block
+        long_w = float(self.rng.uniform(14.0, 22.0))
+        short_w = float(self.rng.uniform(8.0, 12.0))
+        d_main = float(self.rng.uniform(8.0, 11.0))
+        d_wing = float(self.rng.uniform(10.0, 16.0))
+        height = float(self.rng.uniform(3.0, 8.0)) if damaged else float(
+            self.rng.uniform(2.0 * STORY, 4.0 * STORY)
+        )
+        wing_left = self.rng.random() < 0.5
+
+        if edge in ("s", "n"):
+            if along0 + long_w > depth_limit:
+                return False
+            a0, a1 = along0, along0 + long_w
+            if edge == "s":
+                main = (a0, a1, y0, y0 + d_main)
+                if wing_left:
+                    wing = (a0, a0 + short_w, y0, y0 + d_wing)
+                else:
+                    wing = (a1 - short_w, a1, y0, y0 + d_wing)
+            else:
+                main = (a0, a1, y1 - d_main, y1)
+                if wing_left:
+                    wing = (a0, a0 + short_w, y1 - d_wing, y1)
+                else:
+                    wing = (a1 - short_w, a1, y1 - d_wing, y1)
+        else:
+            if along0 + long_w > depth_limit:
+                return False
+            a0, a1 = along0, along0 + long_w
+            if edge == "w":
+                main = (x0, x0 + d_main, a0, a1)
+                if wing_left:
+                    wing = (x0, x0 + d_wing, a0, a0 + short_w)
+                else:
+                    wing = (x0, x0 + d_wing, a1 - short_w, a1)
+            else:
+                main = (x1 - d_main, x1, a0, a1)
+                if wing_left:
+                    wing = (x1 - d_wing, x1, a0, a0 + short_w)
+                else:
+                    wing = (x1 - d_wing, x1, a1 - short_w, a1)
+
+        for rect in (main, wing):
+            if rect[0] < x0 - 0.01 or rect[1] > x1 + 0.01 or rect[2] < y0 - 0.01 or rect[3] > y1 + 0.01:
+                return False
+            if not self._footprint_free(rect[0], rect[1], rect[2], rect[3], placed, pad=0.8):
+                return False
+
+        idxs = []
+        fps = []
+        for rect in (main, wing):
+            xmin, xmax, ymin, ymax = rect
+            idxs.append(self._add_box(xmin, ymin, 0.0, xmax, ymax, height, style))
+            fps.append((xmin, xmax, ymin, ymax))
+            placed.append((xmin, xmax, ymin, ymax))
+        self._register_building("lshape", fps, idxs, style, height)
+        self._add_building_details(fps, height, style, "lshape")
+        return True
+
+    def _place_setback(
+        self,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        style,
+        placed,
+        damaged=False,
+    ):
+        """Wide base with a smaller upper box stacked on top."""
+        if not self._footprint_free(xmin, xmax, ymin, ymax, placed):
+            return False
+        if damaged:
+            base_h = float(self.rng.uniform(3.0, 6.0))
+            top_h = float(self.rng.uniform(2.0, 4.0))
+        else:
+            base_h = float(self.rng.uniform(2.0 * STORY, 4.0 * STORY))
+            top_h = float(self.rng.uniform(2.0 * STORY, 5.0 * STORY))
+        inset = float(self.rng.uniform(1.5, 3.0))
+        tx0, tx1 = xmin + inset, xmax - inset
+        ty0, ty1 = ymin + inset, ymax - inset
+        if tx1 - tx0 < 4.0 or ty1 - ty0 < 4.0:
+            return False
+
+        i0 = self._add_box(xmin, ymin, 0.0, xmax, ymax, base_h, style)
+        i1 = self._add_box(tx0, ty0, base_h, tx1, ty1, base_h + top_h, style)
+        fps = [(xmin, xmax, ymin, ymax), (tx0, tx1, ty0, ty1)]
+        total_h = base_h + top_h
+        self._register_building("setback", fps, [i0, i1], style, total_h)
+        # Ground floor + lip on the wide base; inset/lip on the smaller crown
+        base_color = BUILDING_COLORS.get(style, BUILDING_COLORS["concrete"])
+        self._add_detail(
+            xmin - 0.05,
+            ymin - 0.05,
+            0.0,
+            xmax + 0.05,
+            ymax + 0.05,
+            min(STORY, base_h * 0.5),
+            _scale_rgb(base_color, 0.72),
+        )
+        self._add_detail(
+            tx0 - 0.4,
+            ty0 - 0.4,
+            total_h - 0.35,
+            tx1 + 0.4,
+            ty1 + 0.4,
+            total_h + 0.05,
+            _scale_rgb(base_color, 0.88),
+        )
+        inset = 0.7
+        if (tx1 - tx0) > 2 * inset + 2.0 and (ty1 - ty0) > 2 * inset + 2.0:
+            self._add_detail(
+                tx0 + inset,
+                ty0 + inset,
+                base_h + 0.4,
+                tx1 - inset,
+                ty1 - inset,
+                total_h - 0.4,
+                _scale_rgb(base_color, 1.12 if style != "charred" else 0.85),
+            )
+        placed.append((xmin, xmax, ymin, ymax))
+        return True
+
+    def _building_dims(self, btype, edge_len, lot_depth, damaged=False):
+        """Return (along_street, into_lot, height) for a rectangular type."""
+        max_along = max(6.0, edge_len - 1.0)
+        max_depth = max(6.0, min(lot_depth * 0.55, lot_depth - 2.0))
+
+        def span(lo, hi_cap):
+            hi = min(hi_cap, max_along)
+            if hi < lo:
+                return float(max(6.0, hi))
+            return float(self.rng.uniform(lo, hi))
+
+        def depth_span(lo, hi_cap):
+            hi = min(hi_cap, max_depth)
+            if hi < lo:
+                return float(max(6.0, hi))
+            return float(self.rng.uniform(lo, hi))
+
+        if damaged:
+            along = span(8.0, 14.0)
+            depth = depth_span(7.0, 11.0)
+            height = float(self.rng.uniform(2.5, 7.0))
+            return along, depth, height
+
+        if btype == "shop":
+            along = span(10.0, 18.0)
+            depth = depth_span(8.0, 12.0)
+            height = float(self.rng.uniform(1.0 * STORY, 2.0 * STORY))
+        elif btype == "row":
+            lo = min(22.0, max_along * 0.7)
+            hi = min(max_along * 0.92, max_along)
+            if hi < lo:
+                along = float(max_along)
+            else:
+                along = float(self.rng.uniform(lo, hi))
+            depth = depth_span(9.0, 14.0)
+            height = float(self.rng.uniform(2.0 * STORY, 3.2 * STORY))
+        elif btype == "midrise":
+            along = span(8.0, 14.0)
+            depth = depth_span(8.0, 12.0)
+            height = float(self.rng.uniform(4.0 * STORY, 8.0 * STORY))
+        elif btype == "tower":
+            along = span(8.0, 12.0)
+            depth = depth_span(8.0, 12.0)
+            height = float(
+                self.rng.uniform(self.altitude_cap + 5.0, self.altitude_cap + 22.0)
+            )
+        else:
+            along = span(10.0, 16.0)
+            depth = depth_span(8.0, 12.0)
+            height = float(self.rng.uniform(2.0 * STORY, 5.0 * STORY))
+        return along, depth, height
+
+    def _edge_rect(self, edge, block, along0, along1, depth):
+        """Map an along-street span + depth into a footprint on a block edge."""
+        x0, x1, y0, y1 = block
+        if edge == "s":
+            return along0, along1, y0, y0 + depth
+        if edge == "n":
+            return along0, along1, y1 - depth, y1
+        if edge == "w":
+            return x0, x0 + depth, along0, along1
+        return x1 - depth, x1, along0, along1
+
+    def _fill_block_edge(self, edge, block, placed, type_cycle, towers_left, damaged_left):
+        """Pack street-aligned buildings along one block edge with gaps."""
+        x0, x1, y0, y1 = block
+        if edge in ("s", "n"):
+            t0, t1 = x0 + 1.0, x1 - 1.0
+            lot_depth = y1 - y0
+        else:
+            t0, t1 = y0 + 1.0, y1 - 1.0
+            lot_depth = x1 - x0
+
+        cursor = t0
+        gap = float(self.rng.uniform(1.5, 3.0))
+        cursor += float(self.rng.uniform(0.0, 1.5))
+        placed_on_edge = 0
+        max_on_edge = 5
+        used_types = set()
+
+        while cursor < t1 - 8.0 and placed_on_edge < max_on_edge:
+            # Prefer unused types on this block edge for a visible mix
+            candidates = [t for t in type_cycle if t not in used_types] or list(type_cycle)
+            if towers_left[0] <= 0:
+                candidates = [t for t in candidates if t != "tower"] or [
+                    t for t in BUILDING_TYPE_NAMES if t != "tower"
+                ]
+            btype = candidates[int(self.rng.integers(0, len(candidates)))]
+
+            damaged = False
+            if damaged_left[0] > 0:
+                # Bias so a handful of short charred buildings appear citywide
+                p_dmg = 0.35 if damaged_left[0] > 2 else 0.75
+                if self.rng.random() < p_dmg:
+                    damaged = True
+                    # Damaged buildings stay short shops / rows
+                    btype = "shop" if self.rng.random() < 0.6 else "row"
+
+            style = self._pick_style(damaged=damaged)
+            edge_remaining = t1 - cursor
+
+            if btype == "lshape":
+                ok = self._place_lshape(
+                    edge, cursor, t1, block, style, placed, damaged=damaged
+                )
+                if ok:
+                    if damaged:
+                        damaged_left[0] -= 1
+                    # L long arm ~14–22 m
+                    cursor += float(self.rng.uniform(15.0, 23.0)) + gap
+                    placed_on_edge += 1
+                    used_types.add("lshape")
+                else:
+                    cursor += 2.0
+                continue
+
+            along, depth, height = self._building_dims(
+                btype, edge_remaining, lot_depth, damaged=damaged
+            )
+            if along > edge_remaining:
+                if edge_remaining < 9.0:
+                    break
+                along = edge_remaining
+                if btype == "tower":
+                    cursor += 1.0
+                    continue
+
+            xmin, xmax, ymin, ymax = self._edge_rect(
+                edge, block, cursor, cursor + along, depth
+            )
+            # Keep depth inside the lot
+            xmin = max(xmin, x0)
+            xmax = min(xmax, x1)
+            ymin = max(ymin, y0)
+            ymax = min(ymax, y1)
+            if xmax - xmin < 6.0 or ymax - ymin < 6.0:
+                cursor += 2.0
+                continue
+
+            if btype == "setback":
+                ok = self._place_setback(
+                    xmin, xmax, ymin, ymax, style, placed, damaged=damaged
+                )
+            else:
+                ok = self._place_rect_building(
+                    xmin, xmax, ymin, ymax, height, btype, style, placed
+                )
+
+            if ok:
+                if damaged:
+                    damaged_left[0] -= 1
+                if btype == "tower":
+                    towers_left[0] -= 1
+                used_types.add(btype)
+                placed_on_edge += 1
+                cursor += along + gap
+            else:
+                cursor += 2.0
+
+        return placed_on_edge
+
     def _place_buildings(self, half):
-        """2–4 buildings per block; footprints 8–18m; mix of heights/styles."""
-        style_weights = ["concrete", "concrete", "brick", "charred", "concrete"]
-        target_min, target_max = 80, 120
+        """Street-aligned typed buildings on block edges (downtown only)."""
         blocks = list(self._block_rects(half))
         self.rng.shuffle(blocks)
 
-        for x0, x1, y0, y1 in blocks:
-            if len(self.styles) >= target_max:
-                break
-            n = int(self.rng.integers(2, 5))
-            margin = 1.5
-            usable_w = (x1 - x0) - 2 * margin
-            usable_d = (y1 - y0) - 2 * margin
-            if usable_w < 8.0 or usable_d < 8.0:
-                continue
+        # Few towers / few damaged short buildings citywide
+        towers_left = [max(2, min(5, len(blocks) // 10))]
+        damaged_left = [max(4, min(10, len(blocks) // 5))]
 
+        for block in blocks:
+            x0, x1, y0, y1 = block
+            if (x1 - x0) < 14.0 or (y1 - y0) < 14.0:
+                continue
             placed = []
-            for _ in range(n):
-                if len(self.styles) >= target_max:
-                    break
-                fw = float(self.rng.uniform(8.0, min(18.0, usable_w)))
-                fd = float(self.rng.uniform(8.0, min(18.0, usable_d)))
-                cx = float(self.rng.uniform(x0 + margin + fw / 2, x1 - margin - fw / 2))
-                cy = float(self.rng.uniform(y0 + margin + fd / 2, y1 - margin - fd / 2))
+            edges = ["s", "n", "w", "e"]
+            self.rng.shuffle(edges)
+            n_edges = int(self.rng.integers(2, 5))
 
-                # Avoid overlapping footprints inside the block
-                xmin, xmax = cx - fw / 2, cx + fw / 2
-                ymin, ymax = cy - fd / 2, cy + fd / 2
-                overlap = False
-                for px0, px1, py0, py1 in placed:
-                    if not (xmax <= px0 or xmin >= px1 or ymax <= py0 or ymin >= py1):
-                        overlap = True
-                        break
-                if overlap:
-                    continue
+            # Per-block mix — include most types, tower only sometimes
+            type_cycle = ["shop", "row", "midrise", "lshape", "setback", "shop", "midrise"]
+            if towers_left[0] > 0 and self.rng.random() < 0.45:
+                type_cycle.append("tower")
+            self.rng.shuffle(type_cycle)
 
-                style = style_weights[int(self.rng.integers(0, len(style_weights)))]
-                # Damaged / shorter buildings more often for charred
-                if style == "charred":
-                    height = float(self.rng.uniform(3.0, 12.0))
-                else:
-                    roll = self.rng.random()
-                    if roll < 0.08:
-                        # Tower taller than altitude cap
-                        height = float(self.rng.uniform(self.altitude_cap + 5.0, self.altitude_cap + 25.0))
-                    elif roll < 0.35:
-                        height = float(self.rng.uniform(12.0, 28.0))
-                    else:
-                        height = float(self.rng.uniform(4.0, 12.0))
+            for edge in edges[:n_edges]:
+                self._fill_block_edge(
+                    edge, block, placed, type_cycle, towers_left, damaged_left
+                )
 
-                self._add_box(xmin, ymin, 0.0, xmax, ymax, height, style)
-                placed.append((xmin, xmax, ymin, ymax))
+        # Guarantee a handful of short damaged buildings if RNG under-delivered
+        n_charred = sum(1 for b in self.buildings if b["style"] == "charred")
+        target_dmg = max(4, min(8, len(self.buildings) // 15))
+        if n_charred < target_dmg:
+            candidates = [
+                i
+                for i, b in enumerate(self.buildings)
+                if b["style"] != "charred"
+                and b["type"] in ("shop", "row")
+                and b["height"] <= 8.0
+            ]
+            self.rng.shuffle(candidates)
+            for bi in candidates[: target_dmg - n_charred]:
+                b = self.buildings[bi]
+                b["style"] = "charred"
+                for idx in b["box_indices"]:
+                    self.styles[idx] = "charred"
+                # Shorten intact tall leftovers slightly so damage reads
+                if b["height"] > 7.0:
+                    new_h = float(self.rng.uniform(3.0, 6.5))
+                    b["height"] = new_h
+                    for idx in b["box_indices"]:
+                        self.boxes[idx, 5] = self.boxes[idx, 2] + new_h
 
-        # If under target, sprinkle extra mid-block fillers
-        attempts = 0
-        while len(self.styles) < target_min and attempts < 400:
-            attempts += 1
-            fw = float(self.rng.uniform(8.0, 14.0))
-            fd = float(self.rng.uniform(8.0, 14.0))
-            cx = float(self.rng.uniform(-half + 15, half - 15))
-            cy = float(self.rng.uniform(-half + 15, half - 15))
-            if self._on_street(cx, cy):
-                continue
-            xmin, xmax = cx - fw / 2, cx + fw / 2
-            ymin, ymax = cy - fd / 2, cy + fd / 2
-            if self._footprint_overlaps(xmin, xmax, ymin, ymax):
-                continue
-            height = float(self.rng.uniform(4.0, 18.0))
-            style = style_weights[int(self.rng.integers(0, len(style_weights)))]
-            self._add_box(xmin, ymin, 0.0, xmax, ymax, height, style)
 
     def _place_rubble(self, half):
         """Low rubble piles as short AABBs near streets / lots."""
@@ -305,6 +755,54 @@ class TownLayout:
                 self.walkable[mask] = False
 
         self.street_mask = street
+
+    def apply_ground_heights(self, terrain):
+        """
+        Shift building / overpass / detail AABB z so bases follow the heightmap.
+
+        Call after Terrain is built. Relative heights are preserved. Idempotent.
+        """
+        if self._ground_applied:
+            return
+
+        def lift_box_row(box, style):
+            xmin, ymin, zmin, xmax, ymax, zmax = box
+            cx = 0.5 * (xmin + xmax)
+            cy = 0.5 * (ymin + ymax)
+            gz = _sample_heightmap(terrain, cx, cy)
+            if style == "overpass":
+                clearance = zmin
+                thickness = zmax - zmin
+                return (xmin, ymin, gz + clearance, xmax, ymax, gz + clearance + thickness)
+            height = zmax - zmin
+            # Preserve relative stack offsets (setback crowns keep zmin > 0)
+            return (xmin, ymin, gz + zmin, xmax, ymax, gz + zmin + height)
+
+        if self.boxes.size:
+            new_boxes = self.boxes.copy()
+            for i, box in enumerate(self.boxes):
+                style = self.styles[i] if i < len(self.styles) else "concrete"
+                lifted = lift_box_row(box, style)
+                new_boxes[i] = lifted
+            self.boxes = new_boxes
+
+        if self.detail_parts:
+            lifted_details = []
+            for xmin, ymin, zmin, xmax, ymax, zmax, rgba in self.detail_parts:
+                cx = 0.5 * (xmin + xmax)
+                cy = 0.5 * (ymin + ymax)
+                gz = _sample_heightmap(terrain, cx, cy)
+                lifted_details.append(
+                    (xmin, ymin, gz + zmin, xmax, ymax, gz + zmax, rgba)
+                )
+            self.detail_parts = lifted_details
+
+        lifted_roads = []
+        for cx, cy, hx, hy, _z in self.roads:
+            gz = _sample_heightmap(terrain, cx, cy)
+            lifted_roads.append((cx, cy, hx, hy, gz + 0.06))
+        self.roads = lifted_roads
+        self._ground_applied = True
 
     # ------------------------------------------------------------------
     # Queries
@@ -479,6 +977,10 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
     grid = terrain.grid_x
     size = float(env_size)
 
+    town.apply_ground_heights(terrain)
+    if hasattr(terrain, "set_obstacle_boxes"):
+        terrain.set_obstacle_boxes(town.boxes)
+
     terrain_shape = p.createCollisionShape(
         p.GEOM_HEIGHTFIELD,
         meshScale=[size / grid, size / grid, 1.0],
@@ -487,9 +989,15 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
         numHeightfieldColumns=grid,
         physicsClientId=client,
     )
+    # PyBullet centers the heightfield AABB at the body origin; lift so
+    # world Z matches heightmap samples used by buildings / roads.
+    hmin = float(np.min(terrain.heightmap))
+    hmax = float(np.max(terrain.heightmap))
+    mid = 0.5 * (hmin + hmax)
     terrain_body = p.createMultiBody(
         baseMass=0,
         baseCollisionShapeIndex=terrain_shape,
+        basePosition=[0.0, 0.0, mid],
         physicsClientId=client,
     )
     # Gray-brown dusty ground (not forest green)
@@ -518,20 +1026,18 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
         road_bodies.append(bid)
 
     building_bodies = []
-    for i, box in enumerate(town.boxes):
-        xmin, ymin, zmin, xmax, ymax, zmax = box
+
+    def _spawn_box(xmin, ymin, zmin, xmax, ymax, zmax, rgba):
         hx = (xmax - xmin) / 2.0
         hy = (ymax - ymin) / 2.0
-        hz = (zmax - zmin) / 2.0
+        hz = max((zmax - zmin) / 2.0, 0.05)
         cx = (xmin + xmax) / 2.0
         cy = (ymin + ymax) / 2.0
         cz = (zmin + zmax) / 2.0
-        style = town.styles[i]
-        color = BUILDING_COLORS.get(style, BUILDING_COLORS["concrete"])
         vis = p.createVisualShape(
             p.GEOM_BOX,
             halfExtents=[hx, hy, hz],
-            rgbaColor=color,
+            rgbaColor=rgba,
             physicsClientId=client,
         )
         bid = p.createMultiBody(
@@ -542,6 +1048,17 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
             physicsClientId=client,
         )
         building_bodies.append(bid)
+
+    for i, box in enumerate(town.boxes):
+        xmin, ymin, zmin, xmax, ymax, zmax = box
+        style = town.styles[i]
+        color = BUILDING_COLORS.get(style, BUILDING_COLORS["concrete"])
+        _spawn_box(xmin, ymin, zmin, xmax, ymax, zmax, color)
+
+    # Ground floors, roof lips, inset tones (visual only)
+    for part in town.detail_parts:
+        xmin, ymin, zmin, xmax, ymax, zmax, rgba = part
+        _spawn_box(xmin, ymin, zmin, xmax, ymax, zmax, rgba)
 
     return terrain_body, road_bodies, building_bodies
 
