@@ -25,7 +25,7 @@ import numpy as np
 import pybullet as p
 
 from .terrain import _write_png_rgb
-from .town import _sample_heightmap
+from .town import SIGN_POST_COLOR, _sample_heightmap
 
 _WINDOW_TEX_NAME = "district_windows.png"
 _ROAD_TEX_NAME = "district_road.png"
@@ -1466,11 +1466,21 @@ def find_rubble_town_site(
 
 
 def _broken_road_texture_path(filename=_BROKEN_ROAD_TEX_NAME, tex_w=96, tex_h=256):
-    """Dark cracked asphalt — no sidewalks, no center-line polish."""
+    """
+    Cracked asphalt with painted lane marks. Road UVs map u across the
+    street (columns) and v along it (rows), tiling every 8 m, so this
+    image is one 8 m repeat:
+
+      - yellow dashed center line: 3.2 m paint, 4.8 m gap (paint / gap /
+        paint once the ribbon tiles)
+      - thin solid white line inset from each asphalt edge
+    """
     path = os.path.join(os.path.dirname(__file__), filename)
     pavement = np.array([36, 34, 32], dtype=np.uint8)
     stain = np.array([48, 44, 40], dtype=np.uint8)
     crack = np.array([18, 16, 15], dtype=np.uint8)
+    yellow = np.array([230, 200, 50], dtype=np.uint8)
+    white = np.array([228, 226, 220], dtype=np.uint8)
     rgb = np.empty((tex_h, tex_w, 3), dtype=np.uint8)
     rgb[:] = pavement
     rng = np.random.default_rng(19)
@@ -1494,6 +1504,16 @@ def _broken_road_texture_path(filename=_BROKEN_ROAD_TEX_NAME, tex_w=96, tex_h=25
             x += vx
             y += vy
             vx += float(rng.normal(0.0, 0.08))
+
+    # u = 0/1 at the asphalt edges; v = 0..1 is one 8 m street repeat.
+    edge = max(2, tex_w // 20)
+    stripe = max(2, tex_w // 48)
+    rgb[:, edge : edge + stripe] = white
+    rgb[:, tex_w - edge - stripe : tex_w - edge] = white
+    c0 = tex_w // 2 - max(1, tex_w // 32)
+    c1 = tex_w // 2 + max(1, tex_w // 32)
+    paint = int(round(0.40 * tex_h))
+    rgb[:paint, c0:c1] = yellow
     _write_png_rgb(path, rgb)
     return path
 
@@ -2626,6 +2646,330 @@ def spawn_district_in_pybullet(client, district, window_tex=None, road_tex=None)
             f"pieces={ruin_pieces} (merged per shell)"
         )
     return wall_bodies + roof_bodies + road_bodies + prop_bodies + ruin_bodies
+
+
+_SIGN_BOARD_RGBS = (
+    [0.76, 0.14, 0.12, 1.0],  # stop-sign red
+    [0.90, 0.76, 0.12, 1.0],  # yellow warning
+    [0.16, 0.48, 0.28, 1.0],  # green direction
+)
+_N_RUBBLE_SIGNS = 10
+_N_RUBBLE_TREES = 40
+_N_RUBBLE_GRASS = 12
+_SIGN_PERSON_PAD = 2.8
+_DRESS_SHELL_PAD = 1.4
+_DRESS_STREET_PAD = 0.35
+
+
+def _in_rubble_shell(town, x, y, pad=_DRESS_SHELL_PAD):
+    for ruin in getattr(town, "ruins", []) or []:
+        if (
+            ruin["xmin"] - pad <= x <= ruin["xmax"] + pad
+            and ruin["ymin"] - pad <= y <= ruin["ymax"] + pad
+        ):
+            return True
+    for tower in getattr(town, "towers", []) or []:
+        if (
+            tower["xmin"] - pad <= x <= tower["xmax"] + pad
+            and tower["ymin"] - pad <= y <= tower["ymax"] + pad
+        ):
+            return True
+    return False
+
+
+def _near_people(x, y, people_xy, pad=_SIGN_PERSON_PAD):
+    if people_xy is None:
+        return False
+    for px, py in people_xy:
+        if math.hypot(x - float(px), y - float(py)) < pad:
+            return True
+    return False
+
+
+def _in_map_square(x, y, hx, hy, margin=4.0):
+    return abs(x) <= hx - margin and abs(y) <= hy - margin
+
+
+def _rubble_sidewalk_sites(town, offset=1.55, step=8.0):
+    """Curb-side points just off the asphalt, with a facing flag toward the street."""
+    half_w = 0.5 * _BROKEN_ROAD_WIDTH
+    sites = []
+    for road in town.roads:
+        line = road.get("centerline") or []
+        if len(line) < 2:
+            continue
+        samples = _resample_polyline(line, step)
+        if len(samples) < 2:
+            continue
+        for i, (x, y) in enumerate(samples):
+            if i + 1 < len(samples):
+                tx, ty = samples[i + 1][0] - x, samples[i + 1][1] - y
+            else:
+                tx, ty = x - samples[i - 1][0], y - samples[i - 1][1]
+            ln = math.hypot(tx, ty) or 1.0
+            nx, ny = -ty / ln, tx / ln
+            along_x = abs(tx) >= abs(ty)
+            facing_x = not along_x
+            for side in (-1.0, 1.0):
+                sx = x + side * nx * (half_w + offset)
+                sy = y + side * ny * (half_w + offset)
+                sites.append((float(sx), float(sy), bool(facing_x)))
+    return sites
+
+
+def _dress_spot_ok(town, x, y, people_xy, hx, hy, need_off_street=True):
+    if not _in_map_square(x, y, hx, hy):
+        return False
+    if _in_rubble_shell(town, x, y):
+        return False
+    if _near_people(x, y, people_xy):
+        return False
+    if need_off_street and hasattr(town, "is_street") and town.is_street(x, y):
+        return False
+    return True
+
+
+def _layout_rubble_signs(town, people_xy, hx, hy, rng, n=_N_RUBBLE_SIGNS):
+    cands = [
+        site
+        for site in _rubble_sidewalk_sites(town, offset=1.7, step=10.0)
+        if _dress_spot_ok(town, site[0], site[1], people_xy, hx, hy)
+    ]
+    rng.shuffle(cands)
+    picked = []
+    for min_sep in (28.0, 20.0, 14.0, 10.0):
+        picked = []
+        for x, y, facing_x in cands:
+            if any(math.hypot(x - px, y - py) < min_sep for px, py, _f, _c in picked):
+                continue
+            color = list(_SIGN_BOARD_RGBS[len(picked) % len(_SIGN_BOARD_RGBS)])
+            picked.append((x, y, facing_x, color))
+            if len(picked) >= n:
+                return picked
+    return picked
+
+
+def _sign_pieces(terrain, x, y, facing_x, board_rgba):
+    """One post + one board, same sizes as town._add_sign, sitting on the ground."""
+    gz = _sample_heightmap(terrain, x, y)
+    post_w, post_h = 0.08, 2.4
+    board_w, board_d, board_h = 1.1, 0.06, 0.7
+    board_z0 = gz + 1.5
+    pieces = [
+        {
+            "hx": post_w,
+            "hy": post_w,
+            "hz": 0.5 * post_h,
+            "cx": float(x),
+            "cy": float(y),
+            "z": gz + 0.02 + 0.5 * post_h,
+            "orn": [0.0, 0.0, 0.0, 1.0],
+            "rgba": list(SIGN_POST_COLOR),
+        }
+    ]
+    if facing_x:
+        pieces.append(
+            {
+                "hx": 0.5 * board_d,
+                "hy": 0.5 * board_w,
+                "hz": 0.5 * board_h,
+                "cx": float(x),
+                "cy": float(y),
+                "z": board_z0 + 0.5 * board_h,
+                "orn": [0.0, 0.0, 0.0, 1.0],
+                "rgba": list(board_rgba),
+            }
+        )
+    else:
+        pieces.append(
+            {
+                "hx": 0.5 * board_w,
+                "hy": 0.5 * board_d,
+                "hz": 0.5 * board_h,
+                "cx": float(x),
+                "cy": float(y),
+                "z": board_z0 + 0.5 * board_h,
+                "orn": [0.0, 0.0, 0.0, 1.0],
+                "rgba": list(board_rgba),
+            }
+        )
+    return pieces
+
+
+def _perimeter_xy(hx, hy, s, inset):
+    w = max(2.0, 2.0 * (hx - inset))
+    h = max(2.0, 2.0 * (hy - inset))
+    perim = 2.0 * (w + h)
+    u = (float(s) % 1.0) * perim
+    if u < w:
+        return -hx + inset + u, -hy + inset
+    u -= w
+    if u < h:
+        return hx - inset, -hy + inset + u
+    u -= h
+    if u < w:
+        return hx - inset - u, hy - inset
+    u -= w
+    return -hx + inset, hy - inset - u
+
+
+def _layout_rubble_greenery(town, people_xy, hx, hy, rng):
+    """About 40 trees plus a few grass patches. Sidewalk clumps + ragged border."""
+    from .scenery import _cluster_offsets
+
+    sidewalk = [
+        (x, y)
+        for x, y, _f in _rubble_sidewalk_sites(town, offset=2.1, step=7.0)
+        if _dress_spot_ok(town, x, y, people_xy, hx, hy)
+    ]
+    rng.shuffle(sidewalk)
+
+    trees = []
+    grass = []
+
+    def _add_tree(x, y, stem):
+        if not _dress_spot_ok(town, x, y, people_xy, hx, hy):
+            return False
+        if any(math.hypot(x - tx, y - ty) < 2.4 for tx, ty, _s, _yw in trees):
+            return False
+        trees.append((float(x), float(y), stem, float(rng.uniform(0.0, 2.0 * math.pi))))
+        return True
+
+    n_walk_clumps = 8
+    walk_centers = []
+    for x, y in sidewalk:
+        if any(math.hypot(x - cx, y - cy) < 16.0 for cx, cy in walk_centers):
+            continue
+        walk_centers.append((x, y))
+        if len(walk_centers) >= n_walk_clumps:
+            break
+    for i, (cx, cy) in enumerate(walk_centers):
+        n_local = 2 if i % 3 else 3
+        for ox, oy in _cluster_offsets(rng, n_local, 3.2, 1.6):
+            stem = "tree-high" if (len(trees) % 3 == 0) else "tree"
+            _add_tree(cx + ox, cy + oy, stem)
+        if len(grass) < 6 and _dress_spot_ok(town, cx, cy, people_xy, hx, hy):
+            grass.append((cx, cy, "patch-grass", float(rng.uniform(0.0, 2.0 * math.pi))))
+
+    n_border_clumps = 8
+    for k in range(n_border_clumps):
+        s = (k + float(rng.uniform(-0.08, 0.08))) / n_border_clumps
+        inset = float(rng.uniform(8.0, 20.0))
+        bx, by = _perimeter_xy(hx, hy, s, inset)
+        bx += float(rng.uniform(-6.0, 6.0))
+        by += float(rng.uniform(-6.0, 6.0))
+        if not _dress_spot_ok(town, bx, by, people_xy, hx, hy):
+            for _try in range(6):
+                s2 = float(rng.random())
+                inset2 = float(rng.uniform(7.0, 22.0))
+                bx, by = _perimeter_xy(hx, hy, s2, inset2)
+                if _dress_spot_ok(town, bx, by, people_xy, hx, hy):
+                    break
+            else:
+                continue
+        n_local = int(rng.integers(2, 5))
+        for ox, oy in _cluster_offsets(rng, n_local, 4.5, 1.8):
+            if len(trees) >= _N_RUBBLE_TREES:
+                break
+            stem = "tree-high" if rng.random() < 0.35 else "tree"
+            _add_tree(bx + ox, by + oy, stem)
+        if len(grass) < _N_RUBBLE_GRASS and _dress_spot_ok(town, bx, by, people_xy, hx, hy):
+            grass.append((bx, by, "patch-grass", float(rng.uniform(0.0, 2.0 * math.pi))))
+        if len(trees) >= _N_RUBBLE_TREES:
+            break
+
+    for x, y in sidewalk:
+        if len(trees) >= _N_RUBBLE_TREES:
+            break
+        stem = "tree-high" if rng.random() < 0.3 else "tree"
+        _add_tree(x, y, stem)
+
+    trees = trees[:_N_RUBBLE_TREES]
+    for x, y in sidewalk:
+        if len(grass) >= _N_RUBBLE_GRASS:
+            break
+        if any(math.hypot(x - gx, y - gy) < 12.0 for gx, gy, _s, _yw in grass):
+            continue
+        if _dress_spot_ok(town, x, y, people_xy, hx, hy):
+            grass.append((x, y, "patch-grass", float(rng.uniform(0.0, 2.0 * math.pi))))
+    return trees, grass[:_N_RUBBLE_GRASS]
+
+
+def spawn_rubble_town_dressing(client, town, terrain, people_xy=None, map_hx=None, map_hy=None):
+    """
+    Visual-only roadside signs and Kenney greenery. One body per sign, meshes
+    loaded once. Never writes town.boxes and never adds collision.
+    """
+    hx = float(map_hx if map_hx is not None else 0.5 * float(getattr(town, "size", 240.0)))
+    hy = float(map_hy if map_hy is not None else hx)
+    people = []
+    if people_xy is not None and len(people_xy) > 0:
+        arr = np.asarray(people_xy, dtype=np.float64)
+        people = [(float(row[0]), float(row[1])) for row in arr]
+    rng = np.random.default_rng(int(getattr(town, "seed", 71)) + 401)
+
+    signs = _layout_rubble_signs(town, people, hx, hy, rng)
+    sign_bodies = 0
+    for x, y, facing_x, color in signs:
+        bid = _spawn_merged_box_visual(client, _sign_pieces(terrain, x, y, facing_x, color))
+        if bid is not None:
+            sign_bodies += 1
+
+    n_trees = 0
+    n_grass = 0
+    try:
+        from .scenery import _MeshBank, _PATCH_LIFT
+
+        bank = _MeshBank(client)
+        loaded = []
+        for stem in ("tree", "tree-high", "plant", "patch-grass"):
+            try:
+                bank.load(stem)
+                loaded.append(stem)
+            except (FileNotFoundError, RuntimeError, OSError):
+                continue
+        if loaded:
+            trees, grass = _layout_rubble_greenery(town, people, hx, hy, rng)
+            if "plant" in loaded:
+                extras = [
+                    site
+                    for site in _rubble_sidewalk_sites(town, offset=2.4, step=14.0)
+                    if _dress_spot_ok(town, site[0], site[1], people, hx, hy)
+                ]
+                rng.shuffle(extras)
+                for x, y, _f in extras[:6]:
+                    try:
+                        bank.sit(terrain, "plant", x, y, float(rng.uniform(0.0, 6.0)))
+                    except Exception:
+                        pass
+            for x, y, stem, yaw in trees:
+                if stem not in bank.vis:
+                    stem = "tree" if "tree" in bank.vis else next(iter(bank.vis), None)
+                if stem is None:
+                    continue
+                try:
+                    bank.sit(terrain, stem, x, y, yaw)
+                    n_trees += 1
+                except Exception:
+                    continue
+            for x, y, stem, yaw in grass:
+                use = stem if stem in bank.vis else None
+                if use is None:
+                    continue
+                try:
+                    bank.sit(terrain, use, x, y, yaw, lift=_PATCH_LIFT)
+                    n_grass += 1
+                except Exception:
+                    continue
+    except Exception:
+        n_trees = 0
+        n_grass = 0
+
+    print(
+        f"[RUBBLE-TOWN] dressing signs={sign_bodies}  trees={n_trees}  "
+        f"grass={n_grass} (visual only, no collision)"
+    )
+    return sign_bodies, n_trees, n_grass
 
 
 def spawn_rubble_town_in_pybullet(client, town):
