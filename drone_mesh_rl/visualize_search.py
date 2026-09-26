@@ -87,6 +87,10 @@ class SearchCamera:
         self.home_pitch = -89.0
         self.home_dist = max(80.0, float(env_size) * 1.05)
         self.home_target = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        self._applied_yaw = None
+        self._applied_pitch = None
+        self._applied_dist = None
+        self._applied_target = None
         self.reset_overview()
 
     def reset_overview(self):
@@ -95,7 +99,23 @@ class SearchCamera:
         self.dist = self.home_dist
         self.target = self.home_target.copy()
         self.follow = None
+        self._apply_camera_if_changed()
+
+    def _apply_camera_if_changed(self):
+        last = self._applied_target
+        if (
+            last is not None
+            and self._applied_yaw == self.yaw
+            and self._applied_pitch == self.pitch
+            and self._applied_dist == self.dist
+            and np.array_equal(last, self.target)
+        ):
+            return
         apply_orbit_camera(self.client, self.yaw, self.pitch, self.dist, self.target)
+        self._applied_yaw = self.yaw
+        self._applied_pitch = self.pitch
+        self._applied_dist = self.dist
+        self._applied_target = np.asarray(self.target, dtype=np.float64).copy()
 
     def _pan(self, dx, dy, scale):
         if self.pitch <= -70.0:
@@ -156,8 +176,44 @@ class SearchCamera:
             pos = np.asarray(drone_positions[idx], dtype=np.float64)
             self.target = pos + np.array([0.0, 0.0, 1.2], dtype=np.float64)
 
-        apply_orbit_camera(self.client, self.yaw, self.pitch, self.dist, self.target)
+        self._apply_camera_if_changed()
         return self.follow
+
+
+def _search_drone_tag(index, alive):
+    return f"D{index}" if alive else f"D{index} DEAD"
+
+
+class SearchDroneLabels:
+    """D0/D1/... text above each search drone, replaced in place (no wipe)."""
+
+    def __init__(self, client, num_drones):
+        self.client = client
+        self.num_drones = int(num_drones)
+        self.item_ids = [-1] * self.num_drones
+        self._last = [None] * self.num_drones
+
+    def sync(self, drone_positions, drone_alive, follow=None):
+        for i in range(self.num_drones):
+            alive = bool(drone_alive[i])
+            tag = _search_drone_tag(i, alive)
+            color = [0.2, 0.5, 1.0] if alive else [1.0, 0.05, 0.05]
+            size = 1.4 if follow == i else 1.0
+            pos = np.asarray(drone_positions[i], dtype=np.float64)
+            xyz = [float(pos[0]), float(pos[1]), float(pos[2]) + 1.2]
+            key = (tag, tuple(color), size, round(xyz[0], 3), round(xyz[1], 3), round(xyz[2], 3))
+            if self.item_ids[i] >= 0 and self._last[i] == key:
+                continue
+            kwargs = {
+                "textColorRGB": color,
+                "textSize": size,
+                "physicsClientId": self.client,
+            }
+            if self.item_ids[i] >= 0:
+                kwargs["replaceItemUniqueId"] = self.item_ids[i]
+            item_id = int(p.addUserDebugText(tag, xyz, **kwargs))
+            self.item_ids[i] = item_id
+            self._last[i] = None if item_id < 0 else key
 
 
 def main():
@@ -230,6 +286,9 @@ def main():
     step_num = 0
     cam = SearchCamera(env.client, args.num_drones, args.env_size)
     prev_alive = np.ones(args.num_drones, dtype=bool)
+    search_labels = (
+        SearchDroneLabels(env.client, args.num_drones) if args.task == "search" else None
+    )
 
     try:
         while True:
@@ -249,12 +308,15 @@ def main():
                 step_num = 0
                 prev_alive[:] = True
                 cam = SearchCamera(env.client, args.num_drones, args.env_size)
+                if args.task == "search":
+                    search_labels = SearchDroneLabels(env.client, args.num_drones)
                 continue
 
             cam.handle(keys, env.drone_positions)
 
             if not paused:
-                playback = 4 if args.task == "search" else 1
+                # One physics/policy step per displayed frame. HUD below is ~2 Hz.
+                playback = 1
                 for _ in range(playback):
                     step_num += 1
 
@@ -339,10 +401,12 @@ def main():
                         obs_dict, info_dict = env.reset()
                         step_num = 0
                         prev_alive[:] = True
+                        if args.task == "search":
+                            search_labels = SearchDroneLabels(env.client, args.num_drones)
                         break
 
-                # Debug text is expensive in the GUI. Refresh it a few times a second.
-                if step_num % 15 == 0:
+                # Mesh still refreshes its overlay. Search labels are replaced in place above.
+                if args.task != "search" and step_num % 15 == 0:
                     p.removeAllUserDebugItems(physicsClientId=env.client)
 
                     alive_indices = [i for i in range(args.num_drones) if env.drone_alive[i]]
@@ -469,6 +533,13 @@ def main():
                         textSize=1.2,
                         physicsClientId=env.client,
                     )
+
+            if search_labels is not None:
+                search_labels.sync(
+                    env.drone_positions,
+                    env.drone_alive,
+                    follow=cam.follow,
+                )
 
             # Cap frame rate
             elapsed = time.time() - loop_start

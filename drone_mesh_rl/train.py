@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Continue from save_path instead of random weights")
     parser.add_argument("--save_freq", type=int, default=10, help="Save frequency in iterations")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--bc_steps", type=int, default=0, help="Search only: imitate the coverage heading for N steps before PPO. 0 = 6000 on discrete search.")
+    parser.add_argument("--bc_steps", type=int, default=None, help="Search only: imitate the coverage heading for N steps before PPO. Unset = 6000 on discrete search; 0 skips BC.")
     parser.add_argument("--bc_coef", type=float, default=0.1, help="Search only: keep imitating the unpainted-cell heading during PPO.")
     return parser.parse_args()
 
@@ -221,8 +221,8 @@ def main():
         print(f"[RESUME] No checkpoint at {args.save_path}, starting random.")
     optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
-    if args.task == "search" and discrete and args.bc_steps <= 0:
-        args.bc_steps = 6000
+    if args.bc_steps is None:
+        args.bc_steps = 6000 if (args.task == "search" and discrete) else 0
     if args.task == "search" and args.bc_steps > 0 and discrete:
         behavior_clone_headings(
             env, model, optimizer, env.possible_agents, args.device, steps=args.bc_steps

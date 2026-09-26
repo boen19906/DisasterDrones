@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import tempfile
 
 import numpy as np
 import pybullet as p
@@ -2311,6 +2312,118 @@ def _load_shared_district_textures(client):
     return tex_id, road_tex
 
 
+def _spawn_merged_box_visual(client, pieces):
+    """One visual-only mesh: one createVisualShape + one createMultiBody.
+
+    Pieces stay on the layout for numpy AABB collision. This path never
+    adds PyBullet collision shapes.
+    """
+    if not pieces:
+        return None
+    ox = sum(float(pc["cx"]) for pc in pieces) / len(pieces)
+    oy = sum(float(pc["cy"]) for pc in pieces) / len(pieces)
+    oz = sum(float(pc["z"]) for pc in pieces) / len(pieces)
+    vis, atlas_tex = _bake_colored_box_mesh(client, pieces, (ox, oy, oz))
+    if vis is None or int(vis) < 0:
+        n = len(pieces)
+        vis = p.createVisualShapeArray(
+            shapeTypes=[p.GEOM_BOX] * n,
+            halfExtents=[
+                [float(pc["hx"]), float(pc["hy"]), float(pc["hz"])] for pc in pieces
+            ],
+            rgbaColors=[list(pc["rgba"]) for pc in pieces],
+            visualFramePositions=[
+                [float(pc["cx"]) - ox, float(pc["cy"]) - oy, float(pc["z"]) - oz]
+                for pc in pieces
+            ],
+            visualFrameOrientations=[list(pc["orn"]) for pc in pieces],
+            physicsClientId=client,
+        )
+        atlas_tex = None
+    bid = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=vis,
+        basePosition=[ox, oy, oz],
+        physicsClientId=client,
+    )
+    if atlas_tex is not None and int(atlas_tex) >= 0:
+        try:
+            p.changeVisualShape(
+                bid, -1, textureUniqueId=atlas_tex, physicsClientId=client
+            )
+        except Exception:
+            pass
+    return bid
+
+
+_BOX_CORNERS = (
+    (-1.0, -1.0, -1.0),
+    (1.0, -1.0, -1.0),
+    (1.0, 1.0, -1.0),
+    (-1.0, 1.0, -1.0),
+    (-1.0, -1.0, 1.0),
+    (1.0, -1.0, 1.0),
+    (1.0, 1.0, 1.0),
+    (-1.0, 1.0, 1.0),
+)
+_BOX_FACES = (
+    (4, 5, 6, 7),
+    (0, 3, 2, 1),
+    (0, 1, 5, 4),
+    (2, 3, 7, 6),
+    (0, 4, 7, 3),
+    (1, 2, 6, 5),
+)
+
+
+def _bake_colored_box_mesh(client, pieces, origin):
+    """Single GEOM_MESH plus a 1-pixel-per-piece color atlas."""
+    ox, oy, oz = origin
+    verts, indices, uvs = [], [], []
+    n = len(pieces)
+    rgb = np.zeros((1, max(n, 1), 3), dtype=np.uint8)
+    for i, pc in enumerate(pieces):
+        hx, hy, hz = float(pc["hx"]), float(pc["hy"]), float(pc["hz"])
+        rgba = pc["rgba"]
+        rgb[0, i] = [
+            int(round(255.0 * float(rgba[0]))),
+            int(round(255.0 * float(rgba[1]))),
+            int(round(255.0 * float(rgba[2]))),
+        ]
+        u = (i + 0.5) / float(n)
+        base = len(verts)
+        for sx, sy, sz in _BOX_CORNERS:
+            rx, ry, rz = _quat_rotate(pc["orn"], (sx * hx, sy * hy, sz * hz))
+            verts.append(
+                [
+                    float(pc["cx"]) + rx - ox,
+                    float(pc["cy"]) + ry - oy,
+                    float(pc["z"]) + rz - oz,
+                ]
+            )
+            uvs.append([u, 0.5])
+        for face in _BOX_FACES:
+            indices.extend([base + face[0], base + face[1], base + face[2]])
+            indices.extend([base + face[0], base + face[2], base + face[3]])
+    vis = p.createVisualShape(
+        p.GEOM_MESH,
+        vertices=verts,
+        indices=indices,
+        uvs=uvs,
+        rgbaColor=[1.0, 1.0, 1.0, 1.0],
+        physicsClientId=client,
+    )
+    fd, atlas_path = tempfile.mkstemp(prefix="ruin_atlas_", suffix=".png")
+    os.close(fd)
+    _write_png_rgb(atlas_path, rgb)
+    try:
+        tex = p.loadTexture(atlas_path, physicsClientId=client)
+    except Exception:
+        tex = -1
+    return vis, tex
+
+
 def spawn_districts_in_pybullet(client, districts):
     """Spawn every district using one window PNG and one road PNG."""
     window_tex, road_tex = _load_shared_district_textures(client)
@@ -2489,27 +2602,16 @@ def spawn_district_in_pybullet(client, district, window_tex=None, road_tex=None)
     )
 
     ruin_bodies = []
+    ruin_pieces = 0
     for ruin in getattr(district, "ruins", []) or []:
-        for piece in ruin["pieces"]:
-            vis = p.createVisualShape(
-                p.GEOM_BOX,
-                halfExtents=[piece["hx"], piece["hy"], piece["hz"]],
-                rgbaColor=piece["rgba"],
-                physicsClientId=client,
-            )
-            ruin_bodies.append(
-                p.createMultiBody(
-                    baseMass=0,
-                    baseCollisionShapeIndex=-1,
-                    baseVisualShapeIndex=vis,
-                    basePosition=[piece["cx"], piece["cy"], piece["z"]],
-                    baseOrientation=piece["orn"],
-                    physicsClientId=client,
-                )
-            )
+        ruin_pieces += len(ruin["pieces"])
+        bid = _spawn_merged_box_visual(client, ruin["pieces"])
+        if bid is not None:
+            ruin_bodies.append(bid)
     if district.ruins:
         print(
-            f"[DISTRICT] ruin_bodies={len(ruin_bodies)}  ruins={len(district.ruins)}"
+            f"[DISTRICT] ruin_bodies={len(ruin_bodies)}  ruins={len(district.ruins)}  "
+            f"pieces={ruin_pieces} (merged per shell)"
         )
     return wall_bodies + roof_bodies + road_bodies + prop_bodies + ruin_bodies
 
@@ -2565,44 +2667,35 @@ def spawn_rubble_town_in_pybullet(client, town):
         road_bodies.append(bid)
 
     ruin_bodies = []
+    ruin_pieces = 0
     for ruin in town.ruins:
-        for piece in ruin["pieces"]:
-            vis = p.createVisualShape(
-                p.GEOM_BOX,
-                halfExtents=[piece["hx"], piece["hy"], piece["hz"]],
-                rgbaColor=piece["rgba"],
-                physicsClientId=client,
-            )
-            ruin_bodies.append(
-                p.createMultiBody(
-                    baseMass=0,
-                    baseCollisionShapeIndex=-1,
-                    baseVisualShapeIndex=vis,
-                    basePosition=[piece["cx"], piece["cy"], piece["z"]],
-                    baseOrientation=piece["orn"],
-                    physicsClientId=client,
-                )
-            )
+        ruin_pieces += len(ruin["pieces"])
+        bid = _spawn_merged_box_visual(client, ruin["pieces"])
+        if bid is not None:
+            ruin_bodies.append(bid)
     tower_bodies = []
     for tower in getattr(town, "towers", []) or []:
-        vis = p.createVisualShape(
-            p.GEOM_BOX,
-            halfExtents=[tower["hx"], tower["hy"], tower["hz"]],
-            rgbaColor=tower["rgba"],
-            physicsClientId=client,
+        bid = _spawn_merged_box_visual(
+            client,
+            [
+                {
+                    "hx": float(tower["hx"]),
+                    "hy": float(tower["hy"]),
+                    "hz": float(tower["hz"]),
+                    "cx": float(tower["cx"]),
+                    "cy": float(tower["cy"]),
+                    "z": float(tower["z"]),
+                    "orn": [0.0, 0.0, 0.0, 1.0],
+                    "rgba": list(tower["rgba"]),
+                }
+            ],
         )
-        tower_bodies.append(
-            p.createMultiBody(
-                baseMass=0,
-                baseCollisionShapeIndex=-1,
-                baseVisualShapeIndex=vis,
-                basePosition=[tower["cx"], tower["cy"], tower["z"]],
-                physicsClientId=client,
-            )
-        )
+        if bid is not None:
+            tower_bodies.append(bid)
     print(
         f"[RUBBLE-TOWN] slabs={len(road_bodies)}  ruin_bodies={len(ruin_bodies)}  "
-        f"shells={len(town.ruins)}  towers={len(tower_bodies)}  "
+        f"shells={len(town.ruins)}  pieces={ruin_pieces} (merged per shell)  "
+        f"towers={len(tower_bodies)} (merged per tower)  "
         f"tex={os.path.basename(road_path)}"
     )
     return road_bodies + ruin_bodies + tower_bodies

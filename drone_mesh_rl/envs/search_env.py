@@ -201,6 +201,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.town = None
         self.person_torso_ids = []
         self.person_head_ids = []
+        self._person_vis_discovered = np.zeros(0, dtype=bool)
+        self.capsule_color_updates = 0
+        self.capsule_pose_updates = 0
 
         self._observation_spaces = {
             agent: spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
@@ -1294,35 +1297,36 @@ class SurvivorSearchEnv(ParallelEnv):
             )
             self.person_torso_ids.append(torso)
             self.person_head_ids.append(head)
+        n = len(self.person_torso_ids)
+        self._person_vis_discovered = np.array(
+            [bool(self.survivors.discovered[i]) for i in range(n)],
+            dtype=bool,
+        )
+        self.capsule_color_updates = 0
+        self.capsule_pose_updates = 0
 
     def _sync_person_capsules(self):
+        """Survivors are frozen. Recolor only the person whose discovered flag flipped."""
         if self.client is None or not self.person_torso_ids:
             return
-        positions = self.survivors.get_positions()
-        orn = [0, 0, 0, 1]
         n = min(len(self.person_torso_ids), self.survivors.num_survivors)
+        vis = self._person_vis_discovered
+        if vis is None or len(vis) != n:
+            vis = np.zeros(n, dtype=bool)
+            self._person_vis_discovered = vis
         for i in range(n):
-            x, y, z = float(positions[i][0]), float(positions[i][1]), float(positions[i][2])
-            ground = z - 0.3
-            rgba = self._person_rgba(bool(self.survivors.discovered[i]))
-            p.resetBasePositionAndOrientation(
-                self.person_torso_ids[i],
-                [x, y, ground + 0.95],
-                orn,
-                physicsClientId=self.client,
-            )
-            p.resetBasePositionAndOrientation(
-                self.person_head_ids[i],
-                [x, y, ground + 1.85],
-                orn,
-                physicsClientId=self.client,
-            )
+            found = bool(self.survivors.discovered[i])
+            if found == bool(vis[i]):
+                continue
+            rgba = self._person_rgba(found)
             p.changeVisualShape(
                 self.person_torso_ids[i], -1, rgbaColor=rgba, physicsClientId=self.client
             )
             p.changeVisualShape(
                 self.person_head_ids[i], -1, rgbaColor=rgba, physicsClientId=self.client
             )
+            vis[i] = found
+            self.capsule_color_updates += 1
 
     def reset(self, seed=None, options=None):
         if seed is not None:
