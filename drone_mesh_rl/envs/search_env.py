@@ -2,15 +2,24 @@
 search_env.py — V1 multi-agent search: find as many survivors as possible.
 
 Fog-of-war coverage. A survivor is found when a drone flies over them
-(XY distance <= 5 m). No mesh, satellite, battery, or buildings.
+(XY distance <= sensor_radius). No mesh, satellite, battery, or buildings.
 
-Rewards (shared unless noted):
-  +10.0  each newly found survivor (primary)
-  +50.0  all survivors found
-  +~3.0  one full new 5 m sensor disk of coverage (~1/3.5 of a find)
-  -0.01  per step
-  -0.0004 per already-covered cell still under a sensor (light revisit / overlap)
-  -5.0   drone-drone collision (that drone only)
+Each action is one of 9 grid moves (8 neighbors or stay). A move into the
+wall is replaced by a legal heading toward unfinished ground.
+The chosen heading is flown at full speed for one kinematic step. Altitude
+is locked to hover. Every drone reads the same coarse coverage map and a
+vector toward the middle of the remaining unpainted region. That vector is
+not a chase reward.
+
+Rewards:
+  +1.0   each newly painted cell, paid only to the drone that painted it
+  +10.0  each newly found survivor (shared)
+  +50.0  all survivors found (shared)
+  -0.25  per step a drone paints nothing and is only re-covering searched cells
+  -0.01  per step (shared)
+  -1.0   drone-drone collision (that drone only)
+  -1.0   not moving while cells or people remain (that drone only)
+  -8.0   per survivor still missing, on the timeout step only
 """
 
 import functools
@@ -29,6 +38,27 @@ from .terrain import Terrain
 
 
 COVER_CROP = 7  # local visited-map window (odd)
+GLOBAL_BINS = 8  # coarse coverage map for the training critic
+N_ACTIONS = 9
+
+# Eight neighbor headings, plus stay. Stay on the wall is turned back inward.
+_HEADING_XY = np.array(
+    [
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+        [-1.0, 1.0],
+        [-1.0, 0.0],
+        [-1.0, -1.0],
+        [0.0, -1.0],
+        [1.0, -1.0],
+        [0.0, 0.0],
+    ],
+    dtype=np.float64,
+)
+_HEADING_NORM = np.linalg.norm(_HEADING_XY, axis=1)
+_HEADING_NORM[_HEADING_NORM == 0.0] = 1.0
+_HEADING_XY = _HEADING_XY / _HEADING_NORM[:, None]
 
 
 class SurvivorSearchEnv(ParallelEnv):
@@ -48,12 +78,12 @@ class SurvivorSearchEnv(ParallelEnv):
         env_size=100.0,
         max_steps=800,
         render_mode=None,
-        drone_max_speed=4.0,
+        drone_max_speed=12.0,
         drone_max_altitude=20.0,
         hover_altitude=8.0,
-        sensor_radius=5.0,
+        sensor_radius=8.0,
         cover_cells=20,
-        pyb_freq=30,
+        pyb_freq=10,
         seed=None,
     ):
         super().__init__()
@@ -67,19 +97,26 @@ class SurvivorSearchEnv(ParallelEnv):
         self.drone_max_altitude = drone_max_altitude
         self.hover_altitude = hover_altitude
         self.sensor_radius = sensor_radius
-        self.cover_cells = cover_cells
+        self.cover_cells = max(int(cover_cells), int(round(float(env_size) / 5.0)))
         self.pyb_freq = pyb_freq
         self._seed = seed
 
         self.possible_agents = [f"drone_{i}" for i in range(num_drones)]
         self.agents = list(self.possible_agents)
 
-        self.obs_dim = 6 + 3 * (num_drones - 1) + 2 + COVER_CROP * COVER_CROP
-        self.act_dim = 3
+        # Vel, shared-map heading, walls, teammates, progress, local crop, shared map
+        self.obs_dim = (
+            2 + 2 + 4 + 2 * (num_drones - 1) + 2 + COVER_CROP * COVER_CROP + GLOBAL_BINS * GLOBAL_BINS
+        )
+        self.discrete_actions = True
+        self.n_actions = N_ACTIONS
+        self.act_dim = N_ACTIONS
+        self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 2 * num_drones
 
         self.terrain = None
         self.survivors = None
-        self.coverage = np.zeros((cover_cells, cover_cells), dtype=np.float32)
+        self.coverage = np.zeros((self.cover_cells, self.cover_cells), dtype=np.float32)
+        self.visit_age = np.zeros((self.cover_cells, self.cover_cells), dtype=np.float32)
         self.drone_positions = np.zeros((num_drones, 3))
         self.drone_velocities = np.zeros((num_drones, 3))
         self.drone_alive = np.ones(num_drones, dtype=bool)
@@ -87,6 +124,8 @@ class SurvivorSearchEnv(ParallelEnv):
         self.newly_discovered = 0
         self.new_cells = 0
         self.overlap_cells = 0
+        self._prev_uncovered_dist = np.zeros(num_drones, dtype=np.float32)
+        self._prev_frontier_dist = np.zeros(num_drones, dtype=np.float32)
 
         self.client = None
         self.drone_ids = []
@@ -97,8 +136,7 @@ class SurvivorSearchEnv(ParallelEnv):
             for agent in self.possible_agents
         }
         self._action_spaces = {
-            agent: spaces.Box(low=-1.0, high=1.0, shape=(self.act_dim,), dtype=np.float32)
-            for agent in self.possible_agents
+            agent: spaces.Discrete(self.n_actions) for agent in self.possible_agents
         }
 
     @functools.lru_cache(maxsize=None)
@@ -118,12 +156,22 @@ class SurvivorSearchEnv(ParallelEnv):
         return gx, gy
 
     def _mark_coverage(self, positions):
-        """Paint sensor footprints; return newly covered cells and overlap count."""
+        """Paint a cell only when the whole cell was inside the sensor.
+
+        Otherwise a survivor near the cell edge is marked 'searched' without
+        ever being found, and the policy never comes back.
+        """
         new_cells = 0
         overlap = 0
+        per_drone = np.zeros(len(positions), dtype=np.int32)
+        per_overlap = np.zeros(len(positions), dtype=np.int32)
+        # Snapshot so a cell painted earlier this step is not also overlap.
+        already = self.coverage >= 1.0
         cell_m = self.env_size / self.cover_cells
-        radius_cells = max(1, int(np.ceil(self.sensor_radius / cell_m)))
-        for pos in positions:
+        half_diag = cell_m * np.sqrt(2.0) / 2.0
+        paint_radius = max(cell_m * 0.5, self.sensor_radius - half_diag)
+        radius_cells = max(1, int(np.ceil(paint_radius / cell_m)))
+        for i, pos in enumerate(positions):
             cx, cy = self._world_to_cell(pos[0], pos[1])
             for dx in range(-radius_cells, radius_cells + 1):
                 for dy in range(-radius_cells, radius_cells + 1):
@@ -132,13 +180,18 @@ class SurvivorSearchEnv(ParallelEnv):
                         continue
                     wx = (gx + 0.5) / self.cover_cells * self.env_size - self.env_size / 2.0
                     wy = (gy + 0.5) / self.cover_cells * self.env_size - self.env_size / 2.0
-                    if np.hypot(wx - pos[0], wy - pos[1]) > self.sensor_radius:
+                    if np.hypot(wx - pos[0], wy - pos[1]) > paint_radius:
                         continue
-                    if self.coverage[gy, gx] >= 1.0:
+                    if already[gy, gx]:
                         overlap += 1
-                    else:
+                        per_overlap[i] += 1
+                    elif self.coverage[gy, gx] < 1.0:
                         new_cells += 1
+                        per_drone[i] += 1
                     self.coverage[gy, gx] = 1.0
+                    self.visit_age[gy, gx] = 0.0
+        self._drone_new_cells = per_drone
+        self._drone_overlap = per_overlap
         return new_cells, overlap
 
     def _coverage_crop(self, x, y):
@@ -151,16 +204,237 @@ class SurvivorSearchEnv(ParallelEnv):
                     crop[i, j] = self.coverage[dy, dx]
         return crop.ravel()
 
+    def _uncovered_targets(self, sector=None):
+        uncovered = np.argwhere(self.coverage < 0.5)
+        if uncovered.shape[0] == 0:
+            return None
+        half = self.env_size / 2.0
+        cells = uncovered.astype(np.float32)
+        wx = (cells[:, 1] + 0.5) / self.cover_cells * self.env_size - half
+        wy = (cells[:, 0] + 0.5) / self.cover_cells * self.env_size - half
+        if sector is not None:
+            width = self.env_size / self.num_drones
+            x0 = -half + sector * width
+            x1 = x0 + width
+            keep = (wx >= x0) & (wx < x1)
+            if not np.any(keep):
+                return None
+            wx, wy = wx[keep], wy[keep]
+        return wx, wy
+
+    def _frontier_xy(self, drone_idx, x, y):
+        """Middle of the remaining unpainted patch in this drone's strip.
+
+        Aiming at the nearest edge cell makes a deterministic policy orbit
+        that patch and miss whoever is inside it.
+        """
+        pts = self._uncovered_targets(sector=drone_idx)
+        if pts is None:
+            pts = self._uncovered_targets()
+        if pts is None:
+            return 0.0, 0.0
+        wx, wy = pts
+        return float((np.mean(wx) - x) / self.env_size), float((np.mean(wy) - y) / self.env_size)
+
+    def _search_heading(self, x, y):
+        """Direction to the middle of the ground the team has not searched yet.
+
+        The nearest unpainted cell makes a deterministic policy orbit that
+        edge. The centroid pulls the drone across the remaining region.
+        """
+        pts = self._uncovered_targets()
+        if pts is not None:
+            wx, wy = pts
+            return float((np.mean(wx) - x) / self.env_size), float((np.mean(wy) - y) / self.env_size)
+        if self.survivors is not None and not bool(np.all(self.survivors.discovered)):
+            gy, gx = np.unravel_index(int(np.argmax(self.visit_age)), self.visit_age.shape)
+            half = self.env_size / 2.0
+            wx = (gx + 0.5) / self.cover_cells * self.env_size - half
+            wy = (gy + 0.5) / self.cover_cells * self.env_size - half
+            return float((wx - x) / self.env_size), float((wy - y) / self.env_size)
+        return 0.0, 0.0
+
+    def _shared_map(self):
+        """Coarse coverage grid the whole team paints and every drone can read."""
+        bins = GLOBAL_BINS
+        g = self.cover_cells
+        small = np.zeros((bins, bins), dtype=np.float32)
+        for iy in range(bins):
+            y0 = iy * g // bins
+            y1 = max(y0 + 1, (iy + 1) * g // bins)
+            for ix in range(bins):
+                x0 = ix * g // bins
+                x1 = max(x0 + 1, (ix + 1) * g // bins)
+                small[iy, ix] = float(self.coverage[y0:y1, x0:x1].mean())
+        return small.ravel()
+
+    def global_state(self):
+        """Shared coverage map plus normalized drone XY, for the critic."""
+        half = max(self.env_size / 2.0, 1.0)
+        pos = (self.drone_positions[:, :2] / half).astype(np.float32).ravel()
+        return np.concatenate([self._shared_map(), pos])
+
+    def _nearest_uncovered_xy(self, x, y):
+        pts = self._uncovered_targets()
+        if pts is None:
+            return 0.0, 0.0
+        wx, wy = pts
+        dist = np.hypot(wx - x, wy - y)
+        k = int(np.argmin(dist))
+        return float((wx[k] - x) / self.env_size), float((wy[k] - y) / self.env_size)
+
+    def _uncovered_dist(self, x, y):
+        pts = self._uncovered_targets()
+        if pts is None:
+            return 0.0
+        wx, wy = pts
+        return float(np.min(np.hypot(wx - x, wy - y)))
+
+    def _assigned_survivor_xy(self, drone_idx):
+        """Each drone gets a distinct unfound survivor (greedy by id)."""
+        mask = ~self.survivors.discovered
+        if not np.any(mask):
+            return 0.0, 0.0
+        pts = self.survivors.positions[mask, :2].copy()
+        taken = np.zeros(len(pts), dtype=bool)
+        target = np.zeros(2, dtype=np.float64)
+        for i in range(self.num_drones):
+            pos = self.drone_positions[i, :2]
+            dist = np.linalg.norm(pts - pos, axis=1)
+            dist[taken] = np.inf
+            k = int(np.argmin(dist))
+            if not np.isfinite(dist[k]):
+                break
+            taken[k] = True
+            if i == drone_idx:
+                target = pts[k] - pos
+                break
+        return float(target[0] / self.env_size), float(target[1] / self.env_size)
+
+    def _on_border(self, pos, margin=0.4):
+        limit = self.env_size / 2.0 - 1.0
+        return abs(pos[0]) >= limit - margin or abs(pos[1]) >= limit - margin
+
+    def _heading_blocked(self, pos, heading):
+        """True when this heading only pushes into a wall the drone is already on."""
+        limit = self.env_size / 2.0 - 1.0
+        x, y = float(pos[0]), float(pos[1])
+        hx, hy = float(heading[0]), float(heading[1])
+        if x >= limit - 0.4 and hx > 0.1:
+            return True
+        if x <= -limit + 0.4 and hx < -0.1:
+            return True
+        if y >= limit - 0.4 and hy > 0.1:
+            return True
+        if y <= -limit + 0.4 and hy < -0.1:
+            return True
+        return False
+
+    def _best_legal_heading(self, pos, ux, uy):
+        """Neighbor heading toward (ux, uy) that does not point out of the map."""
+        best = None
+        best_dot = -np.inf
+        for heading in _HEADING_XY:
+            if self._heading_blocked(pos, heading):
+                continue
+            dot = float(heading[0]) * float(ux) + float(heading[1]) * float(uy)
+            if dot > best_dot:
+                best_dot = dot
+                best = heading
+        if best is None:
+            inward = np.array([-np.sign(pos[0]), -np.sign(pos[1])], dtype=np.float64)
+            norm = float(np.linalg.norm(inward))
+            best = np.array([1.0, 0.0]) if norm < 1e-6 else inward / norm
+        return best
+
+    def _move_with_soft_walls(self, pos, vel, dt, half):
+        """Kinematic motion. A move into the wall turns back toward unfinished cells."""
+        pos = np.asarray(pos, dtype=np.float64).copy()
+        vel = np.asarray(vel, dtype=np.float64).copy()
+        heading = vel[:2]
+        speed = float(np.hypot(heading[0], heading[1]))
+        if speed > 0.5 and self._heading_blocked(pos, heading):
+            ux, uy = self._search_heading(pos[0], pos[1])
+            if abs(ux) + abs(uy) < 1e-6:
+                ux, uy = -float(np.sign(pos[0])), -float(np.sign(pos[1]))
+            legal = self._best_legal_heading(pos, ux, uy)
+            vel[0] = legal[0] * self.drone_max_speed
+            vel[1] = legal[1] * self.drone_max_speed
+        pos = pos + vel * dt
+        limit = half - 1.0
+        for axis in (0, 1):
+            if pos[axis] >= limit:
+                pos[axis] = limit
+                if vel[axis] > 0.0:
+                    vel[axis] = 0.0
+            elif pos[axis] <= -limit:
+                pos[axis] = -limit
+                if vel[axis] < 0.0:
+                    vel[axis] = 0.0
+        if float(np.hypot(vel[0], vel[1])) < 0.5 and self._on_border(pos):
+            ux, uy = -float(np.sign(pos[0])) or 0.0, -float(np.sign(pos[1])) or 0.0
+            legal = self._best_legal_heading(pos, ux, uy)
+            vel[0] = legal[0] * self.drone_max_speed
+            vel[1] = legal[1] * self.drone_max_speed
+            pos[0] = float(np.clip(pos[0] + vel[0] * dt, -limit, limit))
+            pos[1] = float(np.clip(pos[1] + vel[1] * dt, -limit, limit))
+        pos[2] = self.hover_altitude
+        vel[2] = 0.0
+        return pos, vel
+
+    def _init_coverage_sweep(self):
+        """Split the map into north-south lanes, one subset per drone."""
+        half = self.env_size / 2.0 - 4.0
+        spacing = max(self.sensor_radius * 1.5, 8.0)
+        xs = np.arange(-half, half + 0.01, spacing)
+        if xs.size == 0:
+            xs = np.array([0.0])
+        self._lanes = [xs[i :: self.num_drones] for i in range(self.num_drones)]
+        self._lane_idx = np.zeros(self.num_drones, dtype=int)
+        self._sweep_dir = np.ones(self.num_drones, dtype=np.float64)
+
+    def coverage_actions(self):
+        """Boustrophedon (lawnmower) covering the whole square."""
+        if not hasattr(self, "_lanes"):
+            self._init_coverage_sweep()
+        half = self.env_size / 2.0 - 4.0
+        actions = {}
+        for i, agent in enumerate(self.possible_agents):
+            lanes = np.asarray(self._lanes[i], dtype=np.float64)
+            if lanes.size == 0:
+                actions[agent] = np.zeros(3, dtype=np.float32)
+                continue
+            idx = int(np.clip(self._lane_idx[i], 0, lanes.size - 1))
+            target_x = float(lanes[idx])
+            pos = self.drone_positions[i]
+            vx = float(np.clip((target_x - pos[0]) / 3.0, -1.0, 1.0))
+            on_lane = abs(pos[0] - target_x) < 2.5
+            if on_lane:
+                if pos[1] >= half and self._sweep_dir[i] > 0:
+                    self._sweep_dir[i] = -1.0
+                    self._lane_idx[i] = min(idx + 1, lanes.size - 1)
+                elif pos[1] <= -half and self._sweep_dir[i] < 0:
+                    self._sweep_dir[i] = 1.0
+                    self._lane_idx[i] = min(idx + 1, lanes.size - 1)
+            vy = float(self._sweep_dir[i])
+            if not on_lane:
+                vy *= 0.15
+            actions[agent] = np.array([vx, vy, 0.0], dtype=np.float32)
+        return actions
+
     def _init_pybullet(self):
-        if self.client is not None:
-            try:
-                p.disconnect(physicsClientId=self.client)
-            except Exception:
-                pass
+        if self.client is not None and p.isConnected(self.client):
+            p.resetSimulation(physicsClientId=self.client)
+            p.setGravity(0, 0, 0, physicsClientId=self.client)
+            p.setTimeStep(1.0 / self.pyb_freq, physicsClientId=self.client)
+            if self.render_mode == "human":
+                p.setRealTimeSimulation(0, physicsClientId=self.client)
+            return
         if self.render_mode == "human":
             self.client = p.connect(p.GUI)
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.client)
             p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=self.client)
+            p.setRealTimeSimulation(0, physicsClientId=self.client)
         else:
             self.client = p.connect(p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -185,6 +459,36 @@ class SurvivorSearchEnv(ParallelEnv):
             basePosition=[0, 0, -0.2],
             physicsClientId=self.client,
         )
+        self._build_fence()
+
+    def _build_fence(self):
+        """Solid rim so a drone body cannot leave the green square."""
+        half = self.env_size / 2.0
+        thick = 1.0
+        height = 4.0
+        walls = (
+            ([0.0, half + thick, height / 2], [half + thick, thick, height / 2]),
+            ([0.0, -(half + thick), height / 2], [half + thick, thick, height / 2]),
+            ([half + thick, 0.0, height / 2], [thick, half + thick, height / 2]),
+            ([-(half + thick), 0.0, height / 2], [thick, half + thick, height / 2]),
+        )
+        for pos, ext in walls:
+            col = p.createCollisionShape(
+                p.GEOM_BOX, halfExtents=ext, physicsClientId=self.client
+            )
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=ext,
+                rgbaColor=[0.25, 0.25, 0.28, 1],
+                physicsClientId=self.client,
+            )
+            p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=vis,
+                basePosition=pos,
+                physicsClientId=self.client,
+            )
 
     def _spawn_drones(self):
         self.drone_ids = []
@@ -199,11 +503,13 @@ class SurvivorSearchEnv(ParallelEnv):
         except Exception:
             urdf_path = None
 
-        spread = min(self.num_drones * 4.0, self.env_size * 0.25)
         z = self.hover_altitude
+        self._init_coverage_sweep()
+        rng = np.random.default_rng((self._seed or 0) + 17)
+        margin = self.env_size * 0.25
         for i in range(self.num_drones):
-            x = (i - (self.num_drones - 1) / 2.0) * (spread / max(self.num_drones - 1, 1))
-            y = -self.env_size * 0.35
+            x = float(rng.uniform(-margin, margin))
+            y = float(rng.uniform(-margin, margin))
             self.drone_positions[i] = [x, y, z]
             if urdf_path is not None:
                 original_cwd = os.getcwd()
@@ -221,11 +527,15 @@ class SurvivorSearchEnv(ParallelEnv):
                     os.chdir(original_cwd)
             else:
                 did = self._sphere_drone([x, y, z], i)
+            p.changeDynamics(did, -1, mass=0, physicsClientId=self.client)
+            p.resetBaseVelocity(
+                did, [0, 0, 0], [0, 0, 0], physicsClientId=self.client
+            )
             self.drone_ids.append(did)
 
         if self.render_mode == "human":
             p.resetDebugVisualizerCamera(
-                cameraDistance=90,
+                cameraDistance=max(90.0, self.env_size * 0.95),
                 cameraYaw=45,
                 cameraPitch=-40,
                 cameraTargetPosition=[0, 0, 2.0],
@@ -255,10 +565,17 @@ class SurvivorSearchEnv(ParallelEnv):
 
     def reset(self, seed=None, options=None):
         if seed is not None:
-            self._seed = seed
+            self._seed = int(seed)
+        else:
+            self._seed = int(np.random.randint(0, 1_000_000_000))
+        if options and options.get("env_size") is not None:
+            self.env_size = float(options["env_size"])
+            self.cover_cells = max(16, int(round(self.env_size / 5.0)))
+            self.max_steps = max(500, int(self.env_size * 8.0))
         self.agents = list(self.possible_agents)
         self.step_count = 0
         self.coverage = np.zeros((self.cover_cells, self.cover_cells), dtype=np.float32)
+        self.visit_age = np.zeros((self.cover_cells, self.cover_cells), dtype=np.float32)
         self.drone_velocities = np.zeros((self.num_drones, 3))
         self.drone_alive = np.ones(self.num_drones, dtype=bool)
         self.newly_discovered = 0
@@ -288,32 +605,47 @@ class SurvivorSearchEnv(ParallelEnv):
         self._init_pybullet()
         self._build_ground()
         self._spawn_drones()
+        self._init_coverage_sweep()
         self._mark_coverage(self.drone_positions)
 
         return self._get_observations(), self._infos()
 
     def step(self, actions):
         self.step_count += 1
+        self.visit_age += 1.0
         dt = 1.0 / self.pyb_freq
         half = self.env_size / 2.0
 
         for i, agent in enumerate(self.possible_agents):
             if agent not in actions:
                 continue
-            act = np.clip(np.array(actions[agent], dtype=np.float32), -1.0, 1.0)
-            self.drone_velocities[i] = act * self.drone_max_speed
+            raw = np.asarray(actions[agent], dtype=np.float32).reshape(-1)
+            if raw.size >= 3:
+                act = np.clip(raw[:3], -1.0, 1.0)
+                self.drone_velocities[i] = act * self.drone_max_speed
+            else:
+                idx = int(np.clip(np.rint(float(raw[0])), 0, self.n_actions - 1))
+                heading = _HEADING_XY[idx]
+                self.drone_velocities[i, 0] = heading[0] * self.drone_max_speed
+                self.drone_velocities[i, 1] = heading[1] * self.drone_max_speed
+                self.drone_velocities[i, 2] = 0.0
 
         collisions = np.zeros(self.num_drones, dtype=bool)
         for i in range(self.num_drones):
-            pos = self.drone_positions[i] + self.drone_velocities[i] * dt
-            pos[0] = np.clip(pos[0], -half, half)
-            pos[1] = np.clip(pos[1], -half, half)
-            pos[2] = np.clip(pos[2], 1.0, self.drone_max_altitude)
+            pos, vel = self._move_with_soft_walls(
+                self.drone_positions[i], self.drone_velocities[i], dt, half
+            )
+            self.drone_velocities[i] = vel
             self.drone_positions[i] = pos
             orn = p.getQuaternionFromEuler([0, 0, 0])
             p.resetBasePositionAndOrientation(
                 self.drone_ids[i], pos.tolist(), orn, physicsClientId=self.client
             )
+            p.resetBaseVelocity(
+                self.drone_ids[i], [0, 0, 0], [0, 0, 0], physicsClientId=self.client
+            )
+        if self.render_mode == "human":
+            p.setRealTimeSimulation(0, physicsClientId=self.client)
 
         for i in range(self.num_drones):
             for j in range(i + 1, self.num_drones):
@@ -334,66 +666,80 @@ class SurvivorSearchEnv(ParallelEnv):
         terminations = {a: False for a in self.possible_agents}
 
         if self.render_mode == "human":
-            time.sleep(max(0.0, dt * 0.25))
+            pass
 
         return self._get_observations(), rewards, terminations, truncations, self._infos()
 
     def _compute_rewards(self, collisions):
-        """People-first search: find survivors, then expand into unpainted ground."""
+        """New cells and new people. Sitting still is costly while work remains."""
         stats = self.survivors.get_discovery_stats()
         all_found = stats["discovered_survivors"] == stats["total_survivors"] and stats["total_survivors"] > 0
+        uncovered_left = float(self.coverage.mean()) < 0.995
 
-        find_bonus = 10.0
-        # One new 5 m sensor disk ≈ 1/3.5 of a find, so coverage expands after
-        # local ground is cleared without beating the people objective.
-        cell_m = self.env_size / self.cover_cells
-        footprint_cells = max(1.0, np.pi * (self.sensor_radius ** 2) / (cell_m ** 2))
-        cover_per_cell = (find_bonus / 3.5) / footprint_cells
-
-        shared = find_bonus * float(self.newly_discovered)
-        shared += cover_per_cell * float(self.new_cells)
+        shared = 10.0 * float(self.newly_discovered)
         shared -= 0.01
-        shared -= 0.0004 * float(self.overlap_cells)
         if all_found:
             shared += 50.0
+        elif self.step_count >= self.max_steps:
+            remaining = stats["total_survivors"] - stats["discovered_survivors"]
+            shared -= 8.0 * float(remaining)
 
         rewards = {}
         for i, agent in enumerate(self.possible_agents):
-            rew = shared
-            # Extra nudge: if this drone's local map is fully searched, pay a
-            # little more for any new coverage this step so it leaves the patch.
-            crop = self._coverage_crop(self.drone_positions[i][0], self.drone_positions[i][1])
-            if crop.size > 0 and float(crop.mean()) >= 0.9 and self.new_cells > 0:
-                rew += 0.15 * cover_per_cell * float(self.new_cells)
+            rew = shared + float(self._drone_new_cells[i])
+            # The sensor always overlaps cells painted a moment ago. Charge only
+            # when this step is pure re-coverage, so crossing old ground to reach
+            # a new region is not punished on every step.
+            if self._drone_new_cells[i] == 0 and self._drone_overlap[i] > 0:
+                rew -= 0.25
+            speed = float(np.hypot(self.drone_velocities[i][0], self.drone_velocities[i][1]))
+            if speed < 0.5 and (uncovered_left or not all_found):
+                rew -= 1.0
             if collisions[i]:
-                rew -= 5.0
+                rew -= 1.0
+            x, y = self.drone_positions[i][0], self.drone_positions[i][1]
+            limit = self.env_size / 2.0 - 1.0
+            if abs(x) >= limit - 0.05 or abs(y) >= limit - 0.05:
+                rew -= 0.15
+                if not all_found:
+                    rew -= 0.5
             rewards[agent] = rew
         return rewards
 
     def _get_observations(self):
+        """Scale-invariant local obs so the policy can transfer to larger maps."""
         half = self.env_size / 2.0
+        sr = max(self.sensor_radius, 1.0)
         stats = self.survivors.get_discovery_stats()
-        remaining = 1.0 - stats["discovery_rate"]
+        uncovered_frac = 1.0 - float(self.coverage.mean())
         observations = {}
         for i, agent in enumerate(self.possible_agents):
             obs = np.zeros(self.obs_dim, dtype=np.float32)
             pos = self.drone_positions[i]
             vel = self.drone_velocities[i]
-            obs[0] = pos[0] / half
-            obs[1] = pos[1] / half
-            obs[2] = pos[2] / self.drone_max_altitude
-            obs[3:6] = vel / self.drone_max_speed
-            idx = 6
+            obs[0] = vel[0] / self.drone_max_speed
+            obs[1] = vel[1] / self.drone_max_speed
+            ux, uy = self._search_heading(pos[0], pos[1])
+            obs[2] = float(np.clip(ux * self.env_size / sr, -4.0, 4.0))
+            obs[3] = float(np.clip(uy * self.env_size / sr, -4.0, 4.0))
+            obs[4] = float(np.clip((half - pos[0]) / sr, 0.0, 8.0))
+            obs[5] = float(np.clip((pos[0] + half) / sr, 0.0, 8.0))
+            obs[6] = float(np.clip((half - pos[1]) / sr, 0.0, 8.0))
+            obs[7] = float(np.clip((pos[1] + half) / sr, 0.0, 8.0))
+            idx = 8
             for j in range(self.num_drones):
                 if j == i:
                     continue
-                rel = (self.drone_positions[j] - pos) / self.env_size
-                obs[idx : idx + 3] = rel
-                idx += 3
+                rel = (self.drone_positions[j][:2] - pos[:2]) / sr
+                obs[idx] = float(np.clip(rel[0], -8.0, 8.0))
+                obs[idx + 1] = float(np.clip(rel[1], -8.0, 8.0))
+                idx += 2
             obs[idx] = stats["discovery_rate"]
-            obs[idx + 1] = remaining
+            obs[idx + 1] = uncovered_frac
             crop = self._coverage_crop(pos[0], pos[1])
             obs[idx + 2 : idx + 2 + crop.size] = crop
+            shared = self._shared_map()
+            obs[idx + 2 + crop.size : idx + 2 + crop.size + shared.size] = shared
             observations[agent] = obs
         return observations
 
