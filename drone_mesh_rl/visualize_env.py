@@ -2,8 +2,9 @@
 visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
 Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
-PyBullet heightfield, tiles that patch 2x2 in memory, then copies the same
-300 m district onto each tile. --procedural restores the two-downtown metro.
+PyBullet heightfield, tiles that patch 2x2 in memory, copies the same
+300 m district onto each tile, then adds grouped Kenney scenery outside
+those towns. --procedural restores the two-downtown metro.
 Camera-only loop (no drones).
 
 Usage:
@@ -33,6 +34,7 @@ from envs.district import (
     matching_tile_centers,
     spawn_districts_in_pybullet,
 )
+from envs.scenery import spawn_scenery_in_pybullet
 from envs.town import (
     MetroLayout,
     connect_pybullet,
@@ -325,6 +327,9 @@ def build_dem_world(client, dem_path):
         f"roads={len(district.roads)}  trees={len(district.trees)}  "
         f"cars={len(district.cars)}  place+spawn={t_district:.3f}s"
     )
+    t0 = time.perf_counter()
+    _scenery_bodies, _scenery = spawn_scenery_in_pybullet(client, terrain, districts)
+    print(f"[SCENERY] place+spawn={time.perf_counter() - t0:.3f}s")
 
     info = terrain.dem_info
     rows, cols = info["raster_shape"]
@@ -447,7 +452,7 @@ def main():
     if args.procedural:
         print(" [3D METRO VIEWER] Two-downtown spectator")
     else:
-        print(" [3D TERRAIN VIEWER] USGS elevation + four copied districts")
+        print(" [3D TERRAIN VIEWER] USGS elevation + four districts + scenery")
     if not gui:
         print(" --headless: timing/body-count check (p.DIRECT).")
     else:
