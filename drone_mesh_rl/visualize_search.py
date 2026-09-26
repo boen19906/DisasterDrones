@@ -144,7 +144,7 @@ class SearchCamera:
             self.target = self.target - right * dx * scale + fwd * dy * scale
         self.target[2] = float(np.clip(self.target[2], 0.0, 40.0))
 
-    def handle(self, keys, drone_positions):
+    def handle(self, keys, drone_positions, env=None):
         if _key_hit(keys, ord("0")):
             self.reset_overview()
             print("[CAM] Overview")
@@ -185,9 +185,32 @@ class SearchCamera:
             idx = int(np.clip(self.follow, 0, len(drone_positions) - 1))
             pos = np.asarray(drone_positions[idx], dtype=np.float64)
             self.target = pos + np.array([0.0, 0.0, 1.2], dtype=np.float64)
+            self._pull_camera_out_of_solids(env)
 
         self._apply_camera_if_changed()
         return self.follow
+
+    def _pull_camera_out_of_solids(self, env):
+        """Slide the follow camera toward the drone until it is outside solid walls."""
+        if env is None or not hasattr(env, "_hits_solid"):
+            return
+        yaw = np.radians(self.yaw)
+        pitch = np.radians(self.pitch)
+        cp = np.cos(pitch)
+        direction = np.array(
+            [np.sin(yaw) * cp, -np.cos(yaw) * cp, -np.sin(pitch)],
+            dtype=np.float64,
+        )
+        dist = float(self.dist)
+        for _ in range(14):
+            eye = self.target + direction * dist
+            if not env._hits_solid(eye, radius=0.6):
+                break
+            dist *= 0.7
+            if dist < 6.0:
+                break
+        if dist < float(self.dist) - 0.4:
+            self.dist = dist
 
 
 def _search_drone_tag(index, alive):
@@ -577,7 +600,7 @@ def main():
                     last_status = time.time()
                 continue
 
-            cam.handle(keys, env.drone_positions)
+            cam.handle(keys, env.drone_positions, env)
 
             if not paused:
                 # One physics/policy step per displayed frame. HUD below is ~2 Hz.

@@ -77,6 +77,13 @@ TURN_MARGIN = 1.25  # only slide when actually on the wall, not 8 m inland
 GOAL_EDGE_M = 0.25  # claim streets on the rim
 LEFTOVER_CELLS = 80  # drop keep-out so last alleys are not abandoned
 WALL_COOLDOWN_STEPS = 12  # brief peel if a corner pins them
+CLIMB_STALL_STEPS = 8  # climb commands with no altitude gain, then go around
+CAMERA_M = 12.0  # forward sensor: a solid on this ray, not a preloaded obstacle map
+LEVEL_WALL_M = CAMERA_M  # do not cruise into a wall the sensor already sees
+TALL_AVOID_M = 14.0  # a tower this close is not a climb; go around
+DETOUR_LOCK_STEPS = 16  # keep the around-heading so a corner cannot flip it
+STUCK_STEPS = 60  # net movement inside STUCK_RADIUS this long means the drone is stuck
+STUCK_RADIUS = 3.5
 STREET_LOOKAHEAD_CELLS = 6  # follow streets this far around a block
 
 # Eight neighbor headings, plus stay. Stay on the wall is turned back inward.
@@ -214,6 +221,21 @@ class SurvivorSearchEnv(ParallelEnv):
         self.has_nav_goal = np.zeros(num_drones, dtype=bool)
         self.goal_hold = np.zeros(num_drones, dtype=np.int32)
         self.abandoned_goals = [[] for _ in range(num_drones)]
+        self._plan_action = np.full(num_drones, 24, dtype=np.int32)
+        self._stall_z = np.zeros(num_drones, dtype=np.float64)
+        self._stall_n = np.zeros(num_drones, dtype=np.int32)
+        self._climb_intent = np.zeros(num_drones, dtype=bool)
+        self._stall_xy = np.zeros((num_drones, 2), dtype=np.float64)
+        self._xy_stall = np.zeros(num_drones, dtype=np.int32)
+        self._lock_h = np.full(num_drones, -1, dtype=np.int32)
+        self._lock_n = np.zeros(num_drones, dtype=np.int32)
+        self._stuck_cool = np.zeros(num_drones, dtype=np.int32)
+        self._free_xy = np.zeros((num_drones, 2), dtype=np.float64)
+        self._free_n = np.zeros(num_drones, dtype=np.int32)
+        self._free_left = np.zeros(num_drones, dtype=np.int32)
+        self._free_h = np.full(num_drones, -1, dtype=np.int32)
+        self._free_up = np.zeros(num_drones, dtype=bool)
+        self._free_dir = np.zeros((num_drones, 2), dtype=np.float64)
         self.goal_is_person = np.zeros(num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(num_drones, dtype=np.int32)
         self.street_mask = np.ones((self.cover_ny, self.cover_nx), dtype=bool)
@@ -980,8 +1002,19 @@ class SurvivorSearchEnv(ParallelEnv):
         for k in range(8):
             level_hit = self._motion_blocked(pos, k, 0.0)
             climb_hit = self._motion_blocked(pos, k, 1.0)
-            hits[k] = 1.0 if level_hit else 0.0
-            helps[k] = 1.0 if level_hit and not climb_hit else 0.0
+            # Camera ray from the drone. A hit means a solid within CAMERA_M, not one step.
+            ahead = self._solid_blocking(
+                pos, _HEADING_XY[k, 0], _HEADING_XY[k, 1], reach=CAMERA_M
+            )
+            hits[k] = 1.0 if ahead is not None else 0.0
+            # Climb helps only for a shell. A tower on this heading is not a climb.
+            too_tall = ahead is not None and self._too_tall_to_clear(pos, ahead[1])
+            if too_tall:
+                helps[k] = 0.0
+            elif ahead is not None and ahead[0] <= TALL_AVOID_M:
+                helps[k] = 1.0
+            else:
+                helps[k] = 1.0 if level_hit and not climb_hit else 0.0
         return clear, hits, helps
 
     def action_mask(self):
@@ -996,11 +1029,26 @@ class SurvivorSearchEnv(ParallelEnv):
             return mask
         for i in range(self.num_drones):
             pos = self.drone_positions[i]
-            for band, vz in enumerate(_VZ_BY_BAND):
-                for h in range(8):
-                    if self._motion_blocked(pos, h, vz):
+            tower_close = False
+            for h in range(8):
+                ahead = self._solid_blocking(
+                    pos, _HEADING_XY[h, 0], _HEADING_XY[h, 1], reach=TALL_AVOID_M
+                )
+                too_tall = (
+                    ahead is not None
+                    and ahead[0] <= TALL_AVOID_M
+                    and self._too_tall_to_clear(pos, ahead[1])
+                )
+                level_wall = ahead is not None and ahead[0] <= LEVEL_WALL_M
+                if too_tall and ahead[0] <= 8.0:
+                    tower_close = True
+                for band, vz in enumerate(_VZ_BY_BAND):
+                    blocked = self._motion_blocked(pos, h, vz)
+                    # Never climb or cruise into a tower. Level flight also stops
+                    # short of a shell so the drone can turn down the street.
+                    if blocked or too_tall or (level_wall and vz == 0.0):
                         mask[i, band * 8 + h] = 0.0
-            if self._motion_blocked(pos, 8, 1.0):
+            if self._motion_blocked(pos, 8, 1.0) or tower_close:
                 mask[i, 25] = 0.0
             if self._motion_blocked(pos, 8, -1.0):
                 mask[i, 26] = 0.0
@@ -1046,6 +1094,84 @@ class SurvivorSearchEnv(ParallelEnv):
             return None
         return float(dist[i]), float(zmax[i])
 
+    def _clearable_wall_ahead(self, pos, ux, uy, reach=28.0):
+        """A wall on this ray the drone can fly over. (distance, top_z) or None.
+
+        Towers above the altitude cap are ignored. A wall already below the drone is ignored.
+        """
+        info = self._first_solid_ahead(pos, ux, uy, reach=reach)
+        if info is None:
+            return None
+        dist, top = info
+        gz = self._ground_z(float(pos[0]), float(pos[1]))
+        if top >= gz + self.drone_max_altitude - 1.0:
+            return None
+        if float(pos[2]) >= top + 1.0:
+            return None
+        return dist, top
+
+    def _too_tall_to_clear(self, pos, top):
+        gz = self._ground_z(float(pos[0]), float(pos[1]))
+        return float(top) >= gz + self.drone_max_altitude - 1.0
+
+    def _solid_blocking(self, pos, ux, uy, reach=22.0):
+        """Solid on this ray the drone has not already flown over. (distance, top_z) or None."""
+        info = self._first_solid_ahead(pos, ux, uy, reach=reach)
+        if info is None:
+            return None
+        if float(pos[2]) >= info[1] + 1.0:
+            return None
+        return info
+
+    def _note_climb_progress(self, drone_index, pos):
+        """Count climb commands that do not raise the drone. A real climb resets it."""
+        z = float(pos[2])
+        if self._climb_intent[drone_index] and z <= float(self._stall_z[drone_index]) + 0.25:
+            self._stall_n[drone_index] += 1
+        else:
+            self._stall_n[drone_index] = 0
+        self._stall_z[drone_index] = z
+
+    def _note_stuck(self, drone_index, pos):
+        """True when the drone is still near where it was a while ago.
+
+        A one-step wiggle does not clear this. A climb that is actually rising does.
+        """
+        if int(self._stuck_cool[drone_index]) > 0:
+            self._stuck_cool[drone_index] -= 1
+            self._xy_stall[drone_index] = 0
+            self._stall_xy[drone_index, 0] = float(pos[0])
+            self._stall_xy[drone_index, 1] = float(pos[1])
+            return False
+        z = float(pos[2])
+        rising = self._climb_intent[drone_index] and z > float(self._stall_z[drone_index]) + 0.25
+        dist = float(np.hypot(
+            float(pos[0]) - float(self._stall_xy[drone_index, 0]),
+            float(pos[1]) - float(self._stall_xy[drone_index, 1]),
+        ))
+        if rising or dist > STUCK_RADIUS:
+            self._xy_stall[drone_index] = 0
+            self._stall_xy[drone_index, 0] = float(pos[0])
+            self._stall_xy[drone_index, 1] = float(pos[1])
+            return False
+        self._xy_stall[drone_index] += 1
+        return int(self._xy_stall[drone_index]) >= STUCK_STEPS
+
+    def _escape_aim(self, drone_index, pos, blocked, target):
+        """Leave a wall that cannot be crossed. Street first, then back away from it."""
+        if target is not None:
+            self._abandon_goal(drone_index, target)
+        self._stall_n[drone_index] = 0
+        ahead = self._ahead_street_xy(float(pos[0]), float(pos[1]))
+        if ahead is not None:
+            delta = np.asarray(ahead, dtype=np.float64) - np.asarray(pos[:2], dtype=np.float64)
+            norm = float(np.hypot(delta[0], delta[1]))
+            if norm >= 1.0:
+                aim = delta / norm
+                if float(np.dot(aim, blocked)) < 0.35:
+                    return aim
+        return -np.asarray(blocked, dtype=np.float64)
+
     def _heading_index(self, ux, uy):
         best_k = 0
         best_dot = -1e9
@@ -1066,6 +1192,16 @@ class SurvivorSearchEnv(ParallelEnv):
             if not self.drone_alive[i]:
                 continue
             pos = self.drone_positions[i]
+            if not self.legacy_xy and int(self._lock_n[i]) > 0:
+                locked = int(self._lock_h[i])
+                if 0 <= locked < 8 and mask[i, locked] > 0.5:
+                    self._lock_n[i] -= 1
+                    actions[i] = float(locked)
+                    self._plan_action[i] = locked
+                    self._climb_intent[i] = False
+                    self._note_stuck(i, pos)
+                    continue
+                self._lock_n[i] = 0
             ux, uy = self._inland_search_dir(i, pos)
             street = np.array([ux, uy], dtype=np.float64)
             sn = float(np.hypot(street[0], street[1])) or 1.0
@@ -1076,70 +1212,101 @@ class SurvivorSearchEnv(ParallelEnv):
                 direct = np.asarray(target, dtype=np.float64) - pos[:2]
                 dn = float(np.hypot(direct[0], direct[1]))
                 direct = direct / dn if dn > 1.0 else None
-            hop = None
+            stuck = self._note_stuck(i, pos)
+            self._note_climb_progress(i, pos)
+            wall = None
             aim = street
-            if direct is not None and not self.legacy_xy:
-                dist_goal = float(np.linalg.norm(np.asarray(target, dtype=np.float64) - pos[:2]))
-                info = self._first_solid_ahead(pos, direct[0], direct[1], reach=max(dist_goal, 8.0))
-                gz = self._ground_z(float(pos[0]), float(pos[1]))
-                # The search cell is behind a shell this drone can fly over.
-                if (
-                    info is not None
-                    and info[0] < dist_goal - 2.0
-                    and info[1] < gz + self.drone_max_altitude - 1.0
-                ):
-                    hop = info
-                    aim = direct
+            if not self.legacy_xy:
+                # Climb a shell early enough to clear it. A tower, or a climb that
+                # stops gaining height, is not a climb: drop that cell and leave
+                # down the street, or back away from the face.
+                block = None
+                blocked_dir = street
+                if direct is not None:
+                    dist_goal = float(np.linalg.norm(np.asarray(target, dtype=np.float64) - pos[:2]))
+                    hit = self._solid_blocking(
+                        pos, direct[0], direct[1], reach=max(dist_goal, 12.0)
+                    )
+                    if hit is not None and hit[0] < dist_goal - 1.5:
+                        block = hit
+                        blocked_dir = direct
+                if block is None:
+                    hit = self._solid_blocking(pos, street[0], street[1], reach=28.0)
+                    if hit is not None:
+                        block = hit
+                        blocked_dir = street
+                stalled = int(self._stall_n[i]) >= CLIMB_STALL_STEPS
+                too_tall = block is not None and self._too_tall_to_clear(pos, block[1])
+                # Held in place: climb a shell, or leave a tower. A one-step wiggle
+                # does not count as progress.
+                if stuck and block is not None and not too_tall:
+                    wall = block
+                    aim = blocked_dir
+                    self._stuck_cool[i] = STUCK_STEPS
+                    self._xy_stall[i] = 0
+                elif stuck or (block is not None and (too_tall or stalled)):
+                    aim = self._escape_aim(i, pos, blocked_dir, target)
+                    locked = self._heading_index(float(aim[0]), float(aim[1]))
+                    if mask[i, locked] > 0.5:
+                        self._lock_h[i] = locked
+                        self._lock_n[i] = DETOUR_LOCK_STEPS
+                    self._stuck_cool[i] = STUCK_STEPS
+                    self._xy_stall[i] = 0
+                    wall = None
+                elif block is not None:
+                    wall = block
+                    aim = blocked_dir
             desired = self._heading_index(aim[0], aim[1])
             agl = self._agl_of(pos)
-            step_m = self.drone_max_speed / self.pyb_freq
-            climbing = False
-            if hop is not None and float(pos[2]) < hop[1] + 1.2:
-                steps_up = (hop[1] + 1.2 - float(pos[2])) / step_m
-                steps_to = max(hop[0], 0.5) / step_m
-                if steps_up + 1.0 >= steps_to or hop[0] < 14.0:
-                    climbing = True
+            climbing = wall is not None and float(pos[2]) < wall[1] + 1.2
+            choice = stay
             if self.legacy_xy:
                 if mask[i, desired] > 0.5:
-                    actions[i] = float(desired)
-                continue
-            if climbing:
-                if mask[i, 8 + desired] > 0.5:
-                    actions[i] = float(8 + desired)
-                    continue
-                if mask[i, 25] > 0.5:
-                    actions[i] = 25.0
-                    continue
-            crossing = False
-            if agl > SEARCH_AGL_MAX and not climbing:
-                over = self._first_solid_ahead(pos, aim[0], aim[1], reach=16.0)
-                if over is not None and float(pos[2]) > over[1] + 0.3 and over[0] < 14.0:
-                    crossing = True
-                elif mask[i, 16 + desired] > 0.5:
-                    actions[i] = float(16 + desired)
-                    continue
-                elif mask[i, 26] > 0.5:
-                    actions[i] = 26.0
-                    continue
-            if mask[i, desired] > 0.5:
-                actions[i] = float(desired)
-                continue
-            if not crossing and mask[i, 8 + desired] > 0.5:
-                actions[i] = float(8 + desired)
-                continue
-            if mask[i, 25] > 0.5 and hop is not None:
-                actions[i] = 25.0
-                continue
-            best_k = 24
-            best_dot = -1e9
-            for k in range(8):
-                if mask[i, k] < 0.5:
-                    continue
-                dot = float(_HEADING_XY[k, 0]) * float(aim[0]) + float(_HEADING_XY[k, 1]) * float(aim[1])
-                if dot > best_dot:
-                    best_dot = dot
-                    best_k = k
-            actions[i] = float(best_k)
+                    choice = float(desired)
+            elif climbing:
+                # Far enough that one climb step still clears the face: climb forward.
+                # Against the wall, climb in place. Never fall through to a level ram.
+                if wall[0] > 4.0 and mask[i, 8 + desired] > 0.5:
+                    choice = float(8 + desired)
+                elif mask[i, 25] > 0.5:
+                    choice = 25.0
+                elif mask[i, 8 + desired] > 0.5:
+                    choice = float(8 + desired)
+            else:
+                crossing = False
+                if agl > SEARCH_AGL_MAX:
+                    over = self._first_solid_ahead(pos, aim[0], aim[1], reach=16.0)
+                    if over is not None and float(pos[2]) > over[1] + 0.3 and over[0] < 14.0:
+                        crossing = True
+                    elif mask[i, 16 + desired] > 0.5:
+                        choice = float(16 + desired)
+                    elif mask[i, 26] > 0.5:
+                        choice = 26.0
+                if choice == stay and mask[i, desired] > 0.5:
+                    choice = float(desired)
+                elif choice == stay and not crossing and mask[i, 8 + desired] > 0.5:
+                    choice = float(8 + desired)
+                elif choice == stay and mask[i, 25] > 0.5 and self._clearable_wall_ahead(
+                    pos, aim[0], aim[1], reach=10.0
+                ):
+                    choice = 25.0
+                elif choice == stay:
+                    best_k = 24
+                    best_dot = -1e9
+                    for k in range(8):
+                        if mask[i, k] < 0.5:
+                            continue
+                        dot = (
+                            float(_HEADING_XY[k, 0]) * float(aim[0])
+                            + float(_HEADING_XY[k, 1]) * float(aim[1])
+                        )
+                        if dot > best_dot:
+                            best_dot = dot
+                            best_k = k
+                    choice = float(best_k)
+            actions[i] = choice
+            self._plan_action[i] = int(choice)
+            self._climb_intent[i] = bool(climbing) and not self.legacy_xy
         return actions
 
     def _keep_moving(self, drone_index):
@@ -1684,6 +1851,21 @@ class SurvivorSearchEnv(ParallelEnv):
         self.has_nav_goal = np.zeros(self.num_drones, dtype=bool)
         self.goal_hold = np.zeros(self.num_drones, dtype=np.int32)
         self.abandoned_goals = [[] for _ in range(self.num_drones)]
+        self._plan_action = np.full(self.num_drones, 24, dtype=np.int32)
+        self._stall_z = np.zeros(self.num_drones, dtype=np.float64)
+        self._stall_n = np.zeros(self.num_drones, dtype=np.int32)
+        self._climb_intent = np.zeros(self.num_drones, dtype=bool)
+        self._stall_xy = np.zeros((self.num_drones, 2), dtype=np.float64)
+        self._xy_stall = np.zeros(self.num_drones, dtype=np.int32)
+        self._lock_h = np.full(self.num_drones, -1, dtype=np.int32)
+        self._lock_n = np.zeros(self.num_drones, dtype=np.int32)
+        self._stuck_cool = np.zeros(self.num_drones, dtype=np.int32)
+        self._free_xy = np.zeros((self.num_drones, 2), dtype=np.float64)
+        self._free_n = np.zeros(self.num_drones, dtype=np.int32)
+        self._free_left = np.zeros(self.num_drones, dtype=np.int32)
+        self._free_h = np.full(self.num_drones, -1, dtype=np.int32)
+        self._free_up = np.zeros(self.num_drones, dtype=bool)
+        self._free_dir = np.zeros((self.num_drones, 2), dtype=np.float64)
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
         self.town = None
@@ -1756,6 +1938,107 @@ class SurvivorSearchEnv(ParallelEnv):
 
         return self._get_observations(), self._infos()
 
+    def _nearest_blocking(self, pos):
+        """Closest solid the forward rays see. (distance, top, heading) or None."""
+        best = None
+        for h in range(8):
+            info = self._solid_blocking(
+                pos, _HEADING_XY[h, 0], _HEADING_XY[h, 1], reach=CAMERA_M
+            )
+            if info is None:
+                continue
+            if best is None or info[0] < best[0]:
+                best = (info[0], info[1], h)
+        return best
+
+    def _open_escape_heading(self, drone_index, pos, into):
+        """Legal level heading that leaves the obstacle, or None."""
+        mask = self.action_mask()[drone_index]
+        best_h = None
+        best_dot = 1e9
+        for h in range(8):
+            if mask[h] < 0.5:
+                continue
+            info = self._solid_blocking(
+                pos, _HEADING_XY[h, 0], _HEADING_XY[h, 1], reach=6.0
+            )
+            if info is not None and info[0] < 4.0:
+                continue
+            dot = float(np.dot(_HEADING_XY[h], into))
+            if dot < best_dot:
+                best_dot = dot
+                best_h = h
+        return best_h
+
+    def _held_too_long(self, drone_index, pos):
+        """True after the drone has stayed inside STUCK_RADIUS for STUCK_STEPS."""
+        if int(self._free_left[drone_index]) > 0:
+            return False
+        dist = float(np.hypot(
+            float(pos[0]) - float(self._free_xy[drone_index, 0]),
+            float(pos[1]) - float(self._free_xy[drone_index, 1]),
+        ))
+        if dist > STUCK_RADIUS:
+            self._free_n[drone_index] = 0
+            self._free_xy[drone_index, 0] = float(pos[0])
+            self._free_xy[drone_index, 1] = float(pos[1])
+            return False
+        self._free_n[drone_index] += 1
+        return int(self._free_n[drone_index]) >= STUCK_STEPS
+
+    def _unstick_action(self, drone_index, idx, pos):
+        """Replace a stuck drone's action. Shells get a climb. Towers get a held detour."""
+        if self.legacy_xy:
+            return idx
+        mask = self.action_mask()[drone_index]
+        if int(self._free_left[drone_index]) > 0:
+            if self._free_up[drone_index]:
+                opened = self._open_escape_heading(
+                    drone_index, pos, self._free_dir[drone_index]
+                )
+                if opened is not None:
+                    self._free_up[drone_index] = False
+                    self._free_h[drone_index] = opened
+                    self._free_left[drone_index] = DETOUR_LOCK_STEPS
+                    return opened
+                if mask[25] > 0.5:
+                    self._free_left[drone_index] -= 1
+                    return 25
+            else:
+                held = int(self._free_h[drone_index])
+                if 0 <= held < 8 and mask[held] > 0.5:
+                    self._free_left[drone_index] -= 1
+                    return held
+            self._free_left[drone_index] = 0
+        if not self._held_too_long(drone_index, pos):
+            return idx
+        block = self._nearest_blocking(pos)
+        if block is None:
+            into = -_HEADING_XY[idx % 8] if idx < 24 else np.array([1.0, 0.0])
+            top_tall = True
+        else:
+            into = _HEADING_XY[block[2]]
+            top_tall = self._too_tall_to_clear(pos, block[1])
+        self._free_dir[drone_index] = into
+        self._free_n[drone_index] = 0
+        self._free_xy[drone_index, 0] = float(pos[0])
+        self._free_xy[drone_index, 1] = float(pos[1])
+        opened = self._open_escape_heading(drone_index, pos, into)
+        if top_tall or opened is not None:
+            if opened is None:
+                opened = self._heading_index(float(-into[0]), float(-into[1]))
+                if mask[opened] < 0.5:
+                    return idx
+            self._free_up[drone_index] = False
+            self._free_h[drone_index] = opened
+            self._free_left[drone_index] = DETOUR_LOCK_STEPS
+            return int(opened)
+        if mask[25] > 0.5:
+            self._free_up[drone_index] = True
+            self._free_left[drone_index] = DETOUR_LOCK_STEPS
+            return 25
+        return idx
+
     def step(self, actions):
         self.step_count += 1
         dt = 1.0 / self.pyb_freq
@@ -1773,6 +2056,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 self.drone_velocities[i] = act * self.drone_max_speed
             else:
                 idx = int(np.clip(np.rint(float(raw[0])) if raw.size else 0, 0, self.n_actions - 1))
+                idx = self._unstick_action(i, idx, self.drone_positions[i])
                 if self.legacy_xy:
                     heading_idx, vz_sign = (8, 0.0) if idx >= 8 else (idx, 0.0)
                 else:
