@@ -32,6 +32,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from envs.disaster_env import DisasterMeshEnv
 from envs.search_env import SurvivorSearchEnv
+from envs.town import apply_spectator_sun
 from visualize_rubble import (
     _SPEC_MOVE_SPEED,
     enter_spectator_fly,
@@ -74,6 +75,11 @@ def parse_args():
         action="store_true",
         help="Viewer only: 5 m XY policy (obs 136, 9 actions, critic 70). Chunks block.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Skip GUI: DIRECT lighting check, then exit",
+    )
     return parser.parse_args()
 
 
@@ -105,7 +111,11 @@ def _disable_pybullet_hotkeys(client):
 
 
 class SearchCamera:
-    """Keyboard camera: arrows pan, 1-9 follow a drone, 0 overview, F fly."""
+    """Keyboard camera: arrows pan, 1-9 follow a drone, 0 overview, F fly.
+
+    Overview is framed on the 250 m city. Fly / pan are not clamped to that
+    square — the spectator can move out over the forest and mountains.
+    """
 
     def __init__(self, client, num_drones, env_size):
         self.client = client
@@ -507,33 +517,17 @@ class SearchDroneLabels:
             self._last[i] = None if item_id < 0 else key
 
 
-class SearchHud:
-    """One status line (found / alive / cover), replaced in place."""
-
-    def __init__(self, client):
-        self.client = client
-        self.item_id = -1
-        self._last = None
-
-    def sync(self, text, position):
-        xyz = [float(position[0]), float(position[1]), float(position[2])]
-        key = (text, round(xyz[0], 2), round(xyz[1], 2), round(xyz[2], 2))
-        if self.item_id >= 0 and self._last == key:
-            return
-        kwargs = {
-            "textColorRGB": [1.0, 1.0, 1.0],
-            "textSize": 1.4,
-            "physicsClientId": self.client,
-        }
-        if self.item_id >= 0:
-            kwargs["replaceItemUniqueId"] = self.item_id
-        item_id = int(p.addUserDebugText(text, xyz, **kwargs))
-        self.item_id = item_id
-        self._last = None if item_id < 0 else key
-
-
 def main():
     args = parse_args()
+    if args.headless:
+        client = p.connect(p.DIRECT)
+        apply_spectator_sun(client, shadows=False, spawn_disc=False)
+        print("[VISUALIZER] Headless check done (GUI not opened).")
+        try:
+            p.disconnect(physicsClientId=client)
+        except Exception:
+            pass
+        return
     if args.env_size is None:
         args.env_size = 250.0 if args.task == "search" else 100.0
     print("=" * 65)
@@ -617,7 +611,6 @@ def main():
 
     obs_dict, info_dict = env.reset(seed=args.seed)
     agent_names = env.possible_agents
-    last_infos = info_dict
     _disable_pybullet_hotkeys(env.client)
 
     dt_target = 1.0 / args.fps
@@ -628,7 +621,6 @@ def main():
     search_labels = (
         SearchDroneLabels(env.client, args.num_drones) if args.task == "search" else None
     )
-    search_hud = SearchHud(env.client) if args.task == "search" else None
     if status_panel is not None:
         status_panel.show()
         status_panel.refresh(env)
@@ -649,14 +641,12 @@ def main():
                     print("[CAM] Fly mode OFF")
                 print("[RESET] Resetting environment...")
                 obs_dict, info_dict = env.reset()
-                last_infos = info_dict
                 step_num = 0
                 prev_alive[:] = True
                 _disable_pybullet_hotkeys(env.client)
                 cam = SearchCamera(env.client, args.num_drones, args.env_size)
                 if args.task == "search":
                     search_labels = SearchDroneLabels(env.client, args.num_drones)
-                    search_hud = SearchHud(env.client)
                 if status_panel is not None:
                     status_panel.refresh(env)
                     last_status = time.time()
@@ -746,7 +736,6 @@ def main():
                                 actions[agent] = np.array([vx, vy, vz, role_toggle, 0.0], dtype=np.float32)
 
                     obs_dict, rews, terms, truncs, infos = env.step(actions)
-                    last_infos = infos
                     if args.task == "search":
                         for i in range(args.num_drones):
                             if prev_alive[i] and not env.drone_alive[i]:
@@ -904,20 +893,6 @@ def main():
                         textSize=1.2,
                         physicsClientId=env.client,
                     )
-
-            if search_hud is not None:
-                stats = env.survivors.get_discovery_stats()
-                cover = 0.0
-                if last_infos:
-                    cover = float(last_infos[env.possible_agents[0]].get("coverage_frac", 0.0))
-                alive_n = int(np.sum(env.drone_alive))
-                cam_txt = f"FOLLOW D{cam.follow}" if cam.follow is not None else "OVERVIEW"
-                hud_line = (
-                    f"SEARCH | {cam_txt} | Alive: {alive_n}/{args.num_drones} | "
-                    f"Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
-                    f"| Cover: {cover * 100:.0f}%"
-                )
-                search_hud.sync(hud_line, cam.target + np.array([0.0, 0.0, 10.0]))
 
             if search_labels is not None:
                 search_labels.sync(

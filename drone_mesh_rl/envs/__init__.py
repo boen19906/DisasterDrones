@@ -3,6 +3,8 @@ from .town import (
     TownLayout,
     MetroLayout,
     connect_pybullet,
+    apply_spectator_sun,
+    spawn_sun_disc,
     spawn_town_in_pybullet,
     frame_town_camera,
 )
@@ -31,6 +33,8 @@ __all__ = [
     "TownLayout",
     "MetroLayout",
     "connect_pybullet",
+    "apply_spectator_sun",
+    "spawn_sun_disc",
     "spawn_town_in_pybullet",
     "frame_town_camera",
     "SurvivorCluster",

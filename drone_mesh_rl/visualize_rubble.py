@@ -43,6 +43,7 @@ from envs.minimap import spawn_minimap_hud, update_minimap_hud
 from envs.town import (
     MetroLayout,
     connect_pybullet,
+    spawn_sun_disc,
     spawn_town_in_pybullet,
     frame_town_camera,
 )
@@ -192,7 +193,11 @@ def _key_triggered(keys, code):
 
 
 def update_spectator_camera(client, keys, yaw, pitch, dist, eye, move_speed=None):
-    """Minecraft-style spectator: WASD look-relative, arrows look, Space/Shift vertical."""
+    """Minecraft-style spectator: WASD look-relative, arrows look, Space/Shift vertical.
+
+    Eye XY is not clamped — search fly can leave the 250 m city and look at
+    the forest and mountain ring.
+    """
     speed = _SPEC_MOVE_SPEED if move_speed is None else float(move_speed)
     # Sprint: Left Ctrl only — Left Shift is descend, not faster
     if _key_down(keys, p.B3G_CONTROL):
@@ -529,7 +534,11 @@ def spawn_city_pad(client, terrain, center, size, margin=6.0):
         physicsClientId=client,
     )
     p.changeVisualShape(
-        body, -1, rgbaColor=[0.36, 0.32, 0.28, 1.0], physicsClientId=client
+        body,
+        -1,
+        rgbaColor=[0.36, 0.32, 0.28, 1.0],
+        specularColor=[0.08, 0.08, 0.08],
+        physicsClientId=client,
     )
     print(
         f"[RUBBLE-ONLY] city pad {patch.shape[1]}x{patch.shape[0]} cells "
@@ -577,14 +586,13 @@ def main():
         print("   Q / ESC  = quit")
     print("=" * 65)
 
-    client = connect_pybullet(gui=gui, shadows=False)
+    client = connect_pybullet(gui=gui)
     if gui:
         # Belt-and-suspenders: force our GUI flags again right after connect.
         p.configureDebugVisualizer(
             p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=client
         )
         p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client)
-        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=client)
 
     use_dem = not args.procedural
     dem_path = None
@@ -623,6 +631,18 @@ def main():
                 f"[METRO] Gas station beside connector near "
                 f"({g['lot'][0]:.0f}, {g['lot'][1]:.0f}); "
                 f"{len(town.road_marks)} center dashes in ground texture."
+            )
+
+    if gui:
+        if args.rubble and rubble_town is not None:
+            spawn_sun_disc(
+                client,
+                origin=(rubble_town.center[0], rubble_town.center[1], 0.0),
+            )
+        elif use_dem and district is not None:
+            spawn_sun_disc(
+                client,
+                origin=(district.center[0], district.center[1], 0.0),
             )
 
     if not gui:
@@ -713,6 +733,18 @@ def main():
                     town, terrain, world_size = build_world(client, args.env_size, seed)
                     print(f"[METRO] Loaded {len(town.boxes)} boxes (seed={seed}).")
                     hud = None
+                if args.rubble and rubble_town is not None:
+                    spawn_sun_disc(
+                        client,
+                        origin=(rubble_town.center[0], rubble_town.center[1], 0.0),
+                    )
+                elif use_dem and district is not None:
+                    spawn_sun_disc(
+                        client,
+                        origin=(district.center[0], district.center[1], 0.0),
+                    )
+                else:
+                    spawn_sun_disc(client)
                 yaw, pitch, dist, target = frame_overview()
                 spectator = True
                 yaw, pitch, dist, eye = enter_spectator_fly(

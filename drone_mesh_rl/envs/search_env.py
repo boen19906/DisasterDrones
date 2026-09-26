@@ -1,15 +1,17 @@
 """
 search_env.py - Multi-agent search on a rectangular map.
 
-The world is a 240 m rubble city on a 250 m pad: next-best-view coverage
-and a leftover-survivor hunt choose where unfinished work is. The learning
-interface is Boen's. Each drone picks a heading plus climb, level, or
-descend, reads a shared coarse 8x8 coverage map, and is turned back when a
-heading would hit a wall or tower. Rubble chunks can be flown through.
-Search credit is only counted near 5 m AGL. The heading in the observation points at
-that search goal (a high-gain unpainted patch, or a leftover person), not
-at the nearest uncovered cell. Every drone reads the same painted map and
-teammate XY; overlapping headings are turned toward cells that drone owns.
+The playable world is a 240 m rubble city on a 250 m pad: next-best-view
+coverage and a leftover-survivor hunt choose where unfinished work is.
+GUI / search-viewer only also dress a ~1.2 km heightfield around that pad
+(forest, then mountains). Drones, coverage, and rewards stay on the 250 m
+square. The learning interface is Boen's. Each drone picks one of 9 headings
+(8 neighbors or stay), reads a shared coarse 8x8 coverage map, and is turned
+back when a heading would pin it on a wall. Drones hold 5 m AGL over the
+heightfield. The heading in the observation points at that search goal
+(a high-gain unpainted patch, or a leftover person), not at the nearest
+uncovered cell. Every drone reads the same painted map and teammate XY;
+overlapping headings are turned toward cells that drone owns.
 
 Rewards:
   +1.0   each newly painted cell, paid only to the drone that painted it
@@ -25,6 +27,7 @@ Rewards:
 import functools
 import math
 import os
+import tempfile
 import time
 from heapq import heappop, heappush
 
@@ -50,7 +53,7 @@ from .district import (
 )
 from .survivors import SurvivorCluster
 from .terrain import Terrain, spawn_terrain_in_pybullet
-from .town import TownLayout
+from .town import TownLayout, apply_spectator_sun
 
 
 COVER_CROP = 7  # local visited-map window (odd)
@@ -63,6 +66,7 @@ PERSON_TARGET_H = 1.7
 DRONE_TARGET_LONG = 3.6
 _PERSON_LETTERS = tuple(chr(c) for c in range(ord("a"), ord("r") + 1))
 _MESH_RGBA = [1.0, 1.0, 1.0, 1.0]
+_FOUND_RGBA = [0.15, 1.0, 0.25, 1.0]
 _CRASH_RGBA = [0.45, 0.06, 0.06, 1.0]
 CRASH_RANGE = 3.5
 BUILDING_RADIUS = 0.55  # lethal airframe radius
@@ -93,6 +97,9 @@ PACE_STEPS = 36  # still inside PACE_RADIUS on painted ground: stop the shuttle
 PACE_RADIUS = 14.0
 PACE_LOCK_STEPS = 100  # hold the heading toward leftover work across empty streets
 STREET_LOOKAHEAD_CELLS = 6  # follow streets this far around a block
+# Visual land around the 250 m pad. PyBullet GUI fades ~1000 m from camera.
+SEARCH_WORLD_M = 1200.0
+SEARCH_TERRAIN_RES = 8.0
 
 # Eight neighbor headings, plus stay. Stay on the wall is turned back inward.
 _HEADING_XY = np.array(
@@ -175,6 +182,17 @@ def _mesh_yaw_orn(yaw):
     q_fix = p.getQuaternionFromEuler([math.pi / 2.0, 0.0, 0.0])
     q_yaw = p.getQuaternionFromEuler([0.0, 0.0, float(yaw)])
     return p.multiplyTransforms([0, 0, 0], q_yaw, [0, 0, 0], q_fix)[1]
+
+
+def _write_textureless_obj(src_path):
+    """Copy an OBJ without mtllib/usemtl so rgbaColor is a solid mesh tint."""
+    fd, dst = tempfile.mkstemp(prefix="dd_person_green_", suffix=".obj")
+    with os.fdopen(fd, "w") as out, open(src_path) as src:
+        for line in src:
+            if line.startswith("mtllib ") or line.startswith("usemtl "):
+                continue
+            out.write(line)
+    return dst
 
 
 class SurvivorSearchEnv(ParallelEnv):
@@ -262,6 +280,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.act_dim = self.n_actions
 
         self.terrain = None
+        self.forest_trees = 0
         self.survivors = None
         self.coverage = np.zeros((self.cover_ny, self.cover_nx), dtype=np.float32)
         self.drone_positions = np.zeros((num_drones, 3))
@@ -312,6 +331,11 @@ class SurvivorSearchEnv(ParallelEnv):
         self._person_vis = []
         self._person_ymin = []
         self._person_scale = []
+        self._person_paths = []
+        self._person_models = []
+        self._person_tinted = []
+        self._person_green_vis = []
+        self._person_green_obj_files = []
         self._drone_vis = -1
         self._drone_yaw = np.zeros(num_drones, dtype=np.float64)
         self._drone_crash_tinted = np.zeros(num_drones, dtype=bool)
@@ -633,8 +657,6 @@ class SurvivorSearchEnv(ParallelEnv):
                 world = self._cell_to_world(gx, gy)
                 if not self._cell_is_searchable(world):
                     continue
-                if self._goal_abandoned(drone_index, world):
-                    continue
                 my_d = float(np.linalg.norm(world - my_xy))
                 if not share:
                     stolen = False
@@ -662,8 +684,6 @@ class SurvivorSearchEnv(ParallelEnv):
                         continue
                     world = self._cell_to_world(gx, gy)
                     if not self._cell_is_searchable(world):
-                        continue
-                    if self._goal_abandoned(drone_index, world):
                         continue
                     d = float(np.linalg.norm(world - my_xy))
                     if d < fallback_d:
@@ -902,6 +922,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 uy = -float(np.sign(pos[1])) or 0.0
         return ux, uy
 
+
     def _velocity_toward_unmapped(self, drone_index, pos):
         ux, uy = self._inland_search_dir(drone_index, pos)
         keep_apart = (
@@ -1056,6 +1077,7 @@ class SurvivorSearchEnv(ParallelEnv):
         if self.legacy_xy:
             start[2] = self._agl_z(float(start[0]), float(start[1]))
         return self._path_hits_solid(start, end)
+
 
     def _rubble_sense(self, pos):
         """Clearance at this height, level hits, and which headings open if the drone climbs."""
@@ -1632,9 +1654,6 @@ class SurvivorSearchEnv(ParallelEnv):
         """Fly the chosen heading. Map edges slide; rubble contact is a crash."""
         pos = np.asarray(pos, dtype=np.float64).copy()
         vel = np.asarray(vel, dtype=np.float64).copy()
-        if self.legacy_xy:
-            pos[2] = self._agl_z(float(pos[0]), float(pos[1]))
-            vel[2] = 0.0
         old = pos.copy()
         lx, ly = self._lim_x(), self._lim_y()
         # The chosen heading is what flies. A step into rubble is blocked. The map
@@ -1666,28 +1685,17 @@ class SurvivorSearchEnv(ParallelEnv):
             hit_y = True
         pos[0] = float(np.clip(pos[0], -lx, lx))
         pos[1] = float(np.clip(pos[1], -ly, ly))
-        if self.legacy_xy:
-            pos[2] = self._agl_z(pos[0], pos[1])
-            vel[2] = 0.0
-            building_hit = False
-            if self._path_hits_solid(old, pos) or self._hits_solid(pos):
-                building_hit = True
-                pos = old.copy()
-                pos[2] = self._agl_z(pos[0], pos[1])
-                vel[:] = 0.0
-            return pos, vel, building_hit
-        gz = self._ground_z(pos[0], pos[1])
-        pos[2] = float(np.clip(pos[2], gz + MIN_AGL, gz + self.drone_max_altitude))
-        if pos[2] <= gz + MIN_AGL + 1e-3 and vel[2] < 0.0:
-            vel[2] = 0.0
-        if pos[2] >= gz + self.drone_max_altitude - 1e-3 and vel[2] > 0.0:
-            vel[2] = 0.0
+        pos[2] = float(self._agl_z(pos[0], pos[1]))
+        vel[2] = 0.0
         building_hit = False
-        # Chunks are passable. A step into a wall or tower stops short of it.
-        if self._path_hits_solid(old, pos) or self._hits_solid(pos):
+        # Map edges slide. A step that would enter rubble stops short of it.
+        if self._path_hits_building(old, pos) or self._hits_building(pos):
             building_hit = True
             pos = old.copy()
+            pos[2] = float(self._agl_z(pos[0], pos[1]))
             vel[:] = 0.0
+        pos[2] = float(self._agl_z(pos[0], pos[1]))
+        vel[2] = 0.0
         return pos, vel, building_hit
 
     def _mark_coverage(self, positions):
@@ -1820,16 +1828,17 @@ class SurvivorSearchEnv(ParallelEnv):
         if self.render_mode == "human":
             self.client = p.connect(p.GUI)
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.client)
-            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=self.client)
             p.configureDebugVisualizer(
                 p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=self.client
             )
             p.configureDebugVisualizer(
                 p.COV_ENABLE_WIREFRAME, 0, physicsClientId=self.client
             )
+            apply_spectator_sun(self.client, shadows=True, spawn_disc=True)
             p.setRealTimeSimulation(0, physicsClientId=self.client)
         else:
             self.client = p.connect(p.DIRECT)
+            apply_spectator_sun(self.client, shadows=False, spawn_disc=False)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, 0, physicsClientId=self.client)
         p.setTimeStep(1.0 / self.pyb_freq, physicsClientId=self.client)
@@ -1853,6 +1862,15 @@ class SurvivorSearchEnv(ParallelEnv):
                     map_hx=0.5 * self.size_x,
                     map_hy=0.5 * self.size_y,
                 )
+                from .scenery import spawn_search_forest
+
+                self.forest_trees = spawn_search_forest(
+                    self.client,
+                    self.terrain,
+                    self.size_x,
+                    self.size_y,
+                    seed=self._seed if self._seed is not None else 42,
+                )
             return
         hx, hy = self.size_x / 2.0, self.size_y / 2.0
         col = p.createCollisionShape(
@@ -1875,12 +1893,25 @@ class SurvivorSearchEnv(ParallelEnv):
     def _uses_search_meshes(self):
         return self.render_mode == "human" and self.client is not None
 
+    def _clear_person_green_cache(self):
+        """Drop cached found-person visuals and their temp mesh files."""
+        self._person_green_vis = []
+        files = getattr(self, "_person_green_obj_files", None) or []
+        self._person_green_obj_files = []
+        for path in files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
     def _load_search_visuals(self):
         """Load character and drone meshes once per GUI client. Headless skips files."""
         self._person_vis = []
         self._person_ymin = []
         self._person_scale = []
+        self._person_paths = []
         self._drone_vis = -1
+        self._clear_person_green_cache()
         if not self._uses_search_meshes():
             return
         prefabs = _search_prefabs_dir()
@@ -1900,6 +1931,7 @@ class SurvivorSearchEnv(ParallelEnv):
             self._person_vis.append(vis)
             self._person_ymin.append(bounds["ymin"])
             self._person_scale.append(scale)
+            self._person_paths.append(path)
 
         drone_path = os.path.join(prefabs, "Drone.obj")
         bounds = _obj_bounds(drone_path)
@@ -1966,6 +1998,8 @@ class SurvivorSearchEnv(ParallelEnv):
     def _spawn_person_meshes(self, rng):
         """One textured character per survivor. Pose is set once; no per-step updates."""
         self.person_ids = []
+        self._person_models = []
+        self._person_tinted = []
         if not self._uses_search_meshes() or self.survivors is None or not self._person_vis:
             return
         positions = self.survivors.get_positions()
@@ -1986,6 +2020,8 @@ class SurvivorSearchEnv(ParallelEnv):
                 physicsClientId=self.client,
             )
             self.person_ids.append(bid)
+            self._person_models.append(model)
+            self._person_tinted.append(False)
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -2029,8 +2065,12 @@ class SurvivorSearchEnv(ParallelEnv):
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
         self.town = None
+        self.forest_trees = 0
         self.person_ids = []
         self._person_vis = []
+        self._person_paths = []
+        self._person_models = []
+        self._person_tinted = []
         self._drone_vis = -1
         if hasattr(self, "_lanes"):
             del self._lanes
@@ -2040,24 +2080,48 @@ class SurvivorSearchEnv(ParallelEnv):
             surv_seed ^= int(seed) & 0x7FFFFFFF
 
         pad = max(self.size_x, self.size_y)
+        world = float(SEARCH_WORLD_M)
+        hf_side = int(round(world / SEARCH_TERRAIN_RES))
+        assert hf_side <= 512, f"heightfield side {hf_side} exceeds 512"
+        assert hf_side * hf_side * 4 < 1_000_000, (
+            f"heightfield upload {hf_side * hf_side * 4} bytes exceeds 1 MiB"
+        )
         self.terrain = Terrain(
-            size_x=self.size_x,
-            size_y=self.size_y,
-            resolution=5.0,
+            size_x=world,
+            size_y=world,
+            resolution=SEARCH_TERRAIN_RES,
             seed=self._seed if self._seed is not None else 42,
             flat=False,
             with_structures=False,
             city_size=pad,
             city_centers=[(0.0, 0.0)],
+            blend_width=40.0,
+            color_blend_width=55.0,
             connector_segment=None,
-            rim_width=0.0,
-            n_rim_ranges=(0, 0),
+            rim_width=220.0,
+            n_rim_ranges=(5, 7),
+            rim_peak_amp=(42.0, 78.0),
+            rim_tall_amp=(80.0, 98.0),
+            rim_tall_prob=0.18,
+            rim_max_slope=0.36,
+            rim_min_city_dist=180.0,
             n_tall_hills=(0, 0),
-            n_hill_clusters=(0, 0),
-            meadow_amp=0.12,
-            grass_amp=0.35,
+            n_hill_clusters=(3, 6),
+            hill_amp_min=4.0,
+            hill_amp_max=9.0,
+            meadow_amp=0.25,
+            grass_amp=1.4,
             edge_grass_width=25.0,
             edge_rise_amp=2.8,
+            outer_fade_width=100.0,
+        )
+        hf_bytes = int(self.terrain.grid_x) * int(self.terrain.grid_y) * 4
+        peak_lo, peak_hi = getattr(self.terrain, "peak_height_range", (0.0, 0.0))
+        print(
+            f"[SEARCH-WORLD] playable={self.size_x:.0f}x{self.size_y:.0f} m  "
+            f"terrain={self.terrain.size_x:.0f}x{self.terrain.size_y:.0f} m  "
+            f"grid={self.terrain.grid_x}x{self.terrain.grid_y}  "
+            f"hf_bytes={hf_bytes}  peaks={peak_lo:.1f}–{peak_hi:.1f} m AGL"
         )
         town_size = min(float(RUBBLE_TOWN_SIZE), pad)
         self.town = RubbleTownLayout(
@@ -2300,6 +2364,7 @@ class SurvivorSearchEnv(ParallelEnv):
         ]
         prev_discovered = np.asarray(self.survivors.discovered, dtype=bool).copy()
         self.newly_discovered, _ = self.survivors.update_discovery(alive_pos, self.terrain)
+        self._tint_found_people(prev_discovered)
         self._credit_drone_finds(prev_discovered)
 
         rewards = self._compute_rewards(collisions, building_kills, rubble_blocks)
@@ -2310,6 +2375,71 @@ class SurvivorSearchEnv(ParallelEnv):
         truncations = {a: ((all_found and mapped) or maxed or all_dead) for a in self.possible_agents}
         terminations = {a: False for a in self.possible_agents}
         return self._get_observations(), rewards, terminations, truncations, self._infos()
+
+    def _ensure_found_person_vis(self, model):
+        """One shared solid-green visual per character model. Found people reuse it."""
+        while len(self._person_green_vis) <= model:
+            self._person_green_vis.append(-1)
+        if self._person_green_vis[model] >= 0:
+            return self._person_green_vis[model]
+        path = self._person_paths[model]
+        scale = self._person_scale[model]
+        stripped = _write_textureless_obj(path)
+        self._person_green_obj_files.append(stripped)
+        vis = p.createVisualShape(
+            p.GEOM_MESH,
+            fileName=stripped,
+            meshScale=[scale, scale, scale],
+            rgbaColor=_FOUND_RGBA,
+            physicsClientId=self.client,
+        )
+        self._person_green_vis[model] = vis
+        return vis
+
+    def _replace_person_with_green(self, i):
+        """Give this body its own green visual so siblings keep their texture."""
+        bid = int(self.person_ids[i])
+        if bid < 0:
+            return
+        pos, orn = p.getBasePositionAndOrientation(bid, physicsClientId=self.client)
+        model = int(self._person_models[i]) if i < len(self._person_models) else 0
+        green_vis = self._ensure_found_person_vis(model)
+        p.removeBody(bid, physicsClientId=self.client)
+        new_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=green_vis,
+            basePosition=pos,
+            baseOrientation=orn,
+            physicsClientId=self.client,
+        )
+        p.changeVisualShape(
+            new_id,
+            -1,
+            rgbaColor=_FOUND_RGBA,
+            textureUniqueId=-1,
+            physicsClientId=self.client,
+        )
+        self.person_ids[i] = new_id
+
+    def _tint_found_people(self, prev_discovered):
+        """On false→true discovery, recolor that one person. GUI meshes only."""
+        if self.client is None or not self.person_ids:
+            return
+        if self.survivors is None:
+            return
+        discovered = np.asarray(self.survivors.discovered, dtype=bool)
+        prev = np.asarray(prev_discovered, dtype=bool)
+        if discovered.shape != prev.shape:
+            return
+        for si in np.flatnonzero(discovered & ~prev):
+            i = int(si)
+            if i >= len(self.person_ids) or i >= len(self._person_tinted):
+                continue
+            if self._person_tinted[i]:
+                continue
+            self._replace_person_with_green(i)
+            self._person_tinted[i] = True
 
     def _credit_drone_finds(self, prev_discovered):
         """When a discovered flag flips, credit the closest alive drone in sensor range."""
@@ -2363,7 +2493,7 @@ class SurvivorSearchEnv(ParallelEnv):
             if self._drone_new_cells[i] == 0 and self._drone_overlap[i] > 0:
                 rew -= 0.25
             if self.drone_alive[i] and not rubble_blocks[i]:
-                speed = float(np.linalg.norm(self.drone_velocities[i]))
+                speed = float(np.hypot(self.drone_velocities[i][0], self.drone_velocities[i][1]))
                 if speed < 0.5 and work_remains:
                     rew -= 1.0
             if collisions[i]:
@@ -2448,3 +2578,4 @@ class SurvivorSearchEnv(ParallelEnv):
             except Exception:
                 pass
             self.client = None
+        self._clear_person_green_cache()

@@ -30,6 +30,7 @@ from envs.terrain import Terrain, find_dem_file, spawn_terrain_in_pybullet
 from envs.town import (
     MetroLayout,
     connect_pybullet,
+    spawn_sun_disc,
     spawn_town_in_pybullet,
     frame_town_camera,
 )
@@ -433,14 +434,13 @@ def main():
         print("   Q / ESC  = quit")
     print("=" * 65)
 
-    client = connect_pybullet(gui=gui, shadows=False)
+    client = connect_pybullet(gui=gui)
     if gui:
         # Belt-and-suspenders: force our GUI flags again right after connect.
         p.configureDebugVisualizer(
             p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=client
         )
         p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client)
-        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=client)
 
     use_dem = not args.procedural
     dem_path = None
@@ -532,6 +532,7 @@ def main():
                     seed = int(seed) + 1
                     town, terrain, world_size = build_world(client, args.env_size, seed)
                     print(f"[METRO] Loaded {len(town.boxes)} boxes (seed={seed}).")
+                spawn_sun_disc(client)
                 yaw, pitch, dist, target = frame_overview()
                 spectator = True
                 yaw, pitch, dist, eye = enter_spectator_fly(

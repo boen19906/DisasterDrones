@@ -348,10 +348,16 @@ class Terrain:
         rim_tall_prob=0.15,
         # Per-axis cap; diagonal gradients land near 0.4
         rim_max_slope=0.34,
-        # Search pad: fade pavement→grass and a LOW berm on the outer band.
+        # Search pad: fade pavement→grass and a LOW berm on the outer band
+        # of each city square (not the world rim).
         # Not the mountain rim (leave rim_width=0 for that).
         edge_grass_width=0.0,
         edge_rise_amp=0.0,
+        # Soften the world border so the map does not end as a cliff.
+        # 0 leaves the rim as generated (metro / old 250 m pad).
+        outer_fade_width=0.0,
+        # Min city-outside distance for a rim peak. None = size-adaptive.
+        rim_min_city_dist=None,
     ):
         self.size_x = float(size_x)
         self.size_y = float(size_y)
@@ -397,6 +403,10 @@ class Terrain:
         self.rim_max_slope = float(rim_max_slope)
         self.edge_grass_width = float(edge_grass_width)
         self.edge_rise_amp = float(edge_rise_amp)
+        self.outer_fade_width = float(outer_fade_width)
+        self.rim_min_city_dist = (
+            None if rim_min_city_dist is None else float(rim_min_city_dist)
+        )
         self.grid_x = int(round(self.size_x / self.resolution))
         self.grid_y = int(round(self.size_y / self.resolution))
         self.resolution_x = self.resolution
@@ -415,6 +425,7 @@ class Terrain:
         self._grass_relief = None
         # Fine relief + belt landforms + rim (above grade) — rock / snow tint
         self._relief = None
+        self.peak_height_range = (0.0, 0.0)
         self.structures = []
         if self.flat:
             # Search trainer still asks for a flat field. Skip the city relief.
@@ -466,6 +477,7 @@ class Terrain:
         self._seed = None
         self._grass_relief = None
         self._relief = None
+        self.peak_height_range = (0.0, float(np.max(self.heightmap)))
         self._texture_path = None
         return self
 
@@ -521,6 +533,16 @@ class Terrain:
             d = _signed_distance_to_square(X - cx, Y - cy, half)
             dist = d if dist is None else np.minimum(dist, d)
         return dist
+
+    def _rim_city_clear(self):
+        """How far a rim peak must sit outside the nearest city pad."""
+        if self.rim_min_city_dist is not None:
+            return float(self.rim_min_city_dist)
+        half_w = 0.5 * min(self.size_x, self.size_y)
+        city_half = 0.5 * self.city_size
+        typical_peak_r = half_w - 0.4 * max(self.rim_width, 1.0)
+        typical_d_c = typical_peak_r - city_half
+        return min(450.0, max(120.0, 0.7 * typical_d_c))
 
     def _blurred_field(self, rng, cell, amp=1.0, blur_frac=0.55, passes=4):
         """Heavily blurred low-frequency lattice → smooth scalar field."""
@@ -792,6 +814,7 @@ class Terrain:
         # Cells whose height must stay ~0: city blend ring + connector ribbon
         guard = (dist < self.blend_width + 120.0) | (road_d < self.connector_flat + 40.0)
         gX, gY = X[guard], Y[guard]
+        min_city = self._rim_city_clear()
 
         perim = 2.0 * (self.size_x + self.size_y)
         n_lo, n_hi = self.n_rim_ranges
@@ -810,7 +833,11 @@ class Terrain:
             k = max(2, int(round(length / 300.0)))
             for m in range(k):
                 s = start + (m + 0.5 + float(rng.uniform(-0.15, 0.15))) * length / k
-                inset = float(rng.uniform(0.2, 0.6)) * self.rim_width
+                min_in = 0.2
+                fade_out = float(getattr(self, "outer_fade_width", 0.0) or 0.0)
+                if fade_out > 1e-6:
+                    min_in = min(0.55, fade_out / max(self.rim_width, 1.0))
+                inset = float(rng.uniform(min_in, 0.75)) * self.rim_width
                 if rng.random() < self.rim_tall_prob:
                     amp = float(rng.uniform(*self.rim_tall_amp))
                 else:
@@ -829,17 +856,17 @@ class Terrain:
                     d_c = float(
                         self._city_outside_distance(np.array(cx), np.array(cy))
                     )
-                    if d_c >= 450.0 and gX.size:
+                    if d_c >= min_city and gX.size:
                         leak = self._anisotropic_hill(
                             gX, gY, cx, cy, amp, s_along, s_across, ang + tilt
                         )
                         placed = float(np.max(leak)) < 2.0
-                    elif d_c >= 450.0:
+                    elif d_c >= min_city:
                         placed = True
                     if placed:
                         break
-                    # Retry lower and closer to the border
-                    inset = 0.2 * self.rim_width
+                    # Retry lower and closer to the border (but inside the outer fade)
+                    inset = min_in * self.rim_width
                     amp *= 0.7
                 if not placed:
                     continue
@@ -902,18 +929,46 @@ class Terrain:
         # --- Soft seam: distance-to-nearest-downtown + smoothstep ---
         t = _smoothstep(0.0, self.blend_width, dist)
         Z = (1.0 - t) * city + t * grass
-        # Low uneven berm on the outer band (search pad). Not a mountain rim.
+        # Keep the inner city pad on the city layer so streets stay flyable.
         fade_w = float(getattr(self, "edge_grass_width", 0.0) or 0.0)
+        lock_in = -max(fade_w, 1.0)
+        inner = dist < lock_in
+        if inner.any():
+            Z = np.where(inner, city, Z)
+        # Low uneven berm on the outer band of each city square. Not a mountain rim.
         rise_amp = float(getattr(self, "edge_rise_amp", 0.0) or 0.0)
         if fade_w > 1e-6 and rise_amp > 1e-6:
-            hx, hy = self.size_x / 2.0, self.size_y / 2.0
-            edge_d = np.minimum(hx - np.abs(X), hy - np.abs(Y))
-            w = 1.0 - _smoothstep(0.0, fade_w, edge_d)
+            inward = np.maximum(-dist, 0.0)
+            w = (1.0 - _smoothstep(0.0, fade_w, inward)) * (dist <= 0.0)
             n = 0.55 + 0.45 * (0.5 * (self._blurred_field(rng, 22.0, amp=1.0) + 1.0))
             Z = Z + w * n * rise_amp
+        # Soften the world border so the heightfield does not end as a cliff.
+        fade_out = float(getattr(self, "outer_fade_width", 0.0) or 0.0)
+        if fade_out > 1e-6:
+            hx, hy = self.size_x / 2.0, self.size_y / 2.0
+            border = np.minimum(hx - np.abs(X), hy - np.abs(Y))
+            outer_w = _smoothstep(0.0, fade_out, border)
+            pad = inner if inner.any() else dist <= 0.0
+            city_ref = float(np.median(Z[pad])) if np.any(pad) else 0.0
+            Z = np.where(dist > 0.0, city_ref + (Z - city_ref) * outer_w, Z)
         # Shift up so the map stays non-negative without flattening the low side
         # of a long gentle grade (np.maximum(., 0) would zero half a km-scale map).
         Z = Z - float(np.min(Z))
+        pad = dist <= 0.0
+        city_z = float(np.median(Z[pad])) if np.any(pad) else 0.0
+        realized = []
+        if getattr(self, "_rim_peaks", None):
+            xs, ys = X[0, :], Y[:, 0]
+            for cx, cy, _amp in self._rim_peaks:
+                j = int(np.clip(np.argmin(np.abs(xs - cx)), 0, self.grid_x - 1))
+                i = int(np.clip(np.argmin(np.abs(ys - cy)), 0, self.grid_y - 1))
+                realized.append(float(Z[i, j] - city_z))
+        if realized:
+            self.peak_height_range = (min(realized), max(realized))
+        else:
+            far = dist > max(80.0, 0.35 * self.city_size)
+            above = (Z[far] - city_z) if far.any() else np.array([0.0])
+            self.peak_height_range = (0.0, float(np.max(above)))
         return Z.astype(np.float64)
 
     def generate_ground_texture(
@@ -977,11 +1032,15 @@ class Terrain:
             )
             slope = _upsample_bilinear(np.hypot(gx, gy), tex_res, tex_res)
             h_n = h + 8.0 * light
-            rock_w = np.maximum(
-                _smoothstep(55.0, 110.0, h_n),
-                _smoothstep(0.24, 0.36, slope) * _smoothstep(40.0, 70.0, h_n),
-            )
             h_top = float(np.max(self._relief))
+            rock_lo = min(55.0, max(24.0, 0.40 * h_top))
+            rock_hi = min(110.0, max(rock_lo + 18.0, 0.80 * h_top))
+            slope_h_lo = min(40.0, max(16.0, 0.30 * h_top))
+            slope_h_hi = min(70.0, max(slope_h_lo + 12.0, 0.55 * h_top))
+            rock_w = np.maximum(
+                _smoothstep(rock_lo, rock_hi, h_n),
+                _smoothstep(0.24, 0.36, slope) * _smoothstep(slope_h_lo, slope_h_hi, h_n),
+            )
             snow_lo = max(135.0, h_top - 22.0)
             snow_w = _smoothstep(snow_lo, snow_lo + 12.0, h + 6.0 * light)
             snow_w = snow_w * (1.0 - _smoothstep(0.34, 0.45, slope))
@@ -1000,9 +1059,8 @@ class Terrain:
         rgb = (1.0 - t)[:, :, None] * dust_rgb + t[:, :, None] * grass_rgb
         fade_w = float(getattr(self, "edge_grass_width", 0.0) or 0.0)
         if fade_w > 1e-6:
-            hx, hy = self.size_x / 2.0, self.size_y / 2.0
-            edge_d = np.minimum(hx - np.abs(X), hy - np.abs(Y))
-            w = 1.0 - _smoothstep(0.0, fade_w, edge_d)
+            inward = np.maximum(-dist, 0.0)
+            w = (1.0 - _smoothstep(0.0, fade_w, inward)) * (dist <= 0.0)
             rgb = (1.0 - w)[:, :, None] * rgb + w[:, :, None] * grass_rgb
         rgb = np.clip(rgb, 0.0, 1.0)
         rgb_u8 = (rgb * 255.0 + 0.5).astype(np.uint8)
@@ -1211,10 +1269,13 @@ def spawn_terrain_in_pybullet(client, terrain):
     if texture_id >= 0:
         p.changeVisualShape(
             body, -1, rgbaColor=[1, 1, 1, 1], textureUniqueId=texture_id,
+            specularColor=[0.08, 0.08, 0.08],
             physicsClientId=client,
         )
     else:
         p.changeVisualShape(
-            body, -1, rgbaColor=[*_GRASS_RGB, 1.0], physicsClientId=client
+            body, -1, rgbaColor=[*_GRASS_RGB, 1.0],
+            specularColor=[0.08, 0.08, 0.08],
+            physicsClientId=client,
         )
     return body

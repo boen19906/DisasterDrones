@@ -1637,14 +1637,126 @@ class MetroLayout:
         return out
 
 
-def connect_pybullet(gui=True, shadows=False):
-    """Open a PyBullet client. Shadows default off for a lighter GUI."""
+# Afternoon sun: incoming from high SW so shadows fall NE.
+# +X east, +Y north, +Z up. Unit vector points toward the sun.
+_SUN_DIR = np.array([-0.45, -0.40, 0.80], dtype=np.float64)
+_SUN_DIR /= np.linalg.norm(_SUN_DIR)
+# Warm afternoon, not white-hot. Printed even if this PyBullet build
+# has no lightColor kwarg on configureDebugVisualizer.
+_LIGHT_COLOR = (1.0, 0.90, 0.70)
+_SKY_RGB = (0.46, 0.70, 0.94)
+# Shadow camera looks from (lightPos + cameraTarget) at the target; the
+# ortho far plane is 300 m, so this offset must stay well under 300.
+_LIGHT_OFFSET_M = 110.0
+_SUN_DISC_DIST_M = 620.0
+_SUN_DISC_RADIUS_M = 18.0
+_SHADOW_MAP_RES = 2048
+_SHADOW_MAP_WORLD = 400
+_SHADOW_INTENSITY = 0.28
+
+
+def sunlight_direction():
+    """Unit vector from the scene toward the afternoon sun (high SW)."""
+    return _SUN_DIR.copy()
+
+
+def _print_sun_line(shadows):
+    d = _SUN_DIR
+    c = _LIGHT_COLOR
+    print(
+        f"[SUN] direction=({d[0]:.3f}, {d[1]:.3f}, {d[2]:.3f})  "
+        f"color=({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f})  "
+        f"shadows={'on' if shadows else 'off'}"
+    )
+
+
+_SUN_BODY = None
+
+
+def spawn_sun_disc(client, origin=(0.0, 0.0, 0.0)):
+    """Visual-only sun disc along the incoming light, inside GUI draw distance.
+
+    `origin` is the city/camera focus. The disc sits 620 m toward the SW
+    sun so a spectator over downtown still sees it inside the ~1000 m far
+    plane. Calling again moves the existing disc if that body is still live.
+    """
+    global _SUN_BODY
+    if p is None or client is None:
+        return None
+    pos = np.asarray(origin, dtype=np.float64) + _SUN_DIR * _SUN_DISC_DIST_M
+    if _SUN_BODY is not None:
+        try:
+            p.resetBasePositionAndOrientation(
+                _SUN_BODY,
+                pos.tolist(),
+                [0.0, 0.0, 0.0, 1.0],
+                physicsClientId=client,
+            )
+            return _SUN_BODY
+        except Exception:
+            _SUN_BODY = None
+    vis = p.createVisualShape(
+        p.GEOM_SPHERE,
+        radius=_SUN_DISC_RADIUS_M,
+        rgbaColor=[1.0, 0.92, 0.38, 1.0],
+        specularColor=[1.0, 0.95, 0.55],
+        physicsClientId=client,
+    )
+    _SUN_BODY = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=vis,
+        basePosition=pos.tolist(),
+        physicsClientId=client,
+    )
+    return _SUN_BODY
+
+
+def configure_sunlight(client, shadows=True):
+    """GUI directional sun, warm fill, sky tint, and a town-scale shadow map."""
+    if p is None or client is None:
+        _print_sun_line(False)
+        return
+    shadows = bool(shadows)
+    p.configureDebugVisualizer(
+        p.COV_ENABLE_SHADOWS, 1 if shadows else 0, physicsClientId=client
+    )
+    light_pos = (_SUN_DIR * _LIGHT_OFFSET_M).tolist()
+    kwargs = dict(
+        lightPosition=light_pos,
+        shadowMapResolution=_SHADOW_MAP_RES,
+        shadowMapWorldSize=_SHADOW_MAP_WORLD,
+        shadowMapIntensity=_SHADOW_INTENSITY,
+        rgbBackground=list(_SKY_RGB),
+        physicsClientId=client,
+    )
+    try:
+        p.configureDebugVisualizer(lightColor=list(_LIGHT_COLOR), **kwargs)
+    except TypeError:
+        p.configureDebugVisualizer(**kwargs)
+    _print_sun_line(shadows)
+
+
+def apply_spectator_sun(client, shadows=True, spawn_disc=True, origin=(0.0, 0.0, 0.0)):
+    """Apply spectator lighting. Headless callers must pass shadows=False and spawn_disc=False."""
+    if shadows or spawn_disc:
+        configure_sunlight(client, shadows=shadows)
+        if spawn_disc:
+            return spawn_sun_disc(client, origin=origin)
+        return None
+    _print_sun_line(False)
+    return None
+
+
+def connect_pybullet(gui=True, shadows=None):
+    """Open a PyBullet client. GUI gets an afternoon sun and shadows; DIRECT does not."""
+    global _SUN_BODY
+    _SUN_BODY = None
+    if shadows is None:
+        shadows = bool(gui)
     client = p.connect(p.GUI if gui else p.DIRECT)
     if gui:
         p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=client)
-        p.configureDebugVisualizer(
-            p.COV_ENABLE_SHADOWS, 1 if shadows else 0, physicsClientId=client
-        )
         # Disable built-in W/wireframe and other GUI hotkeys so app keys win.
         p.configureDebugVisualizer(
             p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=client
@@ -1652,6 +1764,9 @@ def connect_pybullet(gui=True, shadows=False):
         p.configureDebugVisualizer(
             p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client
         )
+        apply_spectator_sun(client, shadows=bool(shadows), spawn_disc=True)
+    else:
+        apply_spectator_sun(client, shadows=False, spawn_disc=False)
     p.setGravity(0, 0, -9.81, physicsClientId=client)
     return client
 
@@ -1728,6 +1843,7 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
             -1,
             rgbaColor=[1.0, 1.0, 1.0, 1.0],
             textureUniqueId=texture_id,
+            specularColor=[0.08, 0.08, 0.08],
             physicsClientId=client,
         )
     else:
@@ -1735,6 +1851,7 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
             terrain_body,
             -1,
             rgbaColor=[0.45, 0.38, 0.28, 1],
+            specularColor=[0.08, 0.08, 0.08],
             physicsClientId=client,
         )
 

@@ -789,3 +789,171 @@ def spawn_scenery_in_pybullet(client, terrain, districts, seed=_SEED):
         "meshes": loaded,
     }
     return bodies, info
+
+
+def _outside_playable(x, y, hx, hy, margin=12.0):
+    return abs(x) > hx + margin or abs(y) > hy + margin
+
+
+def spawn_search_forest(client, terrain, playable_x, playable_y, seed=42):
+    """
+    Kenney grove belt outside the search square. Visual only: each of
+    tree / tree-high / plant / patch-grass is loaded once. Not obstacles.
+    """
+    hx = 0.5 * float(playable_x)
+    hy = 0.5 * float(playable_y)
+    world_hx = 0.5 * float(terrain.size_x)
+    world_hy = 0.5 * float(terrain.size_y)
+    inner = max(hx, hy) + 12.0
+    # Stay off the mountain rim and the heightfield lip.
+    outer = min(world_hx, world_hy) - 90.0
+    if outer <= inner + 20.0:
+        print("[SEARCH-FOREST] skipped: no belt between city and world rim")
+        return 0
+
+    rng = np.random.default_rng(int(seed) + 904)
+    bank = _MeshBank(client)
+    stems = ("tree", "tree-high", "plant", "patch-grass")
+    loaded = []
+    for stem in stems:
+        try:
+            bank.load(stem)
+            loaded.append(stem)
+        except (FileNotFoundError, RuntimeError, OSError):
+            continue
+    if not loaded:
+        print("[SEARCH-FOREST] skipped: Kenney meshes missing")
+        return 0
+
+    slope, _Z = _slope_field(terrain)
+
+    def _sample_belt(lo, hi):
+        for _ in range(40):
+            x = float(rng.uniform(-hi, hi))
+            y = float(rng.uniform(-hi, hi))
+            cheb = max(abs(x), abs(y))
+            if lo <= cheb <= hi:
+                return x, y
+        return None
+
+    def _ok(x, y, max_slope=0.22):
+        if not _outside_playable(x, y, hx, hy, 12.0):
+            return False
+        if abs(x) > world_hx - 70.0 or abs(y) > world_hy - 70.0:
+            return False
+        cheb = max(abs(x), abs(y))
+        if cheb < inner or cheb > outer:
+            return False
+        i = int(np.clip((y + world_hy) / max(terrain.resolution_y, 1e-6), 0, slope.shape[0] - 1))
+        j = int(np.clip((x + world_hx) / max(terrain.resolution_x, 1e-6), 0, slope.shape[1] - 1))
+        return float(slope[i, j]) <= max_slope
+
+    # Open meadows: no grove centers here. Dense thickets: extra trees.
+    meadows = []
+    for _ in range(int(rng.integers(5, 8))):
+        pt = _sample_belt(inner + 30.0, outer - 20.0)
+        if pt is None:
+            continue
+        meadows.append((pt[0], pt[1], float(rng.uniform(55.0, 90.0))))
+    thickets = []
+    for _ in range(int(rng.integers(6, 9))):
+        pt = _sample_belt(inner + 20.0, outer - 30.0)
+        if pt is None:
+            continue
+        cx, cy = pt
+        if any(math.hypot(cx - mx, cy - my) < mr + 40.0 for mx, my, mr in meadows):
+            continue
+        thickets.append((cx, cy, float(rng.uniform(40.0, 70.0))))
+
+    def _in_meadow(x, y):
+        return any(math.hypot(x - mx, y - my) < mr for mx, my, mr in meadows)
+
+    def _in_thicket(x, y):
+        return any(math.hypot(x - tx, y - ty) < tr for tx, ty, tr in thickets)
+
+    groves = []
+    attempts = 0
+    n_groves = int(rng.integers(28, 38))
+    while len(groves) < n_groves and attempts < n_groves * 40:
+        attempts += 1
+        pt = _sample_belt(inner + 8.0, outer - 8.0)
+        if pt is None:
+            continue
+        gx, gy = pt
+        if _in_meadow(gx, gy) or not _ok(gx, gy, 0.20):
+            continue
+        sep = 28.0 if _in_thicket(gx, gy) else 48.0
+        if any(math.hypot(gx - px, gy - py) < sep for px, py in groves):
+            continue
+        groves.append((gx, gy))
+
+    n_trees = 0
+    n_plants = 0
+    n_grass = 0
+    placed = []
+
+    def _sit(stem, x, y, yaw, lift=0.0):
+        if stem not in bank.vis:
+            return False
+        if any(math.hypot(x - px, y - py) < 2.6 for px, py in placed):
+            return False
+        try:
+            bank.sit(terrain, stem, x, y, yaw, lift=lift)
+        except Exception:
+            return False
+        placed.append((x, y))
+        return True
+
+    for gx, gy in groves:
+        dense = _in_thicket(gx, gy)
+        n_local = int(rng.integers(11, 18) if dense else rng.integers(6, 12))
+        radius = 14.0 if dense else 11.0
+        for k, (ox, oy) in enumerate(_cluster_offsets(rng, n_local, radius, 2.2)):
+            px, py = gx + ox, gy + oy
+            if not _ok(px, py):
+                continue
+            if "tree-high" in bank.vis and (dense and k % 3 == 0 or (not dense and k % 4 == 0)):
+                stem = "tree-high"
+            elif "tree" in bank.vis:
+                stem = "tree"
+            else:
+                stem = loaded[0]
+            if _sit(stem, px, py, float(rng.uniform(0.0, 2.0 * math.pi))):
+                n_trees += 1
+        n_under = int(rng.integers(3, 7) if dense else rng.integers(1, 4))
+        for ox, oy in _cluster_offsets(rng, n_under, 8.0, 1.4):
+            px, py = gx + ox, gy + oy
+            if not _ok(px, py, 0.26):
+                continue
+            if _sit("plant", px, py, float(rng.uniform(0.0, 2.0 * math.pi))):
+                n_plants += 1
+        if _ok(gx, gy, 0.26) and _sit(
+            "patch-grass", gx, gy, float(rng.uniform(0.0, 2.0 * math.pi)), lift=_PATCH_LIFT
+        ):
+            n_grass += 1
+
+    # A few stray trees so the belt is not only discrete groves.
+    for _ in range(40):
+        pt = _sample_belt(inner + 6.0, outer - 10.0)
+        if pt is None:
+            continue
+        px, py = pt
+        if _in_meadow(px, py) or not _ok(px, py):
+            continue
+        stem = "tree-high" if rng.random() < 0.3 and "tree-high" in bank.vis else "tree"
+        if stem not in bank.vis:
+            continue
+        if _sit(stem, px, py, float(rng.uniform(0.0, 2.0 * math.pi))):
+            n_trees += 1
+
+    for x, y in placed:
+        if not _outside_playable(x, y, hx, hy, 12.0):
+            raise RuntimeError(
+                f"search forest prop at ({x:.1f}, {y:.1f}) is inside the playable square"
+            )
+    print(
+        f"[SEARCH-FOREST] groves={len(groves)}  trees={n_trees}  "
+        f"plants={n_plants}  grass={n_grass}  "
+        f"meshes={','.join(loaded)} (visual only, no collision)"
+    )
+    return n_trees
