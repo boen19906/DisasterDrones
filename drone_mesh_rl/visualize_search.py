@@ -100,7 +100,11 @@ def _disable_pybullet_hotkeys(client):
 
 
 class SearchCamera:
-    """Keyboard camera: arrows pan, 1-9 follow a drone, 0 overview, F fly."""
+    """Keyboard camera: arrows pan, 1-9 follow a drone, 0 overview, F fly.
+
+    Overview is framed on the 250 m city. Fly / pan are not clamped to that
+    square — the spectator can move out over the forest and mountains.
+    """
 
     def __init__(self, client, num_drones, env_size):
         self.client = client

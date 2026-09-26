@@ -192,7 +192,11 @@ def _key_triggered(keys, code):
 
 
 def update_spectator_camera(client, keys, yaw, pitch, dist, eye, move_speed=None):
-    """Minecraft-style spectator: WASD look-relative, arrows look, Space/Shift vertical."""
+    """Minecraft-style spectator: WASD look-relative, arrows look, Space/Shift vertical.
+
+    Eye XY is not clamped — search fly can leave the 250 m city and look at
+    the forest and mountain ring.
+    """
     speed = _SPEC_MOVE_SPEED if move_speed is None else float(move_speed)
     # Sprint: Left Ctrl only — Left Shift is descend, not faster
     if _key_down(keys, p.B3G_CONTROL):

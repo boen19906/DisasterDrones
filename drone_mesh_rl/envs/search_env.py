@@ -1,14 +1,17 @@
 """
 search_env.py - Multi-agent search on a rectangular map.
 
-The world is a 240 m rubble city on a 250 m pad: next-best-view coverage
-and a leftover-survivor hunt choose where unfinished work is. The learning
-interface is Boen's. Each drone picks one of 9 headings (8 neighbors or
-stay), reads a shared coarse 8x8 coverage map, and is turned back when a
-heading would pin it on a wall. Drones hold 5 m AGL over the heightfield. The heading in the observation points at
-that search goal (a high-gain unpainted patch, or a leftover person), not
-at the nearest uncovered cell. Every drone reads the same painted map and
-teammate XY; overlapping headings are turned toward cells that drone owns.
+The playable world is a 240 m rubble city on a 250 m pad: next-best-view
+coverage and a leftover-survivor hunt choose where unfinished work is.
+GUI / search-viewer only also dress a ~1.2 km heightfield around that pad
+(forest, then mountains). Drones, coverage, and rewards stay on the 250 m
+square. The learning interface is Boen's. Each drone picks one of 9 headings
+(8 neighbors or stay), reads a shared coarse 8x8 coverage map, and is turned
+back when a heading would pin it on a wall. Drones hold 5 m AGL over the
+heightfield. The heading in the observation points at that search goal
+(a high-gain unpainted patch, or a leftover person), not at the nearest
+uncovered cell. Every drone reads the same painted map and teammate XY;
+overlapping headings are turned toward cells that drone owns.
 
 Rewards:
   +1.0   each newly painted cell, paid only to the drone that painted it
@@ -80,6 +83,9 @@ GOAL_EDGE_M = 0.25  # claim streets on the rim
 LEFTOVER_CELLS = 80  # drop keep-out so last alleys are not abandoned
 WALL_COOLDOWN_STEPS = 12  # brief peel if a corner pins them
 STREET_LOOKAHEAD_CELLS = 6  # follow streets this far around a block
+# Visual land around the 250 m pad. PyBullet GUI fades ~1000 m from camera.
+SEARCH_WORLD_M = 1200.0
+SEARCH_TERRAIN_RES = 8.0
 
 # Eight neighbor headings, plus stay. Stay on the wall is turned back inward.
 _HEADING_XY = np.array(
@@ -230,6 +236,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 2 * num_drones
 
         self.terrain = None
+        self.forest_trees = 0
         self.survivors = None
         self.coverage = np.zeros((self.cover_ny, self.cover_nx), dtype=np.float32)
         self.drone_positions = np.zeros((num_drones, 3))
@@ -1222,6 +1229,15 @@ class SurvivorSearchEnv(ParallelEnv):
                     map_hx=0.5 * self.size_x,
                     map_hy=0.5 * self.size_y,
                 )
+                from .scenery import spawn_search_forest
+
+                self.forest_trees = spawn_search_forest(
+                    self.client,
+                    self.terrain,
+                    self.size_x,
+                    self.size_y,
+                    seed=self._seed if self._seed is not None else 42,
+                )
             return
         hx, hy = self.size_x / 2.0, self.size_y / 2.0
         col = p.createCollisionShape(
@@ -1376,6 +1392,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
         self.town = None
+        self.forest_trees = 0
         self.person_ids = []
         self._person_vis = []
         self._drone_vis = -1
@@ -1387,24 +1404,48 @@ class SurvivorSearchEnv(ParallelEnv):
             surv_seed ^= int(seed) & 0x7FFFFFFF
 
         pad = max(self.size_x, self.size_y)
+        world = float(SEARCH_WORLD_M)
+        hf_side = int(round(world / SEARCH_TERRAIN_RES))
+        assert hf_side <= 512, f"heightfield side {hf_side} exceeds 512"
+        assert hf_side * hf_side * 4 < 1_000_000, (
+            f"heightfield upload {hf_side * hf_side * 4} bytes exceeds 1 MiB"
+        )
         self.terrain = Terrain(
-            size_x=self.size_x,
-            size_y=self.size_y,
-            resolution=5.0,
+            size_x=world,
+            size_y=world,
+            resolution=SEARCH_TERRAIN_RES,
             seed=self._seed if self._seed is not None else 42,
             flat=False,
             with_structures=False,
             city_size=pad,
             city_centers=[(0.0, 0.0)],
+            blend_width=40.0,
+            color_blend_width=55.0,
             connector_segment=None,
-            rim_width=0.0,
-            n_rim_ranges=(0, 0),
+            rim_width=220.0,
+            n_rim_ranges=(5, 7),
+            rim_peak_amp=(42.0, 78.0),
+            rim_tall_amp=(80.0, 98.0),
+            rim_tall_prob=0.18,
+            rim_max_slope=0.36,
+            rim_min_city_dist=180.0,
             n_tall_hills=(0, 0),
-            n_hill_clusters=(0, 0),
-            meadow_amp=0.12,
-            grass_amp=0.35,
+            n_hill_clusters=(3, 6),
+            hill_amp_min=4.0,
+            hill_amp_max=9.0,
+            meadow_amp=0.25,
+            grass_amp=1.4,
             edge_grass_width=25.0,
             edge_rise_amp=2.8,
+            outer_fade_width=100.0,
+        )
+        hf_bytes = int(self.terrain.grid_x) * int(self.terrain.grid_y) * 4
+        peak_lo, peak_hi = getattr(self.terrain, "peak_height_range", (0.0, 0.0))
+        print(
+            f"[SEARCH-WORLD] playable={self.size_x:.0f}x{self.size_y:.0f} m  "
+            f"terrain={self.terrain.size_x:.0f}x{self.terrain.size_y:.0f} m  "
+            f"grid={self.terrain.grid_x}x{self.terrain.grid_y}  "
+            f"hf_bytes={hf_bytes}  peaks={peak_lo:.1f}–{peak_hi:.1f} m AGL"
         )
         town_size = min(float(RUBBLE_TOWN_SIZE), pad)
         self.town = RubbleTownLayout(
