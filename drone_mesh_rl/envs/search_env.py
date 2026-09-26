@@ -7,7 +7,8 @@ interface is Boen's. Each drone picks one of 9 headings (8 neighbors or
 stay), reads a shared coarse 8x8 coverage map, and is turned back when a
 heading would pin it on a wall. The heading in the observation points at
 that search goal (a high-gain unpainted patch, or a leftover person), not
-at the nearest uncovered cell.
+at the nearest uncovered cell. Every drone reads the same painted map and
+teammate XY; overlapping headings are turned toward cells that drone owns.
 
 Rewards:
   +1.0   each newly painted cell, paid only to the drone that painted it
@@ -51,6 +52,12 @@ CRASH_RANGE = 3.5
 GOAL_HOLD_STEPS = 150
 COVER_CELL_M = 5.0
 HUNT_COVER_FRAC = 0.55  # after this much map is painted, finish leftover people
+TEAM_KEEP_M = 12.0  # do not claim cells inside another drone's sensor disk
+CLAIM_KEEP_M = 22.0  # keep assigned unmapped goals apart
+LOOKAHEAD_M = 8.0  # if this far ahead is already painted, peel off to new ground
+TURN_MARGIN = 8.0  # do not command into a wall inside this band
+BOUNCE_INSET = 10.0  # pop off the rim so they cannot sit on it
+WALL_COOLDOWN_STEPS = 90  # ignore outbound MAPPO after a wall hit
 
 # Eight neighbor headings, plus stay. Stay on the wall is turned back inward.
 _HEADING_XY = np.array(
@@ -65,6 +72,10 @@ _HEADING_XY = np.array(
         [1.0, -1.0],
         [0.0, 0.0],
     ],
+    dtype=np.float64,
+)
+_MOVE_HEADINGS = np.array(
+    [h / np.linalg.norm(h) for h in _HEADING_XY if np.hypot(h[0], h[1]) > 0.5],
     dtype=np.float64,
 )
 _HEADING_NORM = np.linalg.norm(_HEADING_XY, axis=1)
@@ -161,6 +172,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.has_nav_goal = np.zeros(num_drones, dtype=bool)
         self.goal_hold = np.zeros(num_drones, dtype=np.int32)
         self.goal_is_person = np.zeros(num_drones, dtype=bool)
+        self.wall_cooldown = np.zeros(num_drones, dtype=np.int32)
 
         self.client = None
         self.drone_ids = []
@@ -206,7 +218,7 @@ class SurvivorSearchEnv(ParallelEnv):
         return float(self.coverage[1:-1, 1:-1].mean())
 
     def _playable_cell(self, w):
-        return abs(w[0]) <= self._lim_x() - 2.0 and abs(w[1]) <= self._lim_y() - 2.0
+        return abs(w[0]) <= self._lim_x() - TURN_MARGIN and abs(w[1]) <= self._lim_y() - TURN_MARGIN
 
     def _seal_map_border(self):
         """Outer coverage ring is already searched so policies are not paid to leave."""
@@ -300,11 +312,8 @@ class SurvivorSearchEnv(ParallelEnv):
         """Hunt leftover people once mapping is mostly done; otherwise next-best-view."""
         people = self._undiscovered_people()
         missed = any(self._person_was_missed(person) for person in people)
-        if people and (
-            missed
-            or self._interior_coverage() >= HUNT_COVER_FRAC
-            or len(people) <= self.num_drones * 3
-        ):
+        map_done = self._interior_coverage() >= 0.995
+        if people and (missed or map_done):
             hunt = self._hunt_survivor_xy(drone_index)
             if hunt is not None:
                 self.goal_is_person[drone_index] = True
@@ -340,14 +349,15 @@ class SurvivorSearchEnv(ParallelEnv):
                 my_d = float(np.linalg.norm(world - my_xy))
                 stolen = False
                 for other in others:
-                    if float(np.linalg.norm(world - other)) + 2.0 < my_d:
+                    other_d = float(np.linalg.norm(world - other))
+                    if other_d <= my_d or other_d < TEAM_KEEP_M:
                         stolen = True
                         break
                 if stolen:
                     continue
                 skip_claim = False
                 for claim in claimed:
-                    if float(np.linalg.norm(world - claim)) < 14.0:
+                    if float(np.linalg.norm(world - claim)) < CLAIM_KEEP_M:
                         skip_claim = True
                         break
                 if skip_claim:
@@ -375,6 +385,37 @@ class SurvivorSearchEnv(ParallelEnv):
                 best_score = score
                 best = world
         return best if best is not None else nearest
+
+    def _owned_unfinished_centroid(self, drone_index):
+        """Mean of unpainted cells this drone is closest to (team Voronoi)."""
+        my_xy = np.asarray(self.drone_positions[drone_index][:2], dtype=np.float64)
+        others = [
+            np.asarray(self.drone_positions[j][:2], dtype=np.float64)
+            for j in range(self.num_drones)
+            if j != drone_index
+        ]
+        if self.cover_nx <= 2 or self.cover_ny <= 2:
+            mask = self.coverage < 0.5
+        else:
+            mask = np.zeros_like(self.coverage, dtype=bool)
+            mask[1:-1, 1:-1] = self.coverage[1:-1, 1:-1] < 0.5
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            return None
+        wx = (xs.astype(np.float64) + 0.5) / self.cover_nx * self.size_x - self.size_x / 2.0
+        wy = (ys.astype(np.float64) + 0.5) / self.cover_ny * self.size_y - self.size_y / 2.0
+        mine_x = []
+        mine_y = []
+        for x, y in zip(wx, wy):
+            cell = np.array([x, y], dtype=np.float64)
+            my_d = float(np.linalg.norm(cell - my_xy))
+            if any(float(np.linalg.norm(cell - other)) < my_d for other in others):
+                continue
+            mine_x.append(x)
+            mine_y.append(y)
+        if not mine_x:
+            return np.array([float(wx.mean()), float(wy.mean())], dtype=np.float64)
+        return np.array([float(np.mean(mine_x)), float(np.mean(mine_y))], dtype=np.float64)
 
     def _unfinished_centroid(self):
         """Middle of the remaining unpainted ground, not the nearest cell.
@@ -407,6 +448,9 @@ class SurvivorSearchEnv(ParallelEnv):
         gx, gy = self._world_to_cell(goal[0], goal[1])
         if self.coverage[gy, gx] >= 0.5:
             return False
+        here = self.drone_positions[drone_index][:2]
+        if float(np.linalg.norm(here - goal)) < self.sensor_radius:
+            return False
         return True
 
     def _refresh_nav_goals(self):
@@ -426,6 +470,9 @@ class SurvivorSearchEnv(ParallelEnv):
     def _search_target_xy(self, drone_index):
         if self.has_nav_goal[drone_index]:
             return np.asarray(self.nav_goal[drone_index], dtype=np.float64)
+        owned = self._owned_unfinished_centroid(drone_index)
+        if owned is not None:
+            return owned
         return self._unfinished_centroid()
 
     def _metric_search_dir(self, drone_index, x, y):
@@ -434,26 +481,120 @@ class SurvivorSearchEnv(ParallelEnv):
             return 0.0, 0.0
         return float(target[0] - x), float(target[1] - y)
 
+    def _inland_search_dir(self, drone_index, pos):
+        """Direction toward unfinished work, with an inland component if a wall is close.
+
+        Leftover-person goals stay on-target so a rim survivor can still be found.
+        """
+        ux, uy = self._metric_search_dir(drone_index, pos[0], pos[1])
+        if self.goal_is_person[drone_index]:
+            if abs(ux) + abs(uy) < 1.0:
+                ang = 0.35 * self.step_count + drone_index
+                ux, uy = float(np.cos(ang)), float(np.sin(ang))
+            return ux, uy
+        lx, ly = self._lim_x(), self._lim_y()
+        if pos[0] >= lx - TURN_MARGIN:
+            ux = min(ux, -1.0)
+        elif pos[0] <= -lx + TURN_MARGIN:
+            ux = max(ux, 1.0)
+        if pos[1] >= ly - TURN_MARGIN:
+            uy = min(uy, -1.0)
+        elif pos[1] <= -ly + TURN_MARGIN:
+            uy = max(uy, 1.0)
+        if abs(ux) + abs(uy) < 1e-6:
+            ux = -float(np.sign(pos[0])) or 0.0
+            uy = -float(np.sign(pos[1])) or 0.0
+        return ux, uy
+
+    def _velocity_toward_unmapped(self, drone_index, pos):
+        ux, uy = self._inland_search_dir(drone_index, pos)
+        for j in range(self.num_drones):
+            if j == drone_index:
+                continue
+            rel = pos[:2] - self.drone_positions[j][:2]
+            dist = float(np.hypot(rel[0], rel[1]))
+            if 1e-3 < dist < TEAM_KEEP_M:
+                push = (TEAM_KEEP_M - dist) / TEAM_KEEP_M
+                ux += float(rel[0]) / dist * push
+                uy += float(rel[1]) / dist * push
+        if abs(ux) + abs(uy) < 1e-6:
+            ang = 2.0 * np.pi * drone_index / max(self.num_drones, 1) + 0.15 * self.step_count
+            ux = float(np.cos(ang))
+            uy = float(np.sin(ang))
+        legal = self._best_legal_heading(pos, ux, uy)
+        n = float(np.hypot(legal[0], legal[1]))
+        if n < 1e-6:
+            legal = np.array([1.0, 0.0], dtype=np.float64)
+            n = 1.0
+        vel = np.zeros(3, dtype=np.float64)
+        vel[0] = legal[0] / n * self.drone_max_speed
+        vel[1] = legal[1] / n * self.drone_max_speed
+        return vel
+
+    def _heading_retraces(self, pos, vel):
+        """True when this heading is about to fly over ground the team already painted."""
+        if self._interior_coverage() >= 0.995:
+            return False
+        speed = float(np.hypot(vel[0], vel[1]))
+        if speed < 0.5:
+            gx, gy = self._world_to_cell(pos[0], pos[1])
+            return self.coverage[gy, gx] >= 0.5
+        look = np.asarray(pos[:2], dtype=np.float64) + np.asarray(vel[:2], dtype=np.float64) / speed * LOOKAHEAD_M
+        gx, gy = self._world_to_cell(look[0], look[1])
+        return self.coverage[gy, gx] >= 0.5
+
+    def _heading_at_teammate(self, drone_index, pos, vel):
+        heading = np.asarray(vel[:2], dtype=np.float64)
+        speed = float(np.hypot(heading[0], heading[1]))
+        for j in range(self.num_drones):
+            if j == drone_index:
+                continue
+            rel = self.drone_positions[j][:2] - pos[:2]
+            dist = float(np.hypot(rel[0], rel[1]))
+            if dist < 1e-3:
+                return True
+            if dist < TEAM_KEEP_M and speed < 0.5:
+                return True
+            if dist < TEAM_KEEP_M and speed >= 0.5 and float(np.dot(heading, rel)) > 0.0:
+                return True
+        return False
+
+    def _work_remains(self):
+        if self.survivors is not None:
+            left = int(self.survivors.num_survivors - self.survivors.discovered.sum())
+            if left > 0:
+                return True
+        return self._interior_coverage() < 0.995
+
+    def _keep_moving(self, drone_index):
+        if not self._work_remains():
+            return
+        self.drone_velocities[drone_index] = self._velocity_toward_unmapped(
+            drone_index, self.drone_positions[drone_index]
+        )
+
     def _search_heading(self, drone_index, x, y):
         """Map-scaled direction toward unfinished ground or a leftover person."""
         dx, dy = self._metric_search_dir(drone_index, x, y)
         return dx / max(self.size_x, 1.0), dy / max(self.size_y, 1.0)
 
-    def _on_border(self, pos, margin=0.4):
+    def _on_border(self, pos, margin=None):
+        if margin is None:
+            margin = TURN_MARGIN
         return abs(pos[0]) >= self._lim_x() - margin or abs(pos[1]) >= self._lim_y() - margin
 
     def _heading_blocked(self, pos, heading):
-        """True when this heading only pushes into a wall the drone is already on."""
+        """True when this heading would drive into a wall the drone is near."""
         lx, ly = self._lim_x(), self._lim_y()
         x, y = float(pos[0]), float(pos[1])
         hx, hy = float(heading[0]), float(heading[1])
-        if x >= lx - 0.4 and hx > 0.1:
+        if x >= lx - TURN_MARGIN and hx > 0.05:
             return True
-        if x <= -lx + 0.4 and hx < -0.1:
+        if x <= -lx + TURN_MARGIN and hx < -0.05:
             return True
-        if y >= ly - 0.4 and hy > 0.1:
+        if y >= ly - TURN_MARGIN and hy > 0.05:
             return True
-        if y <= -ly + 0.4 and hy < -0.1:
+        if y <= -ly + TURN_MARGIN and hy < -0.05:
             return True
         return False
 
@@ -461,9 +602,7 @@ class SurvivorSearchEnv(ParallelEnv):
         """Neighbor heading toward (ux, uy) that does not point out of the map."""
         best = None
         best_dot = -np.inf
-        for heading in _HEADING_XY:
-            if float(heading[0]) == 0.0 and float(heading[1]) == 0.0:
-                continue
+        for heading in _MOVE_HEADINGS:
             if self._heading_blocked(pos, heading):
                 continue
             dot = float(heading[0]) * float(ux) + float(heading[1]) * float(uy)
@@ -477,46 +616,39 @@ class SurvivorSearchEnv(ParallelEnv):
         return best
 
     def _move_with_soft_walls(self, drone_index, pos, vel, dt):
-        """Fly the chosen heading. Contact with a wall turns back toward unfinished ground."""
+        """Fly the chosen heading. Hitting a wall pops inland and turns toward unfinished ground."""
         pos = np.asarray(pos, dtype=np.float64).copy()
         vel = np.asarray(vel, dtype=np.float64).copy()
         lx, ly = self._lim_x(), self._lim_y()
         heading = vel[:2]
         speed = float(np.hypot(heading[0], heading[1]))
-        if speed > 0.5 and self._heading_blocked(pos, heading):
-            ux, uy = self._metric_search_dir(drone_index, pos[0], pos[1])
-            if abs(ux) + abs(uy) < 1e-6:
-                ux, uy = -float(np.sign(pos[0])), -float(np.sign(pos[1]))
-            legal = self._best_legal_heading(pos, ux, uy)
-            vel[0] = legal[0] * self.drone_max_speed
-            vel[1] = legal[1] * self.drone_max_speed
+        blocked = self._heading_blocked(pos, heading) if speed > 0.5 else False
+        stuck_on_rim = speed <= 0.5 and self._on_border(pos)
+        if blocked or stuck_on_rim:
+            self.wall_cooldown[drone_index] = max(
+                int(self.wall_cooldown[drone_index]), WALL_COOLDOWN_STEPS
+            )
+        if self.wall_cooldown[drone_index] > 0 or blocked or stuck_on_rim:
+            vel = self._velocity_toward_unmapped(drone_index, pos)
         pos = pos + vel * dt
+        bounced = False
         if pos[0] >= lx:
-            pos[0] = lx
-            if vel[0] > 0.0:
-                vel[0] = 0.0
+            pos[0] = lx - BOUNCE_INSET
+            bounced = True
         elif pos[0] <= -lx:
-            pos[0] = -lx
-            if vel[0] < 0.0:
-                vel[0] = 0.0
+            pos[0] = -lx + BOUNCE_INSET
+            bounced = True
         if pos[1] >= ly:
-            pos[1] = ly
-            if vel[1] > 0.0:
-                vel[1] = 0.0
+            pos[1] = ly - BOUNCE_INSET
+            bounced = True
         elif pos[1] <= -ly:
-            pos[1] = -ly
-            if vel[1] < 0.0:
-                vel[1] = 0.0
-        if float(np.hypot(vel[0], vel[1])) < 0.5 and self._on_border(pos):
-            ux, uy = self._metric_search_dir(drone_index, pos[0], pos[1])
-            if abs(ux) + abs(uy) < 1e-6:
-                ux = -float(np.sign(pos[0])) or 0.0
-                uy = -float(np.sign(pos[1])) or 0.0
-            legal = self._best_legal_heading(pos, ux, uy)
-            vel[0] = legal[0] * self.drone_max_speed
-            vel[1] = legal[1] * self.drone_max_speed
-            pos[0] = float(np.clip(pos[0] + vel[0] * dt, -lx, lx))
-            pos[1] = float(np.clip(pos[1] + vel[1] * dt, -ly, ly))
+            pos[1] = -ly + BOUNCE_INSET
+            bounced = True
+        if bounced:
+            self.wall_cooldown[drone_index] = WALL_COOLDOWN_STEPS
+            vel = self._velocity_toward_unmapped(drone_index, pos)
+        pos[0] = float(np.clip(pos[0], -lx, lx))
+        pos[1] = float(np.clip(pos[1], -ly, ly))
         pos[2] = float(self.hover_altitude)
         vel[2] = 0.0
         return pos, vel
@@ -759,6 +891,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.has_nav_goal = np.zeros(self.num_drones, dtype=bool)
         self.goal_hold = np.zeros(self.num_drones, dtype=np.int32)
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
+        self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
         if hasattr(self, "_lanes"):
             del self._lanes
 
@@ -813,14 +946,25 @@ class SurvivorSearchEnv(ParallelEnv):
             else:
                 idx = int(np.clip(np.rint(float(raw[0])) if raw.size else 0, 0, self.n_actions - 1))
                 heading = _HEADING_XY[idx]
-                self.drone_velocities[i, 0] = heading[0] * self.drone_max_speed
-                self.drone_velocities[i, 1] = heading[1] * self.drone_max_speed
-                self.drone_velocities[i, 2] = 0.0
+                if heading[0] == 0.0 and heading[1] == 0.0:
+                    self.drone_velocities[i] = self._velocity_toward_unmapped(
+                        i, self.drone_positions[i]
+                    )
+                else:
+                    self.drone_velocities[i, 0] = heading[0] * self.drone_max_speed
+                    self.drone_velocities[i, 1] = heading[1] * self.drone_max_speed
+                    self.drone_velocities[i, 2] = 0.0
 
         for i in range(self.num_drones):
+            if self.wall_cooldown[i] > 0:
+                self.wall_cooldown[i] -= 1
+            if self._work_remains():
+                self._keep_moving(i)
             pos, vel = self._move_with_soft_walls(
                 i, self.drone_positions[i], self.drone_velocities[i], dt
             )
+            if self._work_remains() and float(np.hypot(vel[0], vel[1])) < 0.5 * self.drone_max_speed:
+                vel = self._velocity_toward_unmapped(i, pos)
             self.drone_positions[i] = pos
             self.drone_velocities[i] = vel
 
