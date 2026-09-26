@@ -9,6 +9,9 @@ square (buildings are not moved). Four box-built ruined shells sit in
 street-edge leftover lots near the center. Sidewalk trees, street cars,
 and one water tower sit in that square. copy_to can shift the same
 relative layout elsewhere, but the viewer only spawns this one district.
+
+A second ~140 m rubble town (RubbleTownLayout) sits ≥200 m outside that
+square: six reused ruin shells and broken road slabs only.
 """
 
 from __future__ import annotations
@@ -87,6 +90,25 @@ _RUIN_CHUNK_RGB = (
     [0.36, 0.33, 0.29, 1.0],
     [0.24, 0.22, 0.20, 1.0],
     [0.33, 0.30, 0.26, 1.0],
+)
+
+RUBBLE_TOWN_SIZE = 140.0
+RUBBLE_TOWN_GAP = 200.0
+RUBBLE_TOWN_SEED = 71
+_N_RUBBLE_SHELLS = 6
+_RUBBLE_H = (13.5, 14.6, 15.2, 16.1, 16.8, 17.6)
+_BROKEN_ROAD_TEX_NAME = "rubble_town_road.png"
+_BROKEN_ROAD_WIDTH = 6.4
+_BROKEN_ROAD_LIFT = 0.08
+_BROKEN_ROAD_HALF_THICK = 0.045
+# Relative lots: (dx, dy, sx, sy, open_side) along a NS + EW cross
+_RUBBLE_LOTS = (
+    (-13.5, -36.0, 16.0, 14.0, "e"),
+    (13.5, 6.0, 16.0, 14.0, "w"),
+    (-13.5, 36.0, 16.0, 14.0, "e"),
+    (-38.0, -13.5, 16.0, 14.0, "n"),
+    (38.0, 13.5, 16.0, 14.0, "s"),
+    (22.0, -13.5, 16.0, 14.0, "n"),
 )
 
 
@@ -605,6 +627,7 @@ def _ruin_piece(terrain, cx, cy, hx, hy, hz, orn, rgba, kind, lift=0.0):
 
 def _build_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, buildings, cars):
     """Broken shell: 2–3 walls, one attached floor, one tipped slab, 4–6 chunks."""
+    index = int(index) % 4
     hx, hy = 0.5 * sx, 0.5 * sy
     xmin, xmax = cx - hx, cx + hx
     ymin, ymax = cy - hy, cy + hy
@@ -1124,6 +1147,323 @@ def _road_slab_geometry(hx, hy, hz, along):
     return mesh_verts, indices, uvs
 
 
+def _aabb_gap(a, b):
+    """Closest-point distance between AABBs (xmin, ymin, xmax, ymax). 0 if overlap."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    dx = max(0.0, bx0 - ax1, ax0 - bx1)
+    dy = max(0.0, by0 - ay1, ay0 - by1)
+    if dx == 0.0 and dy == 0.0:
+        return 0.0
+    if dx == 0.0:
+        return dy
+    if dy == 0.0:
+        return dx
+    return math.hypot(dx, dy)
+
+
+def _square_hits_keepouts(cx, cy, half, keepouts):
+    for kx, ky, r in keepouts:
+        dx = max((cx - half) - kx, 0.0, kx - (cx + half))
+        dy = max((cy - half) - ky, 0.0, ky - (cy + half))
+        if math.hypot(dx, dy) <= float(r) + 1e-6:
+            return True
+    return False
+
+
+def rubble_town_keepouts(scenery):
+    """Keep the 140 m square off groves, camps, huts, and the archer."""
+    out = []
+    scenery = scenery or {}
+    for gx, gy in scenery.get("groves") or []:
+        out.append((float(gx), float(gy), 16.0))
+    for cx, cy in scenery.get("camps") or []:
+        out.append((float(cx), float(cy), 12.0))
+    for hx, hy in scenery.get("huts") or []:
+        out.append((float(hx), float(hy), 10.0))
+    archers = scenery.get("archers") or []
+    if archers:
+        for rec in archers:
+            out.append((float(rec[0]), float(rec[1]), 8.0))
+    else:
+        for ax, ay in scenery.get("archery") or []:
+            out.append((float(ax) + 3.0, float(ay) - 6.0, 8.0))
+    rubble = scenery.get("rubble") or {}
+    for rec in rubble.get("piles") or []:
+        out.append((float(rec["x"]), float(rec["y"]), 8.0))
+    for rec in rubble.get("arches") or []:
+        out.append((float(rec["x"]), float(rec["y"]), 10.0))
+    for rec in rubble.get("walls") or []:
+        out.append((float(rec["x"]), float(rec["y"]), 6.0))
+    ruins = scenery.get("ruins") or {}
+    for rec in ruins.get("placements") or []:
+        out.append((float(rec["x"]), float(rec["y"]), 12.0))
+    return out
+
+
+def find_rubble_town_site(
+    terrain, district, size=RUBBLE_TOWN_SIZE, min_gap=RUBBLE_TOWN_GAP, keepouts=None
+):
+    """
+    Flattest `size` x `size` square fully on the map, ≥ min_gap from the
+    district AABB, and clear of scenery keepouts. Score is mean |slope|
+    then relief; no hard slope cap so the search loosens rather than fails.
+    """
+    keepouts = list(keepouts or [])
+    Z = np.asarray(terrain.heightmap, dtype=np.float64)
+    rx = float(getattr(terrain, "resolution_x", terrain.resolution))
+    ry = float(getattr(terrain, "resolution_y", terrain.resolution))
+    gy, gx = Z.shape
+    nx = max(2, int(round(size / rx)))
+    ny = max(2, int(round(size / ry)))
+    if nx > gx or ny > gy:
+        raise ValueError(f"rubble town {size:.0f} m does not fit the {gx}x{gy} heightmap")
+
+    dzdy, dzdx = np.gradient(Z, ry, rx)
+    slope = np.hypot(dzdx, dzdy)
+
+    half_x = 0.5 * float(terrain.size_x)
+    half_y = 0.5 * float(terrain.size_y)
+    half = 0.5 * size
+    dcx, dcy = float(district.center[0]), float(district.center[1])
+    dh = 0.5 * float(district.size)
+    dbox = (dcx - dh, dcy - dh, dcx + dh, dcy + dh)
+
+    step_j = max(1, int(round(8.0 / rx)))
+    step_i = max(1, int(round(8.0 / ry)))
+
+    best = None
+    for i in range(0, gy - ny + 1, step_i):
+        for j in range(0, gx - nx + 1, step_j):
+            cx = -half_x + (j + 0.5 * nx) * rx
+            cy = -half_y + (i + 0.5 * ny) * ry
+            if (
+                cx - half < -half_x
+                or cx + half > half_x
+                or cy - half < -half_y
+                or cy + half > half_y
+            ):
+                continue
+            gap = _aabb_gap(
+                (cx - half, cy - half, cx + half, cy + half),
+                dbox,
+            )
+            if gap < min_gap - 1e-6:
+                continue
+            if _square_hits_keepouts(cx, cy, half, keepouts):
+                continue
+            patch_s = slope[i : i + ny, j : j + nx]
+            patch_z = Z[i : i + ny, j : j + nx]
+            mean_slope = float(np.mean(patch_s))
+            relief = float(np.max(patch_z) - np.min(patch_z))
+            key = (mean_slope, relief, abs(cx) + abs(cy))
+            if best is None or key < best[0]:
+                best = (key, float(cx), float(cy), gap, mean_slope, relief)
+
+    if best is None:
+        raise RuntimeError(
+            f"no in-bounds {size:.0f} m rubble-town site "
+            f"≥{min_gap:.0f} m from the district AABB"
+        )
+    return {
+        "center": (best[1], best[2]),
+        "gap": float(best[3]),
+        "mean_slope": float(best[4]),
+        "relief": float(best[5]),
+    }
+
+
+def _broken_road_texture_path(filename=_BROKEN_ROAD_TEX_NAME, tex_w=96, tex_h=256):
+    """Dark cracked asphalt — no sidewalks, no center-line polish."""
+    path = os.path.join(os.path.dirname(__file__), filename)
+    pavement = np.array([36, 34, 32], dtype=np.uint8)
+    stain = np.array([48, 44, 40], dtype=np.uint8)
+    crack = np.array([18, 16, 15], dtype=np.uint8)
+    rgb = np.empty((tex_h, tex_w, 3), dtype=np.uint8)
+    rgb[:] = pavement
+    rng = np.random.default_rng(19)
+    for _ in range(18):
+        x0 = int(rng.integers(0, tex_w))
+        y0 = int(rng.integers(0, tex_h))
+        rw = int(rng.integers(4, 18))
+        rh = int(rng.integers(6, 28))
+        rgb[y0 : min(tex_h, y0 + rh), x0 : min(tex_w, x0 + rw)] = stain
+    for _ in range(14):
+        x = float(rng.integers(2, tex_w - 2))
+        y = float(rng.integers(0, tex_h))
+        vx, vy = float(rng.normal(0.0, 0.35)), float(rng.choice([-1.0, 1.0]))
+        n = int(rng.integers(40, 90))
+        for _s in range(n):
+            ix, iy = int(round(x)), int(round(y))
+            if 0 <= iy < tex_h and 0 <= ix < tex_w:
+                rgb[iy, ix] = crack
+                if 0 <= ix + 1 < tex_w and rng.random() < 0.45:
+                    rgb[iy, ix + 1] = crack
+            x += vx
+            y += vy
+            vx += float(rng.normal(0.0, 0.08))
+    _write_png_rgb(path, rgb)
+    return path
+
+
+def _layout_broken_streets(terrain, center, size, seed=RUBBLE_TOWN_SEED):
+    """Two short crossed streets of gapped, slightly tilted cracked slabs."""
+    cx, cy = float(center[0]), float(center[1])
+    reach = 0.5 * size - 14.0
+    rng = np.random.default_rng(int(seed) + 3)
+    hw = 0.5 * _BROKEN_ROAD_WIDTH
+    hz = _BROKEN_ROAD_HALF_THICK
+    slabs = []
+
+    def add_run(along, coord, t0, t1):
+        t = float(t0)
+        while t < t1 - 4.0:
+            length = float(rng.uniform(6.5, 12.5))
+            gap = float(rng.uniform(0.40, 1.05))
+            t1s = min(t + length, float(t1))
+            if t1s - t < 4.0:
+                break
+            mid = 0.5 * (t + t1s)
+            tilt = math.radians(float(rng.choice([-1.0, 1.0])) * rng.uniform(1.8, 5.5))
+            if along == "y":
+                scx, scy = coord, mid
+                hx, hy = hw, 0.5 * (t1s - t)
+                orn = _quat_axis_angle(0.0, 1.0, 0.0, tilt)
+            else:
+                scx, scy = mid, coord
+                hx, hy = 0.5 * (t1s - t), hw
+                orn = _quat_axis_angle(1.0, 0.0, 0.0, tilt)
+            z = _sit_oriented(terrain, scx, scy, hx, hy, hz, orn) + _BROKEN_ROAD_LIFT
+            slabs.append(
+                {
+                    "along": along,
+                    "cx": float(scx),
+                    "cy": float(scy),
+                    "hx": float(hx),
+                    "hy": float(hy),
+                    "hz": float(hz),
+                    "z": float(z),
+                    "orn": list(orn),
+                    "xmin": float(scx - hx),
+                    "xmax": float(scx + hx),
+                    "ymin": float(scy - hy),
+                    "ymax": float(scy + hy),
+                }
+            )
+            t = t1s + gap
+
+    add_run("y", cx, cy - reach, cy - 3.2)
+    add_run("y", cx, cy + 3.2, cy + reach)
+    add_run("x", cy, cx - reach, cx - 3.2)
+    add_run("x", cy, cx + 3.2, cx + reach)
+    return slabs
+
+
+def _layout_rubble_shells(terrain, center):
+    """Six charred shells along the crossed broken streets."""
+    cx, cy = float(center[0]), float(center[1])
+    ruins = []
+    for i, (dx, dy, sx, sy, open_side) in enumerate(_RUBBLE_LOTS):
+        ruins.append(
+            _build_ruin_shell(
+                terrain,
+                cx + dx,
+                cy + dy,
+                sx,
+                sy,
+                float(_RUBBLE_H[i]),
+                open_side,
+                i,
+                [],
+                [],
+            )
+        )
+    return ruins
+
+
+def _print_rubble_town(town):
+    cx, cy = town.center
+    print(f"[RUBBLE-TOWN] center=({cx:.3f}, {cy:.3f})")
+    for i, ruin in enumerate(town.ruins):
+        print(
+            f"[RUBBLE-TOWN] shell[{i}] x={ruin['cx']:.3f} y={ruin['cy']:.3f} "
+            f"height={ruin['height']:.1f}"
+        )
+
+
+def verify_rubble_town(town, district):
+    """Numeric checks: 6 shells, 140 m square, ≥200 m from the district AABB."""
+    if len(town.ruins) != _N_RUBBLE_SHELLS:
+        raise RuntimeError(f"expected {_N_RUBBLE_SHELLS} rubble shells, got {len(town.ruins)}")
+    half = 0.5 * town.size
+    cx, cy = town.center
+    dh = 0.5 * float(district.size)
+    dcx, dcy = float(district.center[0]), float(district.center[1])
+    gap = _aabb_gap(
+        (cx - half, cy - half, cx + half, cy + half),
+        (dcx - dh, dcy - dh, dcx + dh, dcy + dh),
+    )
+    if gap < RUBBLE_TOWN_GAP - 1e-3:
+        raise RuntimeError(f"rubble town gap {gap:.1f} m < {RUBBLE_TOWN_GAP:.0f} m")
+    for i, ruin in enumerate(town.ruins):
+        if abs(ruin["cx"] - cx) > half - 1.0 or abs(ruin["cy"] - cy) > half - 1.0:
+            raise RuntimeError(f"shell[{i}] is outside the rubble-town square")
+        if not (12.0 <= ruin["height"] <= 18.0):
+            raise RuntimeError(f"shell[{i}] height {ruin['height']:.1f} not in 12–18 m")
+        n_wall = sum(1 for p in ruin["pieces"] if p["kind"] == "wall")
+        n_floor = sum(1 for p in ruin["pieces"] if p["kind"] == "floor")
+        n_tip = sum(1 for p in ruin["pieces"] if p["kind"] == "tip")
+        n_chunk = sum(1 for p in ruin["pieces"] if p["kind"] == "chunk")
+        if not (2 <= n_wall <= 3 and n_floor == 1 and n_tip == 1 and 4 <= n_chunk <= 6):
+            raise RuntimeError(
+                f"shell[{i}] pieces walls={n_wall} floor={n_floor} tip={n_tip} chunks={n_chunk}"
+            )
+        for piece in ruin["pieces"]:
+            if piece["kind"] == "chunk" and 2.0 * max(piece["hx"], piece["hy"]) < 3.0 - 1e-6:
+                raise RuntimeError(f"shell[{i}] chunk is under 3 m across")
+            rgb = piece["rgba"][:3]
+            if rgb[0] > 0.55 or rgb[1] > 0.50 or rgb[2] > 0.45:
+                raise RuntimeError(f"shell[{i}] piece is not charred gray: {rgb}")
+    print(
+        f"[RUBBLE-TOWN] check ok: n={len(town.ruins)}  "
+        f"gap={gap:.1f} m  (center {cx:.1f}, {cy:.1f})"
+    )
+    return gap
+
+
+class RubbleTownLayout:
+    """~140 m collapsed town: six reused ruin shells and broken streets only."""
+
+    def __init__(self, terrain, district, scenery=None, size=RUBBLE_TOWN_SIZE, seed=RUBBLE_TOWN_SEED):
+        self.size = float(size)
+        self.seed = int(seed)
+        self.buildings = []
+        self.cars = []
+        self.trees = []
+        self.landmark = None
+        site = find_rubble_town_site(
+            terrain,
+            district,
+            size=self.size,
+            min_gap=RUBBLE_TOWN_GAP,
+            keepouts=rubble_town_keepouts(scenery),
+        )
+        self.center = site["center"]
+        self.gap_from_district = float(site["gap"])
+        self.mean_slope = float(site["mean_slope"])
+        self.relief = float(site["relief"])
+        print(
+            f"[RUBBLE-TOWN] center=({self.center[0]:.3f}, {self.center[1]:.3f})  "
+            f"size={self.size:.0f} m  gap={self.gap_from_district:.1f} m  "
+            f"slope={self.mean_slope:.4f}  relief={self.relief:.2f} m"
+        )
+        self.roads = _layout_broken_streets(terrain, self.center, self.size, self.seed)
+        self.ruins = _layout_rubble_shells(terrain, self.center)
+        self.ground_z = _sample_heightmap(terrain, self.center[0], self.center[1])
+        _print_rubble_town(self)
+        verify_rubble_town(self, district)
+
+
 class DistrictLayout:
     """One 300 m plain-box district on an existing Terrain."""
 
@@ -1470,6 +1810,75 @@ def spawn_district_in_pybullet(client, district, window_tex=None, road_tex=None)
             f"[DISTRICT] ruin_bodies={len(ruin_bodies)}  ruins={len(district.ruins)}"
         )
     return wall_bodies + roof_bodies + road_bodies + prop_bodies + ruin_bodies
+
+
+def spawn_rubble_town_in_pybullet(client, town):
+    """Broken cracked-road slabs plus six reused ruin shells. No intact buildings."""
+    road_path = _broken_road_texture_path()
+    try:
+        road_tex = p.loadTexture(road_path, physicsClientId=client)
+    except Exception:
+        road_tex = -1
+
+    road_bodies = []
+    for slab in town.roads:
+        verts, indices, uvs = _road_slab_geometry(
+            slab["hx"], slab["hy"], slab.get("hz", _BROKEN_ROAD_HALF_THICK), slab["along"]
+        )
+        vis = p.createVisualShape(
+            p.GEOM_MESH,
+            vertices=verts,
+            indices=indices,
+            uvs=uvs,
+            rgbaColor=[1.0, 1.0, 1.0, 1.0],
+            physicsClientId=client,
+        )
+        bid = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=vis,
+            basePosition=[slab["cx"], slab["cy"], slab["z"]],
+            baseOrientation=slab.get("orn", [0.0, 0.0, 0.0, 1.0]),
+            physicsClientId=client,
+        )
+        if road_tex >= 0:
+            p.changeVisualShape(
+                bid,
+                -1,
+                rgbaColor=[0.92, 0.90, 0.86, 1.0],
+                textureUniqueId=road_tex,
+                physicsClientId=client,
+            )
+        else:
+            p.changeVisualShape(
+                bid, -1, rgbaColor=[0.16, 0.15, 0.14, 1.0], physicsClientId=client
+            )
+        road_bodies.append(bid)
+
+    ruin_bodies = []
+    for ruin in town.ruins:
+        for piece in ruin["pieces"]:
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[piece["hx"], piece["hy"], piece["hz"]],
+                rgbaColor=piece["rgba"],
+                physicsClientId=client,
+            )
+            ruin_bodies.append(
+                p.createMultiBody(
+                    baseMass=0,
+                    baseCollisionShapeIndex=-1,
+                    baseVisualShapeIndex=vis,
+                    basePosition=[piece["cx"], piece["cy"], piece["z"]],
+                    baseOrientation=piece["orn"],
+                    physicsClientId=client,
+                )
+            )
+    print(
+        f"[RUBBLE-TOWN] slabs={len(road_bodies)}  ruin_bodies={len(ruin_bodies)}  "
+        f"shells={len(town.ruins)}  tex={os.path.basename(road_path)}"
+    )
+    return road_bodies + ruin_bodies
 
 
 def _default_overview_eye(district):

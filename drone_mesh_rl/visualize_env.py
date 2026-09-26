@@ -3,7 +3,7 @@ visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
 Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
 PyBullet heightfield (one USGS patch, no tiling), places one 300 m
-district, then adds grouped Kenney scenery outside that town.
+district, grouped Kenney scenery, then a second 140 m rubble-only town.
 --procedural restores the two-downtown metro.
 Camera-only loop (no drones).
 
@@ -30,8 +30,10 @@ if hasattr(sys.stdout, "reconfigure"):
 from envs.terrain import Terrain, find_dem_file, spawn_terrain_in_pybullet
 from envs.district import (
     DistrictLayout,
+    RubbleTownLayout,
     frame_district_camera,
     spawn_districts_in_pybullet,
+    spawn_rubble_town_in_pybullet,
 )
 from envs.scenery import spawn_scenery_in_pybullet
 from envs.rubble import spawn_rubble_in_pybullet
@@ -343,6 +345,20 @@ def build_dem_world(client, dem_path):
     _ruins_bodies, ruins = spawn_city_ruins_in_pybullet(client, terrain, districts, scenery)
     print(f"[RUINS] place+spawn={time.perf_counter() - t0:.3f}s")
     scenery["ruins"] = ruins
+    t0 = time.perf_counter()
+    rubble_town = RubbleTownLayout(terrain, district, scenery)
+    spawn_rubble_town_in_pybullet(client, rubble_town)
+    print(
+        f"[RUBBLE-TOWN] place+spawn={time.perf_counter() - t0:.3f}s  "
+        f"center=({rubble_town.center[0]:.3f}, {rubble_town.center[1]:.3f})  "
+        f"gap={rubble_town.gap_from_district:.1f} m"
+    )
+    for i, ruin in enumerate(rubble_town.ruins):
+        print(
+            f"[RUBBLE-TOWN] shell[{i}] x={ruin['cx']:.3f} y={ruin['cy']:.3f} "
+            f"height={ruin['height']:.1f}"
+        )
+    scenery["rubble_town"] = rubble_town
 
     info = terrain.dem_info
     rows, cols = info["raster_shape"]
