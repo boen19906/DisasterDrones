@@ -17,16 +17,13 @@ ENV/
 *.swo
 
 # Project specific
-# Checkpoint weights only — keep Python source under */models/ trackable
 *.pth
 *.pt
 *.h5
 *.keras
 *.onnx
 
-# Training history and logs
-training_history.json
-training_curve.png
+# Logs
 *.log
 
 # OS generated files

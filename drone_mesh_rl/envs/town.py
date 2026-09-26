@@ -8,6 +8,7 @@ line-of-sight stay vectorized numpy — no PyBullet raycasts.
 from __future__ import annotations
 
 import numpy as np
+import pybullet as p
 
 # Styles → RGBA for GUI only
 BUILDING_COLORS = {
@@ -447,3 +448,104 @@ class TownLayout:
     def segment_clear(point_a, point_b, boxes):
         """True if segment does not hit any box."""
         return not TownLayout.segment_hits_boxes(point_a, point_b, boxes)
+
+
+def connect_pybullet(gui=True, shadows=False):
+    """Open a PyBullet client. Shadows default off for a lighter GUI."""
+    client = p.connect(p.GUI if gui else p.DIRECT)
+    if gui:
+        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=client)
+        p.configureDebugVisualizer(
+            p.COV_ENABLE_SHADOWS, 1 if shadows else 0, physicsClientId=client
+        )
+    p.setGravity(0, 0, -9.81, physicsClientId=client)
+    return client
+
+
+def spawn_town_in_pybullet(client, town, terrain, env_size):
+    """
+    Load dusty heightfield + road slabs + building/overpass visuals once.
+
+    Collision for buildings stays in numpy (AABB); the heightfield is the
+    only PyBullet collision mesh. Returns (terrain_body, road_bodies, building_bodies).
+    """
+    grid = terrain.grid_x
+    size = float(env_size)
+
+    terrain_shape = p.createCollisionShape(
+        p.GEOM_HEIGHTFIELD,
+        meshScale=[size / grid, size / grid, 1.0],
+        heightfieldData=terrain.heightmap.flatten().tolist(),
+        numHeightfieldRows=grid,
+        numHeightfieldColumns=grid,
+        physicsClientId=client,
+    )
+    terrain_body = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=terrain_shape,
+        physicsClientId=client,
+    )
+    # Gray-brown dusty ground (not forest green)
+    p.changeVisualShape(
+        terrain_body,
+        -1,
+        rgbaColor=[0.45, 0.38, 0.28, 1],
+        physicsClientId=client,
+    )
+
+    road_bodies = []
+    for cx, cy, hx, hy, z in town.roads:
+        vis = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[hx, hy, 0.04],
+            rgbaColor=ROAD_COLOR,
+            physicsClientId=client,
+        )
+        bid = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=vis,
+            basePosition=[cx, cy, z],
+            physicsClientId=client,
+        )
+        road_bodies.append(bid)
+
+    building_bodies = []
+    for i, box in enumerate(town.boxes):
+        xmin, ymin, zmin, xmax, ymax, zmax = box
+        hx = (xmax - xmin) / 2.0
+        hy = (ymax - ymin) / 2.0
+        hz = (zmax - zmin) / 2.0
+        cx = (xmin + xmax) / 2.0
+        cy = (ymin + ymax) / 2.0
+        cz = (zmin + zmax) / 2.0
+        style = town.styles[i]
+        color = BUILDING_COLORS.get(style, BUILDING_COLORS["concrete"])
+        vis = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[hx, hy, hz],
+            rgbaColor=color,
+            physicsClientId=client,
+        )
+        bid = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=vis,
+            basePosition=[cx, cy, cz],
+            physicsClientId=client,
+        )
+        building_bodies.append(bid)
+
+    return terrain_body, road_bodies, building_bodies
+
+
+def frame_town_camera(client, env_size):
+    """Overview framing for the full map."""
+    cam_dist = max(180.0, float(env_size) * 0.85)
+    p.resetDebugVisualizerCamera(
+        cameraDistance=cam_dist,
+        cameraYaw=45,
+        cameraPitch=-40,
+        cameraTargetPosition=[0, 0, 8.0],
+        physicsClientId=client,
+    )
