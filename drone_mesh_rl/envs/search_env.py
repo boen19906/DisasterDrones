@@ -89,6 +89,9 @@ TALL_AVOID_M = 14.0  # a tower this close is not a climb; go around
 DETOUR_LOCK_STEPS = 16  # keep the around-heading so a corner cannot flip it
 STUCK_STEPS = 60  # net movement inside STUCK_RADIUS this long means the drone is stuck
 STUCK_RADIUS = 3.5
+PACE_STEPS = 36  # still inside PACE_RADIUS on painted ground: stop the shuttle
+PACE_RADIUS = 14.0
+PACE_LOCK_STEPS = 100  # hold the heading toward leftover work across empty streets
 STREET_LOOKAHEAD_CELLS = 6  # follow streets this far around a block
 
 # Eight neighbor headings, plus stay. Stay on the wall is turned back inward.
@@ -290,6 +293,12 @@ class SurvivorSearchEnv(ParallelEnv):
         self._free_h = np.full(num_drones, -1, dtype=np.int32)
         self._free_up = np.zeros(num_drones, dtype=bool)
         self._free_dir = np.zeros((num_drones, 2), dtype=np.float64)
+        self._pace_xy = np.zeros((num_drones, 2), dtype=np.float64)
+        self._pace_n = np.zeros(num_drones, dtype=np.int32)
+        self._pace_left = np.zeros(num_drones, dtype=np.int32)
+        self._pace_h = np.zeros(num_drones, dtype=np.int32)
+        self._pace_tick = np.full(num_drones, -1, dtype=np.int32)
+        self._pace_cached = np.full(num_drones, -1, dtype=np.int32)
         self.goal_is_person = np.zeros(num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(num_drones, dtype=np.int32)
         self.street_mask = np.ones((self.cover_ny, self.cover_nx), dtype=bool)
@@ -1240,6 +1249,121 @@ class SurvivorSearchEnv(ParallelEnv):
                 best_k = k
         return best_k
 
+    def _on_painted(self, pos):
+        gx, gy = self._world_to_cell(float(pos[0]), float(pos[1]))
+        return bool(self.coverage[gy, gx] >= 0.5)
+
+    def _legal_toward(self, mask_row, ux, uy):
+        best_h = None
+        best_dot = -1e9
+        for h in range(8):
+            if mask_row[h] < 0.5:
+                continue
+            dot = float(_HEADING_XY[h, 0]) * float(ux) + float(_HEADING_XY[h, 1]) * float(uy)
+            if dot > best_dot:
+                best_dot = dot
+                best_h = h
+        return best_h
+
+    def _pace_goal_heading(self, drone_index, pos):
+        """Level heading toward leftover work, or None when the drone is already there."""
+        if not self._work_remains():
+            return None
+        target = self._search_target_xy(drone_index)
+        if target is None:
+            return None
+        delta = np.asarray(target, dtype=np.float64) - np.asarray(pos[:2], dtype=np.float64)
+        dist = float(np.hypot(delta[0], delta[1]))
+        if dist < self.sensor_radius:
+            return None
+        return self._heading_index(float(delta[0]), float(delta[1])), delta / dist
+
+    def _pace_action(self, pos, heading, mask_row):
+        """Descend to search height on the way; otherwise fly level toward the goal."""
+        if self.legacy_xy:
+            return heading if mask_row[heading] > 0.5 else None
+        if self._agl_of(pos) > SEARCH_AGL_MAX and mask_row[16 + heading] > 0.5:
+            return 16 + heading
+        if mask_row[heading] > 0.5:
+            return heading
+        return None
+
+    def _pace_decide(self, drone_index, pos, idx, mask_row=None):
+        """Hold a heading toward leftover work after a shuttle on already painted ground."""
+        if int(self._lock_n[drone_index]) > 0 or int(self._free_left[drone_index]) > 0:
+            return None
+        if mask_row is None:
+            mask_row = self.action_mask()[drone_index]
+        if int(self._pace_left[drone_index]) > 0:
+            if not self._on_painted(pos):
+                self._pace_left[drone_index] = 0
+            else:
+                goal = self._pace_goal_heading(drone_index, pos)
+                if goal is None:
+                    self._pace_left[drone_index] = 0
+                else:
+                    heading, aim = goal
+                    held = int(self._pace_h[drone_index])
+                    action = self._pace_action(pos, held, mask_row)
+                    if action is None:
+                        heading = self._legal_toward(mask_row, float(aim[0]), float(aim[1]))
+                        if heading is None:
+                            self._pace_left[drone_index] = 0
+                            return None
+                        self._pace_h[drone_index] = heading
+                        action = self._pace_action(pos, heading, mask_row)
+                    if action is None:
+                        self._pace_left[drone_index] = 0
+                        return None
+                    self._pace_left[drone_index] -= 1
+                    return int(action)
+        if not self.legacy_xy and (8 <= idx <= 15 or idx == 25):
+            return None
+        if not self._on_painted(pos) or not self._work_remains():
+            self._pace_n[drone_index] = 0
+            self._pace_xy[drone_index, 0] = float(pos[0])
+            self._pace_xy[drone_index, 1] = float(pos[1])
+            return None
+        dist = float(np.hypot(
+            float(pos[0]) - float(self._pace_xy[drone_index, 0]),
+            float(pos[1]) - float(self._pace_xy[drone_index, 1]),
+        ))
+        if dist > PACE_RADIUS:
+            self._pace_n[drone_index] = 0
+            self._pace_xy[drone_index, 0] = float(pos[0])
+            self._pace_xy[drone_index, 1] = float(pos[1])
+            return None
+        self._pace_n[drone_index] += 1
+        if int(self._pace_n[drone_index]) < PACE_STEPS:
+            return None
+        goal = self._pace_goal_heading(drone_index, pos)
+        if goal is None:
+            return None
+        heading, aim = goal
+        if mask_row[heading] < 0.5:
+            heading = self._legal_toward(mask_row, float(aim[0]), float(aim[1]))
+        if heading is None:
+            return None
+        action = self._pace_action(pos, heading, mask_row)
+        if action is None:
+            return None
+        self._pace_h[drone_index] = heading
+        self._pace_left[drone_index] = PACE_LOCK_STEPS
+        self._pace_n[drone_index] = 0
+        self._pace_xy[drone_index, 0] = float(pos[0])
+        self._pace_xy[drone_index, 1] = float(pos[1])
+        return int(action)
+
+    def _pace_override(self, drone_index, pos, idx, tick, mask_row=None):
+        """Same decision if the lesson and the step both ask during one env step."""
+        if int(self._pace_tick[drone_index]) == int(tick):
+            cached = int(self._pace_cached[drone_index])
+            return idx if cached < 0 else cached
+        self._pace_tick[drone_index] = int(tick)
+        choice = self._pace_decide(drone_index, pos, idx, mask_row)
+        self._pace_cached[drone_index] = -1 if choice is None else int(choice)
+        return idx if choice is None else int(choice)
+
     def planner_actions(self, mask=None):
         """Head toward unpainted ground. Climb a clearable shell, then drop to search."""
         if mask is None:
@@ -1362,9 +1486,12 @@ class SurvivorSearchEnv(ParallelEnv):
                             best_dot = dot
                             best_k = k
                     choice = float(best_k)
+            choice = float(self._pace_override(i, pos, int(choice), self.step_count, mask[i]))
             actions[i] = choice
             self._plan_action[i] = int(choice)
-            self._climb_intent[i] = bool(climbing) and not self.legacy_xy
+            final = int(choice)
+            climbing_now = (not self.legacy_xy) and (8 <= final <= 15 or final == 25)
+            self._climb_intent[i] = bool(climbing_now and climbing)
         return actions
 
     def _keep_moving(self, drone_index):
@@ -1893,6 +2020,12 @@ class SurvivorSearchEnv(ParallelEnv):
         self._free_h = np.full(self.num_drones, -1, dtype=np.int32)
         self._free_up = np.zeros(self.num_drones, dtype=bool)
         self._free_dir = np.zeros((self.num_drones, 2), dtype=np.float64)
+        self._pace_xy = np.zeros((self.num_drones, 2), dtype=np.float64)
+        self._pace_n = np.zeros(self.num_drones, dtype=np.int32)
+        self._pace_left = np.zeros(self.num_drones, dtype=np.int32)
+        self._pace_h = np.zeros(self.num_drones, dtype=np.int32)
+        self._pace_tick = np.full(self.num_drones, -1, dtype=np.int32)
+        self._pace_cached = np.full(self.num_drones, -1, dtype=np.int32)
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
         self.town = None
@@ -2088,6 +2221,7 @@ class SurvivorSearchEnv(ParallelEnv):
             else:
                 idx = int(np.clip(np.rint(float(raw[0])) if raw.size else 0, 0, self.n_actions - 1))
                 idx = self._unstick_action(i, idx, self.drone_positions[i])
+                idx = self._pace_override(i, self.drone_positions[i], idx, self.step_count - 1)
                 if self.legacy_xy:
                     heading_idx, vz_sign = (8, 0.0) if idx >= 8 else (idx, 0.0)
                 else:
