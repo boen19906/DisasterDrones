@@ -1,8 +1,8 @@
 """
-scenery.py — Grouped Kenney OBJ props on tiled USGS terrain.
+scenery.py — Grouped Kenney OBJ props on single-patch USGS terrain.
 
-Many groves, rock outcrops, camps, and huts sit outside the four 300 m
-districts. Meshes are Y-up; they are rotated so file-Y is world-Z and
+Groves, rock outcrops, camps, and huts sit outside the one 300 m
+district. Meshes are Y-up; they are rotated so file-Y is world-Z and
 scaled from each file AABB. Each unique OBJ is cleaned (xyz only) and
 loaded once.
 """
@@ -23,12 +23,12 @@ _BANNED = frozenset({"weapon-bow.obj", "weapon-arrow.obj", "platform.obj"})
 _SEED = 19
 _MARGIN = 30.0
 _PATCH_LIFT = 0.05
-_N_GROVES = 56
-_N_OUTCROPS = 36
-_N_CAMPS = 16
-_N_HUTS = 8
-_N_ARCHERY = 4
-_N_BRIDGES_MAX = 6
+_N_GROVES = 14
+_N_OUTCROPS = 9
+_N_CAMPS = 4
+_N_HUTS = 2
+_N_ARCHERY = 1
+_N_BRIDGES_MAX = 1
 _GROVE_SEP = 45.0
 _OUTCROP_SEP = 35.0
 _CAMP_SEP = 100.0
@@ -199,6 +199,7 @@ def _gather(terrain, boxes, slope, Z, kind, need):
             {"step": 1, "s_max": 0.18, "rel_max": 12.0, "pad": 12.0},
             {"step": 1, "s_max": 0.28, "rel_max": 18.0, "pad": 8.0},
             {"step": 1, "s_max": 0.45, "rel_max": 28.0, "pad": 6.0},
+            {"step": 1, "s_max": 0.60, "rel_max": 40.0, "pad": 6.0},
         )
     elif kind == "outcrop":
         specs = (
@@ -206,15 +207,19 @@ def _gather(terrain, boxes, slope, Z, kind, need):
             {"step": 2, "s_min": 0.10, "s_max": 0.70, "rel_min": 2.0, "pad": 10.0},
             {"step": 1, "s_min": 0.07, "s_max": 0.85, "rel_min": 1.2, "pad": 8.0},
             {"step": 1, "s_min": 0.045, "s_max": 1.20, "rel_min": 0.6, "pad": 6.0},
+            {"step": 1, "s_min": 0.025, "s_max": 1.50, "rel_min": 0.3, "pad": 6.0},
         )
     elif kind == "camp":
+        # Keep ≥200 m from the one district while sites exist; loosen slope
+        # first, then pad, rather than dropping the camp count.
         specs = (
             {"step": 2, "s_max": 0.045, "rel_max": 2.4, "pad": 200.0},
             {"step": 2, "s_max": 0.055, "rel_max": 3.0, "pad": 200.0},
-            {"step": 2, "s_max": 0.06, "rel_max": 3.5, "pad": 150.0},
-            {"step": 1, "s_max": 0.08, "rel_max": 4.5, "pad": 100.0},
-            {"step": 1, "s_max": 0.10, "rel_max": 6.0, "pad": 40.0},
-            {"step": 1, "s_max": 0.14, "rel_max": 8.0, "pad": 10.0},
+            {"step": 2, "s_max": 0.08, "rel_max": 4.5, "pad": 200.0},
+            {"step": 1, "s_max": 0.12, "rel_max": 6.5, "pad": 200.0},
+            {"step": 1, "s_max": 0.16, "rel_max": 9.0, "pad": 150.0},
+            {"step": 1, "s_max": 0.20, "rel_max": 12.0, "pad": 80.0},
+            {"step": 1, "s_max": 0.28, "rel_max": 16.0, "pad": 10.0},
         )
     else:
         raise ValueError(kind)
@@ -518,7 +523,7 @@ def _find_bridges(terrain, camps, boxes, blockers, rng, n=_N_BRIDGES_MAX):
 
 def spawn_scenery_in_pybullet(client, terrain, districts, seed=_SEED):
     """
-    Place grouped Kenney scenery after the four districts.
+    Place grouped Kenney scenery after the one district.
 
     Returns (body_ids, info) where info has group centers and the bridge flag.
     """

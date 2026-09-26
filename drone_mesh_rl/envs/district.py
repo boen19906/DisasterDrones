@@ -1,13 +1,13 @@
 """
-district.py — One 300 m block district, copied onto each 2x2 DEM tile.
+district.py — One 300 m block district on the USGS DEM.
 
 Seeded axis-aligned boxes on the existing heightmap. Walls share one
 window texture (light wall, dark window grid, darker ground-floor band).
 A thin untinted roof lid covers the top face so roofs have no windows.
 Streets are long pavement slabs through leftover space in the same 300 m
 square (buildings are not moved). Sidewalk trees, street cars, and one
-water tower sit in that square. The same relative layout is shifted onto
-the other three terrain repeats.
+water tower sit in that square. copy_to can shift the same relative
+layout elsewhere, but the viewer only spawns this one district.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ def find_flattest_square(terrain, size=DISTRICT_SIZE):
     """
     Sliding-window search for the flattest `size` x `size` square fully
     inside the terrain AABB. Score is mean |gradient|, then relief (max-min),
-    then distance to the origin so a 2x2-tiled DEM yields one site.
+    then distance to the origin so the search prefers a central site.
     """
     Z = np.asarray(terrain.heightmap, dtype=np.float64)
     rx = float(getattr(terrain, "resolution_x", terrain.resolution))

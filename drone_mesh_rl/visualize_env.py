@@ -2,9 +2,9 @@
 visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
 Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
-PyBullet heightfield, tiles that patch 2x2 in memory, copies the same
-300 m district onto each tile, then adds grouped Kenney scenery outside
-those towns. --procedural restores the two-downtown metro.
+PyBullet heightfield (one USGS patch, no tiling), places one 300 m
+district, then adds grouped Kenney scenery outside that town.
+--procedural restores the two-downtown metro.
 Camera-only loop (no drones).
 
 Usage:
@@ -31,10 +31,10 @@ from envs.terrain import Terrain, find_dem_file, spawn_terrain_in_pybullet
 from envs.district import (
     DistrictLayout,
     frame_district_camera,
-    matching_tile_centers,
     spawn_districts_in_pybullet,
 )
 from envs.scenery import spawn_scenery_in_pybullet
+from envs.minimap import spawn_minimap_hud, update_minimap_hud
 from envs.town import (
     MetroLayout,
     connect_pybullet,
@@ -299,7 +299,7 @@ def build_world(client, env_size, seed):
 
 
 def build_dem_world(client, dem_path):
-    """Load the tiled USGS DEM, then the original district plus three copies."""
+    """Load the single-patch USGS DEM and the original district only."""
     t0 = time.perf_counter()
     terrain = Terrain.from_dem(dem_path)
     t_load = time.perf_counter() - t0
@@ -308,27 +308,23 @@ def build_dem_world(client, dem_path):
     t_spawn = time.perf_counter() - t0
     t0 = time.perf_counter()
     district = DistrictLayout(terrain)
-    centers = matching_tile_centers(terrain, district.center, district.size)
     districts = [district]
-    for c in centers[1:]:
-        districts.append(district.copy_to(terrain, c))
-    print("[DISTRICT] four tile centers:")
-    for i, c in enumerate(centers):
-        label = "original" if i == 0 else f"copy {i}"
-        print(f"[DISTRICT]   {i} ({c[0]:.3f}, {c[1]:.3f})  {label}")
+    print(
+        f"[DISTRICT] center=({district.center[0]:.3f}, {district.center[1]:.3f})"
+    )
     spawn_districts_in_pybullet(client, districts)
     t_district = time.perf_counter() - t0
     counts = district.counts()
     print(
         f"[DISTRICT] original=({district.center[0]:.1f}, {district.center[1]:.1f})  "
-        f"size={district.size:.0f} m  copies={len(districts) - 1}  "
+        f"size={district.size:.0f} m  copies=0  "
         f"shops={counts['shop']}  midrises={counts['midrise']}  "
         f"towers={counts['tower']}  total={len(district.buildings)}  "
         f"roads={len(district.roads)}  trees={len(district.trees)}  "
         f"cars={len(district.cars)}  place+spawn={t_district:.3f}s"
     )
     t0 = time.perf_counter()
-    _scenery_bodies, _scenery = spawn_scenery_in_pybullet(client, terrain, districts)
+    _scenery_bodies, scenery = spawn_scenery_in_pybullet(client, terrain, districts)
     print(f"[SCENERY] place+spawn={time.perf_counter() - t0:.3f}s")
 
     info = terrain.dem_info
@@ -365,7 +361,7 @@ def build_dem_world(client, dem_path):
         f"[DEM] orientation: world (+X,+Y) corner = raster row 0, col {cols - 1} "
         f"(NE corner, ~{ne_lon:.5f}, {ne_lat:.5f}); north = +Y, east = +X"
     )
-    return terrain, district
+    return terrain, district, districts, scenery
 
 
 def dem_move_speed(terrain):
@@ -452,7 +448,7 @@ def main():
     if args.procedural:
         print(" [3D METRO VIEWER] Two-downtown spectator")
     else:
-        print(" [3D TERRAIN VIEWER] USGS elevation + four districts + scenery")
+        print(" [3D TERRAIN VIEWER] USGS elevation + one district + scenery")
     if not gui:
         print(" --headless: timing/body-count check (p.DIRECT).")
     else:
@@ -479,7 +475,7 @@ def main():
     move_speed = _SPEC_MOVE_SPEED
     if use_dem:
         dem_path = args.dem or find_dem_file()
-        terrain, district = build_dem_world(client, dem_path)
+        terrain, district, districts, scenery = build_dem_world(client, dem_path)
         move_speed = dem_move_speed(terrain)
         print(
             f"[SPECTATOR] move speed {move_speed:.2f} m/poll "
@@ -509,6 +505,16 @@ def main():
             pass
         return
 
+    hud = None
+    if use_dem:
+        hud = spawn_minimap_hud(client, terrain, districts, scenery)
+
+    def sync_minimap(eye_xyz, yaw_deg, pitch_deg):
+        if hud is not None:
+            update_minimap_hud(
+                client, hud, eye_xyz, yaw_deg, pitch_deg, camera_basis_from_yaw_pitch
+            )
+
     def frame_overview():
         """Reset the overview camera; returns (yaw, pitch, dist, target).
 
@@ -537,6 +543,7 @@ def main():
     spectator = True
     yaw, pitch, dist, target = frame_overview()
     yaw, pitch, dist, eye = enter_spectator_fly(client, yaw, pitch, dist, target)
+    sync_minimap(eye, yaw, pitch)
     print("[SPECTATOR] ON — click the 3D viewport, then fly with WASD / Space+Shift / arrows.")
 
     dt_target = 1.0 / args.fps
@@ -558,17 +565,22 @@ def main():
                 clear_world(client)
                 if use_dem:
                     print("[RESET] Reloading DEM, district, and reframing...")
-                    terrain, district = build_dem_world(client, dem_path)
+                    terrain, district, districts, scenery = build_dem_world(
+                        client, dem_path
+                    )
+                    hud = spawn_minimap_hud(client, terrain, districts, scenery)
                 else:
                     print("[RESET] Rebuilding metro...")
                     seed = int(seed) + 1
                     town, terrain, world_size = build_world(client, args.env_size, seed)
                     print(f"[METRO] Loaded {len(town.boxes)} boxes (seed={seed}).")
+                    hud = None
                 yaw, pitch, dist, target = frame_overview()
                 spectator = True
                 yaw, pitch, dist, eye = enter_spectator_fly(
                     client, yaw, pitch, dist, target
                 )
+                sync_minimap(eye, yaw, pitch)
                 continue
             if _key_triggered(keys, ord("c")) or _key_triggered(keys, ord("C")):
                 spectator = not spectator
@@ -585,6 +597,9 @@ def main():
                 yaw, pitch, dist, eye = update_spectator_camera(
                     client, keys, yaw, pitch, dist, eye, move_speed=move_speed
                 )
+            elif hud is not None and not spectator:
+                yaw, pitch, dist, target, eye = read_debug_camera(client)
+            sync_minimap(eye, yaw, pitch)
 
             # Idle: no physics stepping, no drone/network updates
             elapsed = time.time() - loop_start
