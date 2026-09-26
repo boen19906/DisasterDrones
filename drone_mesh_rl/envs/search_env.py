@@ -44,6 +44,7 @@ from pettingzoo import ParallelEnv
 from .district import (
     RUBBLE_TOWN_SIZE,
     RubbleTownLayout,
+    spawn_rubble_town_dressing,
     spawn_rubble_town_in_pybullet,
 )
 from .survivors import SurvivorCluster
@@ -1209,6 +1210,18 @@ class SurvivorSearchEnv(ParallelEnv):
             self.terrain_body = spawn_terrain_in_pybullet(self.client, self.terrain)
             if getattr(self.town, "ruins", None):
                 spawn_rubble_town_in_pybullet(self.client, self.town)
+            if self._uses_search_meshes():
+                people = None
+                if self.survivors is not None:
+                    people = self.survivors.get_positions()[:, :2]
+                spawn_rubble_town_dressing(
+                    self.client,
+                    self.town,
+                    self.terrain,
+                    people_xy=people,
+                    map_hx=0.5 * self.size_x,
+                    map_hy=0.5 * self.size_y,
+                )
             return
         hx, hy = self.size_x / 2.0, self.size_y / 2.0
         col = p.createCollisionShape(
@@ -1390,6 +1403,8 @@ class SurvivorSearchEnv(ParallelEnv):
             n_hill_clusters=(0, 0),
             meadow_amp=0.12,
             grass_amp=0.35,
+            edge_grass_width=25.0,
+            edge_rise_amp=2.8,
         )
         town_size = min(float(RUBBLE_TOWN_SIZE), pad)
         self.town = RubbleTownLayout(
