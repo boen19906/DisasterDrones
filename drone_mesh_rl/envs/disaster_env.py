@@ -37,6 +37,7 @@ from gymnasium import spaces
 from pettingzoo import ParallelEnv
 
 from .terrain import Terrain
+from .town import TownLayout, BUILDING_COLORS, ROAD_COLOR
 from .network import Satellite, calculate_throughput, calculate_link
 from .survivors import SurvivorCluster
 from .weather import WeatherSystem
@@ -60,11 +61,11 @@ class DisasterMeshEnv(ParallelEnv):
         num_drones=5,
         num_clusters=4,
         survivors_per_cluster=(2, 5),
-        env_size=100.0,
+        env_size=250.0,
         max_steps=2000,
         render_mode=None,
-        drone_max_speed=2.0,
-        drone_max_altitude=30.0,
+        drone_max_speed=8.0,
+        drone_max_altitude=40.0,
         pyb_freq=60,
         seed=None,
     ):
@@ -107,8 +108,11 @@ class DisasterMeshEnv(ParallelEnv):
         self.possible_agents = [f"drone_{i}" for i in range(num_drones)]
         self.agents = list(self.possible_agents)
 
-        # Subsystems (initialized in reset)
-        self.terrain = Terrain(size_x=env_size, size_y=env_size, resolution=1.0)
+        # Subsystems (initialized in reset) — town + flat dusty ground
+        self.town = None
+        self.terrain = Terrain(
+            size_x=env_size, size_y=env_size, resolution=2.0, seed=seed
+        )
         self.satellite = Satellite(sim_boundary_x=env_size)
         self.survivors = SurvivorCluster(
             num_clusters=num_clusters,
@@ -116,7 +120,9 @@ class DisasterMeshEnv(ParallelEnv):
             env_size_x=env_size,
             env_size_y=env_size,
             terrain_obj=self.terrain,
+            discovery_range=25.0,
             seed=seed,
+            town=None,
         )
         self.weather = WeatherSystem(terrain=self.terrain, seed=seed)
 
@@ -127,6 +133,7 @@ class DisasterMeshEnv(ParallelEnv):
         self.battery_levels = np.ones(num_drones) * 100.0
         self.gateway_roles = np.zeros(num_drones, dtype=int)
         self.drone_alive = np.ones(num_drones, dtype=bool)
+        self.drone_collided = np.zeros(num_drones, dtype=bool)
 
         # Tracking
         self.step_count = 0
@@ -142,6 +149,9 @@ class DisasterMeshEnv(ParallelEnv):
         self.client = None
         self.drone_ids = []
         self.terrain_body = None
+        self.building_bodies = []
+        self.road_bodies = []
+        self._drone_radius = 0.4
 
         # Observation & action spaces
         obs_dim = 25
@@ -184,7 +194,7 @@ class DisasterMeshEnv(ParallelEnv):
         p.setTimeStep(1.0 / self.pyb_freq, physicsClientId=self.client)
 
     def _build_terrain(self):
-        """Build the terrain heightfield in PyBullet."""
+        """Build dusty-town heightfield plus GUI-only roads/buildings."""
         grid = self.terrain.grid_x
         size = self.env_size
 
@@ -201,17 +211,72 @@ class DisasterMeshEnv(ParallelEnv):
             baseCollisionShapeIndex=terrain_shape,
             physicsClientId=self.client,
         )
+        # Gray-brown dusty ground (not forest green)
         p.changeVisualShape(
             self.terrain_body, -1,
-            rgbaColor=[0.2, 0.65, 0.2, 1],
+            rgbaColor=[0.45, 0.38, 0.28, 1],
             physicsClientId=self.client,
         )
 
+        self.building_bodies = []
+        self.road_bodies = []
+        if self.town is None:
+            return
+
+        # Dark non-colliding road slabs (visual only)
+        for cx, cy, hx, hy, z in self.town.roads:
+            # Visual-only: collision shape index -1
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[hx, hy, 0.04],
+                rgbaColor=ROAD_COLOR,
+                physicsClientId=self.client,
+            )
+            bid = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=vis,
+                basePosition=[cx, cy, z],
+                physicsClientId=self.client,
+            )
+            self.road_bodies.append(bid)
+
+        # Colored building / overpass / rubble boxes (visual only — collision is numpy)
+        for i, box in enumerate(self.town.boxes):
+            xmin, ymin, zmin, xmax, ymax, zmax = box
+            hx = (xmax - xmin) / 2.0
+            hy = (ymax - ymin) / 2.0
+            hz = (zmax - zmin) / 2.0
+            cx = (xmin + xmax) / 2.0
+            cy = (ymin + ymax) / 2.0
+            cz = (zmin + zmax) / 2.0
+            style = self.town.styles[i]
+            color = BUILDING_COLORS.get(style, BUILDING_COLORS["concrete"])
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[hx, hy, hz],
+                rgbaColor=color,
+                physicsClientId=self.client,
+            )
+            bid = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=vis,
+                basePosition=[cx, cy, cz],
+                physicsClientId=self.client,
+            )
+            self.building_bodies.append(bid)
+
     def _spawn_drones(self):
-        """Spawn drone bodies in PyBullet."""
+        """Spawn drone bodies in PyBullet on a clear street corridor."""
         self.drone_ids = []
         max_z = float(self.terrain.heightmap.max())
-        spawn_z = max_z + 5.0
+        spawn_z = min(max_z + 8.0, self.drone_max_altitude * 0.5)
+
+        # Prefer the central street for spawn so we are not inside footprints
+        spawn_y = 0.0
+        if self.town is not None and self.town.street_centers_y:
+            spawn_y = float(min(self.town.street_centers_y, key=lambda c: abs(c)))
 
         # Try to load Crazyflie URDF
         urdf_path = None
@@ -225,13 +290,24 @@ class DisasterMeshEnv(ParallelEnv):
         except Exception:
             urdf_path = None
 
-        # Spread drones in a line formation above terrain
-        spread = min(self.num_drones * 3.0, self.env_size * 0.3)
+        # Spread drones along a street
+        spread = min(self.num_drones * 6.0, self.env_size * 0.4)
+        boxes = self.terrain.obstacle_boxes
         for i in range(self.num_drones):
-            x = (i - self.num_drones / 2) * (spread / self.num_drones)
-            y = 0.0
+            x = (i - self.num_drones / 2) * (spread / max(self.num_drones, 1))
+            y = spawn_y
             z = spawn_z
-            self.drone_positions[i] = [x, y, z]
+            candidate = np.array([x, y, z], dtype=np.float64)
+            # Nudge if somehow inside a volume
+            if TownLayout.sphere_hits_boxes(candidate, self._drone_radius, boxes):
+                for dz in (12.0, 18.0, 25.0, 35.0):
+                    candidate[2] = min(spawn_z + dz, self.drone_max_altitude - 1.0)
+                    if not TownLayout.sphere_hits_boxes(candidate, self._drone_radius, boxes):
+                        break
+                else:
+                    candidate = np.array([x, y, self.drone_max_altitude - 1.0])
+            self.drone_positions[i] = candidate
+            x, y, z = candidate.tolist()
 
             if urdf_path is not None:
                 original_cwd = os.getcwd()
@@ -252,13 +328,14 @@ class DisasterMeshEnv(ParallelEnv):
 
             self.drone_ids.append(did)
 
-        # Set initial wide camera for GUI to view entire 100m mountain region
+        # Camera framed for the full 250m town
         if self.render_mode == "human":
+            cam_dist = max(180.0, self.env_size * 0.85)
             p.resetDebugVisualizerCamera(
-                cameraDistance=85,
+                cameraDistance=cam_dist,
                 cameraYaw=45,
-                cameraPitch=-35,
-                cameraTargetPosition=[0, 0, 4.0],
+                cameraPitch=-40,
+                cameraTargetPosition=[0, 0, 8.0],
                 physicsClientId=self.client,
             )
 
@@ -294,10 +371,23 @@ class DisasterMeshEnv(ParallelEnv):
         self.agents = list(self.possible_agents)
         self.step_count = 0
 
-        # Reset subsystems
-        self.terrain = Terrain(size_x=self.env_size, size_y=self.env_size, resolution=1.0)
+        # Seeded damaged-town layout + flat dusty ground (episode seed)
+        self.town = TownLayout(
+            size=self.env_size,
+            seed=self._seed,
+            altitude_cap=self.drone_max_altitude,
+        )
+        self.terrain = Terrain(
+            size_x=self.env_size,
+            size_y=self.env_size,
+            resolution=2.0,
+            seed=self._seed,
+            obstacle_boxes=self.town.boxes,
+        )
         self.satellite.reset()
-        self.survivors.reset(seed=self._seed)
+        self.survivors.terrain = self.terrain
+        self.survivors.reset(seed=self._seed, town=self.town)
+        self.weather.terrain = self.terrain
         self.weather.reset(seed=self._seed)
 
         # Reset drone state
@@ -307,6 +397,7 @@ class DisasterMeshEnv(ParallelEnv):
         if self.num_drones > 0:
             self.gateway_roles[0] = 1
         self.drone_alive = np.ones(self.num_drones, dtype=bool)
+        self.drone_collided = np.zeros(self.num_drones, dtype=bool)
         self.drone_velocities = np.zeros((self.num_drones, 3))
         self.drone_orientations = np.zeros((self.num_drones, 3))
 
@@ -392,6 +483,28 @@ class DisasterMeshEnv(ParallelEnv):
             # Boundary clamping
             new_pos[0] = np.clip(new_pos[0], -self.env_size / 2, self.env_size / 2)
             new_pos[1] = np.clip(new_pos[1], -self.env_size / 2, self.env_size / 2)
+
+            # Building AABB collision: block motion (do not pass through)
+            boxes = self.terrain.obstacle_boxes
+            if TownLayout.sphere_hits_boxes(new_pos, self._drone_radius, boxes):
+                self.drone_collided[i] = True
+                # Try axis-separated slides; otherwise stay put
+                slid = False
+                for trial in (
+                    np.array([new_pos[0], pos[1], pos[2]]),
+                    np.array([pos[0], new_pos[1], pos[2]]),
+                    np.array([pos[0], pos[1], new_pos[2]]),
+                ):
+                    trial[0] = np.clip(trial[0], -self.env_size / 2, self.env_size / 2)
+                    trial[1] = np.clip(trial[1], -self.env_size / 2, self.env_size / 2)
+                    tz = self._get_terrain_height(trial[0], trial[1])
+                    trial[2] = np.clip(trial[2], tz + 0.5, self.drone_max_altitude)
+                    if not TownLayout.sphere_hits_boxes(trial, self._drone_radius, boxes):
+                        new_pos = trial
+                        slid = True
+                        break
+                if not slid:
+                    new_pos = pos.copy()
 
             self.drone_positions[i] = new_pos
 
@@ -498,15 +611,19 @@ class DisasterMeshEnv(ParallelEnv):
         )
 
     def _check_terrain_collisions(self):
-        """Check which drones have collided with terrain."""
+        """Check terrain height hits and building AABB sphere overlaps."""
         collisions = np.zeros(self.num_drones, dtype=bool)
+        boxes = self.terrain.obstacle_boxes
         for i in range(self.num_drones):
             if not self.drone_alive[i]:
                 continue
             pos = self.drone_positions[i]
             terrain_z = self._get_terrain_height(pos[0], pos[1])
-            if pos[2] <= terrain_z + 0.2:
+            hit_ground = pos[2] <= terrain_z + 0.2
+            hit_building = TownLayout.sphere_hits_boxes(pos, self._drone_radius, boxes)
+            if hit_ground or hit_building or self.drone_collided[i]:
                 collisions[i] = True
+                self.drone_collided[i] = False  # consume one-shot motion block flag
         return collisions
 
     def _check_drone_collisions(self):

@@ -39,7 +39,9 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default="", help="Optional model checkpoint path")
     parser.add_argument("--num_drones", type=int, default=5, help="Number of drones")
     parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
-    parser.add_argument("--env_size", type=float, default=100.0, help="Terrain size in meters")
+    parser.add_argument("--env_size", type=float, default=250.0, help="Terrain size in meters")
+    parser.add_argument("--drone_max_speed", type=float, default=8.0, help="Max drone cruise speed m/s")
+    parser.add_argument("--drone_max_altitude", type=float, default=40.0, help="Altitude cap in meters")
     parser.add_argument("--fps", type=float, default=30.0, help="Display FPS target")
     parser.add_argument("--seed", type=int, default=42, help="World seed")
     return parser.parse_args()
@@ -58,6 +60,8 @@ def main():
         env_size=args.env_size,
         max_steps=5000,
         render_mode="human",
+        drone_max_speed=args.drone_max_speed,
+        drone_max_altitude=args.drone_max_altitude,
         seed=args.seed,
     )
 

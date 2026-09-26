@@ -27,8 +27,10 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default="models/mappo_drone_mesh.pt", help="Path to model checkpoint")
     parser.add_argument("--num_drones", type=int, default=5, help="Number of drones")
     parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
-    parser.add_argument("--env_size", type=float, default=100.0, help="Environment size in meters")
-    parser.add_argument("--max_steps", type=int, default=1000, help="Max steps per episode")
+    parser.add_argument("--env_size", type=float, default=250.0, help="Environment size in meters")
+    parser.add_argument("--max_steps", type=int, default=2400, help="Max steps per episode")
+    parser.add_argument("--drone_max_speed", type=float, default=8.0, help="Max drone cruise speed m/s")
+    parser.add_argument("--drone_max_altitude", type=float, default=40.0, help="Altitude cap in meters")
     parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
     parser.add_argument("--random", action="store_true", help="Evaluate random baseline policy")
     parser.add_argument("--seed", type=int, default=100, help="Evaluation random seed")
@@ -56,6 +58,8 @@ def main():
         env_size=args.env_size,
         max_steps=args.max_steps,
         render_mode=None,
+        drone_max_speed=args.drone_max_speed,
+        drone_max_altitude=args.drone_max_altitude,
         seed=args.seed,
     )
 

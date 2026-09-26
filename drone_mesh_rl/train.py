@@ -29,8 +29,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train MAPPO on Disaster Drone Mesh")
     parser.add_argument("--num_drones", type=int, default=5, help="Number of drones in swarm")
     parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
-    parser.add_argument("--env_size", type=float, default=100.0, help="Terrain size in meters")
-    parser.add_argument("--max_steps", type=int, default=1000, help="Max steps per episode")
+    parser.add_argument("--env_size", type=float, default=250.0, help="Terrain size in meters")
+    parser.add_argument("--max_steps", type=int, default=2400, help="Max steps per episode")
+    parser.add_argument("--drone_max_speed", type=float, default=8.0, help="Max drone cruise speed m/s")
+    parser.add_argument("--drone_max_altitude", type=float, default=40.0, help="Altitude cap in meters")
     parser.add_argument("--total_timesteps", type=int, default=50000, help="Total environment steps")
     parser.add_argument("--rollout_steps", type=int, default=256, help="Steps per rollout")
     parser.add_argument("--num_epochs", type=int, default=4, help="PPO update epochs per rollout")
@@ -72,6 +74,8 @@ def main():
         env_size=args.env_size,
         max_steps=args.max_steps,
         render_mode=None, # Headless for maximum speed
+        drone_max_speed=args.drone_max_speed,
+        drone_max_altitude=args.drone_max_altitude,
         seed=args.seed,
     )
 

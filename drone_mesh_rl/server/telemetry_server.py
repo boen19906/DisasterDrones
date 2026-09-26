@@ -43,7 +43,7 @@ app = FastAPI(title="Drone Mesh Mission Control")
 class SwarmSimulationManager:
     """Manages the disaster mesh simulation loop and handles telemetry broadcasting."""
 
-    def __init__(self, num_drones=5, num_clusters=4, env_size=100.0, model_path="", gui=False):
+    def __init__(self, num_drones=5, num_clusters=4, env_size=250.0, model_path="", gui=False):
         self.num_drones = num_drones
         self.num_clusters = num_clusters
         self.env_size = env_size
@@ -252,6 +252,7 @@ class SwarmSimulationManager:
             "weather": weather_data,
             "stats": stats_data,
             "env_size": self.env_size,
+            "buildings": env.town.footprints_2d() if env.town is not None else [],
         }
 
 
@@ -620,7 +621,7 @@ CONTROL_CENTER_HTML = """
     <div class="panel">
       <div class="panel-header">
         <div class="panel-title">
-          <span>📡</span> Tactical Radar & RF Mesh Topology Map (100m x 100m)
+          <span>📡</span> Tactical Radar & RF Mesh Topology Map (250m x 250m)
         </div>
         <div style="font-size: 11px; color: var(--accent-cyan);" id="fpsCounter">30 FPS</div>
       </div>
@@ -639,6 +640,7 @@ CONTROL_CENTER_HTML = """
           <div class="legend-item"><div class="legend-box" style="background: var(--accent-cyan);"></div> Relay Drone</div>
           <div class="legend-item"><div class="legend-box" style="background: var(--accent-green);"></div> Found Survivor</div>
           <div class="legend-item"><div class="legend-box" style="background: #ff5252;"></div> Unknown Survivor</div>
+          <div class="legend-item"><div class="legend-box" style="background: #6b5e4f;"></div> Building</div>
           <div class="legend-item"><div class="legend-box" style="background: var(--accent-yellow);"></div> LEO Orbit Beam</div>
         </div>
       </div>
@@ -896,6 +898,7 @@ CONTROL_CENTER_HTML = """
       if (!lastData) return;
 
       const envSize = lastData.env_size;
+      const half = envSize / 2;
       const scale = Math.min(w, h) * 0.88 / envSize;
       const cx = w / 2;
       const cy = h / 2;
@@ -904,23 +907,36 @@ CONTROL_CENTER_HTML = """
         return [cx + x * scale, cy - y * scale];
       }
 
-      // 1. Draw Mountain Topography Grid Lines
+      // 1. Draw town grid + building footprints
       ctx.strokeStyle = 'rgba(0, 242, 254, 0.08)';
       ctx.lineWidth = 1;
-      const gridSteps = 10;
-      for (let i = -50; i <= 50; i += 10) {
-        const p1 = toScreen(i, -50);
-        const p2 = toScreen(i, 50);
+      const step = Math.max(10, Math.round(envSize / 25) * 5);
+      for (let i = -half; i <= half; i += step) {
+        const p1 = toScreen(i, -half);
+        const p2 = toScreen(i, half);
         ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
 
-        const p3 = toScreen(-50, i);
-        const p4 = toScreen(50, i);
+        const p3 = toScreen(-half, i);
+        const p4 = toScreen(half, i);
         ctx.beginPath(); ctx.moveTo(p3[0], p3[1]); ctx.lineTo(p4[0], p4[1]); ctx.stroke();
       }
 
+      // Building footprints
+      const buildings = lastData.buildings || [];
+      buildings.forEach(b => {
+        const [x0, y0] = toScreen(b.xmin, b.ymax);
+        const [x1, y1] = toScreen(b.xmax, b.ymin);
+        const isOverpass = (b.style === 'overpass') || ((b.zmin || 0) > 0.5);
+        ctx.fillStyle = isOverpass ? 'rgba(120, 120, 140, 0.35)' : 'rgba(90, 78, 65, 0.55)';
+        ctx.strokeStyle = isOverpass ? 'rgba(160, 160, 180, 0.7)' : 'rgba(140, 120, 100, 0.8)';
+        ctx.lineWidth = 1;
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      });
+
       // Map boundary box
-      const bTopLeft = toScreen(-50, 50);
-      const bBottomRight = toScreen(50, -50);
+      const bTopLeft = toScreen(-half, half);
+      const bBottomRight = toScreen(half, -half);
       ctx.strokeStyle = 'rgba(0, 242, 254, 0.35)';
       ctx.lineWidth = 2;
       ctx.strokeRect(bTopLeft[0], bTopLeft[1], bBottomRight[0] - bTopLeft[0], bBottomRight[1] - bTopLeft[1]);
@@ -1018,7 +1034,7 @@ CONTROL_CENTER_HTML = """
 
       // 5. Draw Satellite Trajectory & Uplink Beam
       const sat = lastData.satellite;
-      const [satScrX, satScrY] = toScreen(sat.x, 48); // Near top boundary
+      const [satScrX, satScrY] = toScreen(sat.x, half * 0.96);
       ctx.fillStyle = sat.visible ? '#ffd600' : '#ff3366';
       ctx.beginPath();
       ctx.arc(satScrX, satScrY, 8, 0, Math.PI * 2);
@@ -1108,7 +1124,7 @@ def main():
     parser.add_argument("--model_path", type=str, default="models/mappo_drone_mesh.pt", help="MAPPO model checkpoint")
     parser.add_argument("--num_drones", type=int, default=5, help="Number of drones")
     parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
-    parser.add_argument("--env_size", type=float, default=100.0, help="Environment size in meters")
+    parser.add_argument("--env_size", type=float, default=250.0, help="Environment size in meters")
     args = parser.parse_args()
 
     global sim_manager
