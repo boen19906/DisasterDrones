@@ -167,7 +167,7 @@ def main():
     print("=" * 65)
     print(f" [3D VISUALIZER] task={args.task}")
     if args.task == "search":
-        print(" Search: 250 m downtown, 5 m AGL, capsule survivors, MAPPO XY")
+        print(" Search: 240 m rubble city, 5 m AGL, capsule survivors, MAPPO XY")
         print(" Camera: starts top-down | arrows pan | 1/2/3 follow a drone | 0 overview")
         print("         [ ] zoom | Space pause | R reset | Q quit")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")

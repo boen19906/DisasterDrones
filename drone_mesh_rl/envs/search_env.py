@@ -1,7 +1,7 @@
 """
 search_env.py - Multi-agent search on a rectangular map.
 
-The world is a 250 m downtown pad: next-best-view coverage
+The world is a 240 m rubble city on a 250 m pad: next-best-view coverage
 and a leftover-survivor hunt choose where unfinished work is. The learning
 interface is Boen's. Each drone picks one of 9 headings (8 neighbors or
 stay), reads a shared coarse 8x8 coverage map, and is turned back when a
@@ -41,9 +41,15 @@ except ImportError:
 from gymnasium import spaces
 from pettingzoo import ParallelEnv
 
+from .district import (
+    RUBBLE_TOWN_SEED,
+    RUBBLE_TOWN_SIZE,
+    RubbleTownLayout,
+    spawn_rubble_town_in_pybullet,
+)
 from .survivors import SurvivorCluster
-from .terrain import Terrain
-from .town import TownLayout, spawn_town_in_pybullet
+from .terrain import Terrain, spawn_terrain_in_pybullet
+from .town import TownLayout
 
 
 COVER_CROP = 7  # local visited-map window (odd)
@@ -1112,10 +1118,9 @@ class SurvivorSearchEnv(ParallelEnv):
         if self.client is None:
             return
         if self.town is not None:
-            terrain_body, _, _ = spawn_town_in_pybullet(
-                self.client, self.town, self.terrain, self.size_x
-            )
-            self.terrain_body = terrain_body
+            self.terrain_body = spawn_terrain_in_pybullet(self.client, self.terrain)
+            if getattr(self.town, "ruins", None):
+                spawn_rubble_town_in_pybullet(self.client, self.town)
             return
         hx, hy = self.size_x / 2.0, self.size_y / 2.0
         col = p.createCollisionShape(
@@ -1344,11 +1349,12 @@ class SurvivorSearchEnv(ParallelEnv):
             meadow_amp=0.12,
             grass_amp=0.35,
         )
-        self.town = TownLayout(
-            size=pad,
-            seed=surv_seed,
-            altitude_cap=40.0,
-            origin=(0.0, 0.0),
+        town_size = min(float(RUBBLE_TOWN_SIZE), pad)
+        self.town = RubbleTownLayout(
+            self.terrain,
+            size=town_size,
+            seed=RUBBLE_TOWN_SEED,
+            center=(0.0, 0.0),
         )
         self.town.apply_ground_heights(self.terrain)
         if hasattr(self.terrain, "set_obstacle_boxes"):

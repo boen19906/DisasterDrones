@@ -1,8 +1,8 @@
 """
 terrain.py — Ground heightmap plus texture, either procedural (dusty city,
 grass belt, mountain rim) or loaded from a real elevation GeoTIFF via
-Terrain.from_dem (USGS bare-earth DEM, heights used as-is, then tiled 2x2
-in memory).
+Terrain.from_dem (USGS bare-earth DEM, heights used as-is from the
+loaded patch once — no in-memory tiling).
 
 Grid convention: heightmap[i, j] with i along +Y (row 0 = south edge,
 north = +Y) and j along +X. That is also PyBullet's heightfield order when
@@ -430,9 +430,9 @@ class Terrain:
         (no procedural relief). One vertex per (downsampled) pixel center.
 
         After the GeoTIFF is loaded (file left unchanged), the patch is
-        repeated in memory as a 2x2 block (same land twice along X and Y).
-        The doubled footprint is centered on the origin, north stays +Y,
-        east stays +X, and world z is elevation minus the lowest point.
+        used once (no tiling). The footprint is centered on the origin,
+        north stays +Y, east stays +X, and world z is elevation minus
+        the lowest point.
         """
         if path is None:
             path = find_dem_file()
@@ -444,11 +444,10 @@ class Terrain:
         self.dem_info = info
         # Raster row 0 is north; flip so heightmap row 0 is the south (-Y) edge.
         patch = np.ascontiguousarray(np.flipud(info["elevation"]))
-        # Same USGS patch twice along X and twice along Y. Seams are fine.
-        # 2x2 of the current ~175 x 93 DEM stays under the 512-side / 1 MiB
-        # PyBullet heightfield limit; do not downsample further.
-        self.dem_tile = (2, 2)
-        elev = np.ascontiguousarray(np.tile(patch, self.dem_tile))
+        # Single USGS patch, no tiling. ~175 x 93 stays under the 512-side /
+        # 1 MiB PyBullet heightfield limit.
+        self.dem_tile = (1, 1)
+        elev = patch
         self.z_offset = float(np.min(elev))
         self.heightmap = elev - self.z_offset
         self.grid_y, self.grid_x = self.heightmap.shape
