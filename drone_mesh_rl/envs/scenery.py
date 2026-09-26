@@ -364,40 +364,99 @@ def _q_span(yaw, pitch):
     return p.multiplyTransforms([0, 0, 0], q_yaw, [0, 0, 0], q)[1]
 
 
+def _q_orient(yaw=0.0, pitch=0.0, roll=0.0):
+    """Y-up → Z-up, then roll/pitch/yaw (XYZ) in world."""
+    q_fix = p.getQuaternionFromEuler([math.pi / 2.0, 0.0, 0.0])
+    q_rpy = p.getQuaternionFromEuler([float(roll), float(pitch), float(yaw)])
+    return p.multiplyTransforms([0, 0, 0], q_rpy, [0, 0, 0], q_fix)[1]
+
+
 class _MeshBank:
-    """One visual shape per unique Kenney mesh."""
+    """One visual shape per unique Kenney mesh (or keyed scale/tint variant)."""
 
     def __init__(self, client):
         self.client = client
         self.vis = {}
         self.meta = {}
 
-    def load(self, stem, scale=None):
-        if stem in self.vis:
-            return self.vis[stem]
-        fname = f"{stem}.obj"
-        if fname in _BANNED:
-            raise RuntimeError(f"refusing to load banned mesh {fname}")
-        scale = float(_SCALE[stem] if scale is None else scale)
-        path = _cleaned_obj(stem)
+    def load(self, stem, scale=None, key=None, tint=None, path=None):
+        vis_key = stem if key is None else key
+        if vis_key in self.vis:
+            return self.vis[vis_key]
+        if path is None:
+            fname = f"{stem}.obj"
+            if fname in _BANNED:
+                raise RuntimeError(f"refusing to load banned mesh {fname}")
+            path = _cleaned_obj(stem)
+            if tint is None:
+                tint = _TINT[stem]
+        else:
+            base = os.path.basename(path)
+            if base in _BANNED or base in {"Colonne_2.obj", "Colonne_3.obj"}:
+                raise RuntimeError(f"refusing to load banned mesh {base}")
+            if tint is None:
+                tint = [0.55, 0.50, 0.44, 1.0]
+        if scale is None:
+            mesh_scale = [float(_SCALE[stem])] * 3
+        elif isinstance(scale, (int, float)):
+            mesh_scale = [float(scale)] * 3
+        else:
+            mesh_scale = [float(scale[0]), float(scale[1]), float(scale[2])]
         bounds = _parse_bounds(path)
+        color = list(tint)
         vis = p.createVisualShape(
             p.GEOM_MESH,
             fileName=path,
-            meshScale=[scale, scale, scale],
-            rgbaColor=_TINT[stem],
+            meshScale=mesh_scale,
+            rgbaColor=color,
             physicsClientId=self.client,
         )
-        self.vis[stem] = vis
-        self.meta[stem] = {"scale": scale, "ymin": bounds["ymin"], "bounds": bounds}
+        self.vis[vis_key] = vis
+        self.meta[vis_key] = {
+            "stem": stem,
+            "scale": max(mesh_scale),
+            "mesh_scale": mesh_scale,
+            "ymin": bounds["ymin"],
+            "bounds": bounds,
+        }
         return vis
 
-    def spawn(self, stem, x, y, z, yaw=0.0, pitch=None):
-        vis = self.vis[stem]
-        if pitch is None:
-            orn = _q_yaw(yaw)
-        else:
-            orn = _q_span(yaw, pitch)
+    def _orn(self, yaw=0.0, pitch=None, roll=None):
+        if pitch is None and roll is None:
+            return _q_yaw(yaw)
+        if roll is None:
+            return _q_span(yaw, pitch)
+        return _q_orient(yaw, 0.0 if pitch is None else pitch, roll)
+
+    def corners_world(self, key, x, y, z, orn):
+        meta = self.meta[key]
+        b = meta["bounds"]
+        sx, sy, sz = meta["mesh_scale"]
+        pts = []
+        for fx in (b["xmin"] * sx, b["xmax"] * sx):
+            for fy in (b["ymin"] * sy, b["ymax"] * sy):
+                for fz in (b["zmin"] * sz, b["zmax"] * sz):
+                    w, _ = p.multiplyTransforms(
+                        [float(x), float(y), float(z)],
+                        orn,
+                        [fx, fy, fz],
+                        [0, 0, 0, 1],
+                    )
+                    pts.append(w)
+        return pts
+
+    def extents(self, key, yaw=0.0, pitch=None, roll=None):
+        """Return (height, longest_xy, longest) of the oriented AABB."""
+        orn = self._orn(yaw, pitch, roll)
+        pts = self.corners_world(key, 0.0, 0.0, 0.0, orn)
+        xs, ys, zs = zip(*pts)
+        dx, dy, dz = max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)
+        return dz, max(dx, dy), max(dx, dy, dz)
+
+    def spawn(self, stem, x, y, z, yaw=0.0, pitch=None, roll=None, key=None):
+        vis_key = stem if key is None else key
+        vis = self.vis[vis_key]
+        orn = self._orn(yaw, pitch, roll)
         return p.createMultiBody(
             baseMass=0,
             baseCollisionShapeIndex=-1,
@@ -407,11 +466,21 @@ class _MeshBank:
             physicsClientId=self.client,
         )
 
-    def sit(self, terrain, stem, x, y, yaw=0.0, lift=0.0):
-        meta = self.meta[stem]
+    def sit(self, terrain, stem, x, y, yaw=0.0, lift=0.0, key=None):
+        vis_key = stem if key is None else key
+        meta = self.meta[vis_key]
         gz = _sample_heightmap(terrain, x, y)
-        z = gz - meta["ymin"] * meta["scale"] + lift
-        return self.spawn(stem, x, y, z, yaw), gz
+        z = gz - meta["ymin"] * meta["mesh_scale"][1] + lift
+        return self.spawn(stem, x, y, z, yaw, key=key), gz
+
+    def sit_oriented(self, terrain, key, x, y, yaw=0.0, pitch=0.0, roll=0.0, lift=0.0):
+        """Sit an arbitrarily tilted instance so its AABB rests on the heightmap."""
+        orn = self._orn(yaw, pitch, roll)
+        zmin = min(pt[2] for pt in self.corners_world(key, 0.0, 0.0, 0.0, orn))
+        gz = _sample_heightmap(terrain, x, y)
+        z = gz - zmin + lift
+        bid = self.spawn(key, x, y, z, yaw=yaw, pitch=pitch, roll=roll)
+        return bid, gz, z
 
 
 def _hut_beside(terrain, camp, boxes, rng, others):
@@ -563,6 +632,7 @@ def spawn_scenery_in_pybullet(client, terrain, districts, seed=_SEED):
     print("[SCENERY] Kenney meshes loaded once (xyz-only, Y-up → Z-up)")
 
     n_archery = 0
+    archers = []
     for i, (gx, gy) in enumerate(plan["groves"]):
         n_trees = int(rng.integers(12, 21))
         n_plants = int(rng.integers(6, 11))
@@ -649,6 +719,7 @@ def spawn_scenery_in_pybullet(client, terrain, districts, seed=_SEED):
             bodies.append(bid)
             bid, _ = bank.sit(terrain, "target", tx, ty, yaw_t)
             bodies.append(bid)
+            archers.append((ax, ay))
             n_archery += 1
 
     yard = (
@@ -711,6 +782,7 @@ def spawn_scenery_in_pybullet(client, terrain, districts, seed=_SEED):
         "camps": plan["camps"],
         "huts": plan["huts"],
         "archery": plan["archery"],
+        "archers": archers,
         "bridges": bridges,
         "n_bodies": len(bodies),
         "n_archery": n_archery,

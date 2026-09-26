@@ -34,6 +34,8 @@ from envs.district import (
     spawn_districts_in_pybullet,
 )
 from envs.scenery import spawn_scenery_in_pybullet
+from envs.rubble import spawn_rubble_in_pybullet
+from envs.city_ruins import spawn_city_ruins_in_pybullet
 from envs.minimap import spawn_minimap_hud, update_minimap_hud
 from envs.town import (
     MetroLayout,
@@ -326,6 +328,15 @@ def build_dem_world(client, dem_path):
     t0 = time.perf_counter()
     _scenery_bodies, scenery = spawn_scenery_in_pybullet(client, terrain, districts)
     print(f"[SCENERY] place+spawn={time.perf_counter() - t0:.3f}s")
+    t0 = time.perf_counter()
+    _rubble_bodies, rubble = spawn_rubble_in_pybullet(client, terrain, districts, scenery)
+    print(f"[RUBBLE] place+spawn={time.perf_counter() - t0:.3f}s")
+    scenery = dict(scenery)
+    scenery["rubble"] = rubble
+    t0 = time.perf_counter()
+    _ruins_bodies, ruins = spawn_city_ruins_in_pybullet(client, terrain, districts, scenery)
+    print(f"[RUINS] place+spawn={time.perf_counter() - t0:.3f}s")
+    scenery["ruins"] = ruins
 
     info = terrain.dem_info
     rows, cols = info["raster_shape"]
