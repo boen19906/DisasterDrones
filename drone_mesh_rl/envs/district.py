@@ -5,9 +5,10 @@ Seeded axis-aligned boxes on the existing heightmap. Walls share one
 window texture (light wall, dark window grid, darker ground-floor band).
 A thin untinted roof lid covers the top face so roofs have no windows.
 Streets are long pavement slabs through leftover space in the same 300 m
-square (buildings are not moved). Sidewalk trees, street cars, and one
-water tower sit in that square. copy_to can shift the same relative
-layout elsewhere, but the viewer only spawns this one district.
+square (buildings are not moved). Four box-built ruined shells sit in
+street-edge leftover lots near the center. Sidewalk trees, street cars,
+and one water tower sit in that square. copy_to can shift the same
+relative layout elsewhere, but the viewer only spawns this one district.
 """
 
 from __future__ import annotations
@@ -64,6 +65,28 @@ _BUILDING_SPEC = (
     ("tower", 3, 18.0, 18.0, 45.0, 45.0),
     ("midrise", 15, 14.0, 14.0, 20.0, 28.0),
     ("shop", 30, 16.0, 12.0, 8.0, 12.0),
+)
+
+_N_RUINS = 4
+_RUIN_SX = 16.0
+_RUIN_SY = 14.0
+_RUIN_H = (13.5, 15.2, 16.8, 17.6)
+_RUIN_MAX_R = 70.0
+_RUIN_WALL_T = (1.05, 0.90, 1.15, 0.85)
+_RUIN_TIP_DEG = (34.0, 42.0, 48.0, 38.0)
+# Charred gray / broken concrete — not shop white, brick red, or tower blue
+_RUIN_WALL_RGB = (
+    [0.34, 0.31, 0.28, 1.0],
+    [0.30, 0.28, 0.25, 1.0],
+    [0.32, 0.29, 0.26, 1.0],
+    [0.28, 0.26, 0.23, 1.0],
+)
+_RUIN_SLAB_RGB = [0.31, 0.29, 0.26, 1.0]
+_RUIN_CHUNK_RGB = (
+    [0.27, 0.25, 0.22, 1.0],
+    [0.36, 0.33, 0.29, 1.0],
+    [0.24, 0.22, 0.20, 1.0],
+    [0.33, 0.30, 0.26, 1.0],
 )
 
 
@@ -451,6 +474,497 @@ def _layout_props(terrain, buildings, roads, center, size, seed):
     return trees, cars, landmark
 
 
+def _quat_axis_angle(ax, ay, az, angle):
+    s = math.sin(0.5 * angle)
+    return [ax * s, ay * s, az * s, math.cos(0.5 * angle)]
+
+
+def _quat_rotate(q, v):
+    qx, qy, qz, qw = q
+    x, y, z = v
+    tx = 2.0 * (qy * z - qz * y)
+    ty = 2.0 * (qz * x - qx * z)
+    tz = 2.0 * (qx * y - qy * x)
+    return (
+        x + qw * tx + (qy * tz - qz * ty),
+        y + qw * ty + (qz * tx - qx * tz),
+        z + qw * tz + (qx * ty - qy * tx),
+    )
+
+
+def _support_z(terrain, points):
+    return max(_sample_heightmap(terrain, float(x), float(y)) for x, y in points)
+
+
+def _sit_oriented(terrain, cx, cy, hx, hy, hz, orn):
+    corners = [
+        _quat_rotate(orn, (sx * hx, sy * hy, sz * hz))
+        for sx in (-1.0, 1.0)
+        for sy in (-1.0, 1.0)
+        for sz in (-1.0, 1.0)
+    ]
+    samples = [(cx + c[0], cy + c[1]) for c in corners]
+    samples.append((cx, cy))
+    gz = _support_z(terrain, samples)
+    return gz - min(c[2] for c in corners)
+
+
+def _aabb_overlap(a, b, gap=0.0):
+    return _rects_overlap(a, b, gap)
+
+
+def _car_rect(car):
+    return (
+        car["cx"] - car["hx"],
+        car["cy"] - car["hy"],
+        car["cx"] + car["hx"],
+        car["cy"] + car["hy"],
+    )
+
+
+def _center_on_road(cx, cy, roads, inset=1.2):
+    for slab in roads:
+        if (
+            slab["xmin"] + inset <= cx <= slab["xmax"] - inset
+            and slab["ymin"] + inset <= cy <= slab["ymax"] - inset
+        ):
+            return True
+    return False
+
+
+def _nearest_street(cx, cy, roads):
+    best = None
+    best_d = 1e9
+    for slab in roads:
+        dx = max(slab["xmin"] - cx, 0.0, cx - slab["xmax"])
+        dy = max(slab["ymin"] - cy, 0.0, cy - slab["ymax"])
+        d = math.hypot(dx, dy)
+        if d < best_d:
+            best_d = d
+            best = slab
+    return best, best_d
+
+
+def _beside_street(rect, cx, cy, roads, max_gap=8.0):
+    if _center_on_road(cx, cy, roads):
+        return False, None
+    slab, dist = _nearest_street(cx, cy, roads)
+    if slab is None:
+        return False, None
+    road_rect = (slab["xmin"], slab["ymin"], slab["xmax"], slab["ymax"])
+    if _aabb_overlap(rect, road_rect, max_gap) or dist <= max_gap + 2.0:
+        return True, slab
+    return False, None
+
+
+def _footprint_clear(rect, buildings, cars, landmark, placed, gap_b=0.05, gap_c=0.25):
+    if any(
+        _aabb_overlap(rect, (b["xmin"], b["ymin"], b["xmax"], b["ymax"]), gap_b)
+        for b in buildings
+    ):
+        return False
+    if any(_aabb_overlap(rect, _car_rect(car), gap_c) for car in cars):
+        return False
+    if landmark is not None:
+        lx, ly = float(landmark["cx"]), float(landmark["cy"])
+        if _aabb_overlap(rect, (lx - 3.3, ly - 3.3, lx + 3.3, ly + 3.3), 0.6):
+            return False
+    if any(_aabb_overlap(rect, other, 8.0) for other in placed):
+        return False
+    return True
+
+
+def _open_toward_street(cx, cy, slab):
+    if slab is None:
+        return "e"
+    if slab["along"] == "y":
+        return "e" if cx < slab["cx"] else "w"
+    return "n" if cy < slab["cy"] else "s"
+
+
+def _ruin_piece(terrain, cx, cy, hx, hy, hz, orn, rgba, kind, lift=0.0):
+    z_sit = _sit_oriented(terrain, cx, cy, hx, hy, hz, orn)
+    if kind == "floor":
+        gz = z_sit - hz
+        z = gz + lift
+    else:
+        z = z_sit
+    return {
+        "hx": float(hx),
+        "hy": float(hy),
+        "hz": float(hz),
+        "cx": float(cx),
+        "cy": float(cy),
+        "z": float(z),
+        "orn": list(orn),
+        "rgba": list(rgba),
+        "kind": kind,
+        "lift": float(lift),
+    }
+
+
+def _build_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, buildings, cars):
+    """Broken shell: 2–3 walls, one attached floor, one tipped slab, 4–6 chunks."""
+    hx, hy = 0.5 * sx, 0.5 * sy
+    xmin, xmax = cx - hx, cx + hx
+    ymin, ymax = cy - hy, cy + hy
+    t = float(_RUIN_WALL_T[index])
+    z0 = _support_z(
+        terrain,
+        [(xmin, ymin), (xmax, ymin), (xmin, ymax), (xmax, ymax), (cx, cy)],
+    )
+    n_walls = 3 if index % 2 == 0 else 2
+    opposite = {"n": "s", "s": "n", "e": "w", "w": "e"}[open_side]
+    sides = ["n", "s", "e", "w"]
+    sides.remove(open_side)
+    if n_walls == 2:
+        adj = [s for s in sides if s != opposite]
+        sides = [opposite, adj[index % len(adj)]]
+
+    wall_rgb = list(_RUIN_WALL_RGB[index])
+    pieces = []
+    for wi, side in enumerate(sides):
+        if side == "w":
+            x0, x1, y0, y1 = xmin, xmin + t, ymin, ymax
+        elif side == "e":
+            x0, x1, y0, y1 = xmax - t, xmax, ymin, ymax
+        elif side == "s":
+            x0, x1, y0, y1 = xmin, xmax, ymin, ymin + t
+        else:
+            x0, x1, y0, y1 = xmin, xmax, ymax - t, ymax
+        # Last wall a bit shorter so the shell reads as broken, not a neat box
+        wh = height if wi < n_walls - 1 or n_walls == 2 else height * 0.78
+        if n_walls == 2 and wi == 1:
+            wh = height * 0.86
+        pieces.append(
+            _ruin_piece(
+                terrain,
+                0.5 * (x0 + x1),
+                0.5 * (y0 + y1),
+                0.5 * (x1 - x0),
+                0.5 * (y1 - y0),
+                0.5 * wh,
+                [0.0, 0.0, 0.0, 1.0],
+                wall_rgb if wi == 0 else _RUIN_WALL_RGB[(index + 1) % 4],
+                "wall",
+            )
+        )
+
+    # Attached floor slab on the back half of the interior
+    ix0, ix1 = xmin + t, xmax - t
+    iy0, iy1 = ymin + t, ymax - t
+    span_x, span_y = max(ix1 - ix0, 1.0), max(iy1 - iy0, 1.0)
+    if open_side == "e":
+        fx0, fx1, fy0, fy1 = ix0, ix0 + 0.58 * span_x, iy0, iy1
+    elif open_side == "w":
+        fx0, fx1, fy0, fy1 = ix1 - 0.58 * span_x, ix1, iy0, iy1
+    elif open_side == "n":
+        fx0, fx1, fy0, fy1 = ix0, ix1, iy0, iy0 + 0.58 * span_y
+    else:
+        fx0, fx1, fy0, fy1 = ix0, ix1, iy1 - 0.58 * span_y, iy1
+    attach_h = 0.46 * height
+    pieces.append(
+        _ruin_piece(
+            terrain,
+            0.5 * (fx0 + fx1),
+            0.5 * (fy0 + fy1),
+            0.5 * (fx1 - fx0),
+            0.5 * (fy1 - fy0),
+            0.24,
+            [0.0, 0.0, 0.0, 1.0],
+            _RUIN_SLAB_RGB,
+            "floor",
+            lift=attach_h,
+        )
+    )
+
+    # Tipped floor slab, 30–50°, into the street through the missing wall
+    tip = math.radians(_RUIN_TIP_DEG[index])
+    length, width, thick = 9.2, 5.8, 0.50
+    if open_side in ("e", "w"):
+        sign = 1.0 if open_side == "e" else -1.0
+        tcx = (xmax if open_side == "e" else xmin) + sign * 1.8
+        tcy = cy
+        orn = _quat_axis_angle(0.0, 1.0, 0.0, sign * tip)
+        thx, thy, thz = 0.5 * length, 0.5 * width, 0.5 * thick
+    else:
+        sign = 1.0 if open_side == "n" else -1.0
+        tcx = cx
+        tcy = (ymax if open_side == "n" else ymin) + sign * 1.8
+        orn = _quat_axis_angle(1.0, 0.0, 0.0, -sign * tip)
+        thx, thy, thz = 0.5 * width, 0.5 * length, 0.5 * thick
+    pieces.append(
+        _ruin_piece(
+            terrain, tcx, tcy, thx, thy, thz, orn, _RUIN_SLAB_RGB, "tip"
+        )
+    )
+
+    n_chunks = (5, 4, 6, 5)[index]
+    chunk_sizes = (
+        (3.5, 3.2, 1.9),
+        (4.2, 3.4, 2.3),
+        (3.3, 3.9, 1.6),
+        (3.8, 3.1, 2.1),
+        (3.6, 3.6, 1.8),
+        (4.0, 3.3, 2.0),
+    )
+    if open_side == "e":
+        spots = (
+            (xmax - 2.2, cy - 3.2),
+            (xmax + 1.4, cy + 0.8),
+            (cx + 1.6, cy + 3.6),
+            (xmax - 0.6, cy + 3.4),
+            (cx - 1.0, cy - 3.8),
+            (xmax + 2.2, cy - 2.4),
+        )
+    elif open_side == "w":
+        spots = (
+            (xmin + 2.2, cy + 3.2),
+            (xmin - 1.4, cy - 0.8),
+            (cx - 1.6, cy - 3.6),
+            (xmin + 0.6, cy - 3.4),
+            (cx + 1.0, cy + 3.8),
+            (xmin - 2.2, cy + 2.4),
+        )
+    elif open_side == "n":
+        spots = (
+            (cx - 3.2, ymax - 2.2),
+            (cx + 0.8, ymax + 1.4),
+            (cx + 3.6, cy + 1.6),
+            (cx + 3.4, ymax - 0.6),
+            (cx - 3.8, cy - 1.0),
+            (cx - 2.4, ymax + 2.2),
+        )
+    else:
+        spots = (
+            (cx + 3.2, ymin + 2.2),
+            (cx - 0.8, ymin - 1.4),
+            (cx - 3.6, cy - 1.6),
+            (cx - 3.4, ymin + 0.6),
+            (cx + 3.8, cy + 1.0),
+            (cx + 2.4, ymin - 2.2),
+        )
+    for ci in range(n_chunks):
+        chx = 0.5 * chunk_sizes[ci][0]
+        chy = 0.5 * chunk_sizes[ci][1]
+        px, py = spots[ci]
+        crect = (px - chx, py - chy, px + chx, py + chy)
+        if not _footprint_clear(crect, buildings, cars, None, [], gap_b=0.0, gap_c=0.15):
+            px = 0.55 * px + 0.45 * cx
+            py = 0.55 * py + 0.45 * cy
+        pieces.append(
+            _ruin_piece(
+                terrain,
+                px,
+                py,
+                chx,
+                chy,
+                0.5 * chunk_sizes[ci][2],
+                [0.0, 0.0, 0.0, 1.0],
+                list(_RUIN_CHUNK_RGB[ci % len(_RUIN_CHUNK_RGB)]),
+                "chunk",
+            )
+        )
+
+    return {
+        "cx": float(cx),
+        "cy": float(cy),
+        "sx": float(sx),
+        "sy": float(sy),
+        "height": float(height),
+        "z0": float(z0),
+        "xmin": float(xmin),
+        "ymin": float(ymin),
+        "xmax": float(xmax),
+        "ymax": float(ymax),
+        "open": open_side,
+        "pieces": pieces,
+    }
+
+
+def _street_lot_candidates(roads, center, size):
+    """Lot centers parked along both curbs of each street slab."""
+    cx, cy = float(center[0]), float(center[1])
+    half = 0.5 * size
+    out = []
+    for sx, sy in ((_RUIN_SX, _RUIN_SY), (_RUIN_SY, _RUIN_SX)):
+        hx, hy = 0.5 * sx, 0.5 * sy
+        for slab in roads:
+            if slab["along"] == "y":
+                y0 = slab["ymin"] + hy + 1.0
+                y1 = slab["ymax"] - hy - 1.0
+                if y1 < y0:
+                    continue
+                ys = np.linspace(y0, y1, max(3, int((y1 - y0) / 3.0) + 1))
+                for sign in (-1.0, 1.0):
+                    px = slab["cx"] + sign * (0.5 * _ROAD_WIDTH + 0.7 + hx)
+                    if abs(px - cx) > half - hx - 1.0:
+                        continue
+                    for py in ys:
+                        out.append((float(px), float(py), sx, sy, slab))
+            else:
+                x0 = slab["xmin"] + hx + 1.0
+                x1 = slab["xmax"] - hx - 1.0
+                if x1 < x0:
+                    continue
+                xs = np.linspace(x0, x1, max(3, int((x1 - x0) / 3.0) + 1))
+                for sign in (-1.0, 1.0):
+                    py = slab["cy"] + sign * (0.5 * _ROAD_WIDTH + 0.7 + hy)
+                    if abs(py - cy) > half - hy - 1.0:
+                        continue
+                    for px in xs:
+                        out.append((float(px), float(py), sx, sy, slab))
+    return out
+
+
+def _grid_lot_candidates(roads, center, size):
+    cx, cy = float(center[0]), float(center[1])
+    out = []
+    for sx, sy in ((_RUIN_SX, _RUIN_SY), (_RUIN_SY, _RUIN_SX)):
+        hx, hy = 0.5 * sx, 0.5 * sy
+        for x in np.arange(cx - _RUIN_MAX_R, cx + _RUIN_MAX_R + 0.001, 2.0):
+            for y in np.arange(cy - _RUIN_MAX_R, cy + _RUIN_MAX_R + 0.001, 2.0):
+                if math.hypot(x - cx, y - cy) > _RUIN_MAX_R:
+                    continue
+                out.append((float(x), float(y), sx, sy, None))
+    return out
+
+
+def _lot_ok(px, py, sx, sy, roads, buildings, cars, landmark, placed, center, size):
+    hx, hy = 0.5 * sx, 0.5 * sy
+    rect = (px - hx, py - hy, px + hx, py + hy)
+    corners = (
+        (rect[0], rect[1]),
+        (rect[2], rect[1]),
+        (rect[0], rect[3]),
+        (rect[2], rect[3]),
+        (px, py),
+    )
+    if math.hypot(px - center[0], py - center[1]) > _RUIN_MAX_R:
+        return False, None, rect
+    if not all(_inside_square(x, y, center, size, margin=1.0) for x, y in corners):
+        return False, None, rect
+    beside, slab = _beside_street(rect, px, py, roads)
+    if not beside:
+        return False, None, rect
+    if not _footprint_clear(rect, buildings, cars, landmark, placed):
+        return False, None, rect
+    return True, slab, rect
+
+
+def _layout_ruins(terrain, buildings, roads, cars, landmark, center, size, seed):
+    """Four 16×14 ruined shells in leftover street-edge lots near center."""
+    cx, cy = float(center[0]), float(center[1])
+    seen = set()
+    ranked = []
+    for px, py, sx, sy, hint in _street_lot_candidates(roads, center, size) + _grid_lot_candidates(
+        roads, center, size
+    ):
+        key = (round(px, 1), round(py, 1), round(sx, 1), round(sy, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        ok, slab, rect = _lot_ok(
+            px, py, sx, sy, roads, buildings, cars, landmark, [], center, size
+        )
+        if not ok:
+            continue
+        use = slab or hint
+        dist = math.hypot(px - cx, py - cy)
+        curb = 0.0 if hint is not None else 4.0
+        ranked.append((dist + curb, dist, px, py, sx, sy, use, rect))
+    ranked.sort(key=lambda t: t[0])
+
+    picked = []
+    placed = []
+    for min_sep in (22.0, 16.0, 12.0, 8.0):
+        picked = []
+        placed = []
+        for _score, dist, px, py, sx, sy, slab, rect in ranked:
+            if any(math.hypot(px - r["cx"], py - r["cy"]) < min_sep for r in picked):
+                continue
+            # Re-check against already chosen ruins
+            if any(_aabb_overlap(rect, other, 4.0) for other in placed):
+                continue
+            open_side = _open_toward_street(px, py, slab)
+            height = float(_RUIN_H[len(picked)])
+            ruin = _build_ruin_shell(
+                terrain, px, py, sx, sy, height, open_side, len(picked), buildings, cars
+            )
+            picked.append(ruin)
+            placed.append(rect)
+            if len(picked) >= _N_RUINS:
+                break
+        if len(picked) >= _N_RUINS:
+            break
+    if len(picked) < _N_RUINS:
+        raise RuntimeError(
+            f"could only place {len(picked)} / {_N_RUINS} ruins within "
+            f"{_RUIN_MAX_R:.0f} m of district center"
+        )
+    return picked
+
+
+def _print_district_ruins(district):
+    cx, cy = district.center
+    print(f"[DISTRICT] center=({cx:.3f}, {cy:.3f})")
+    for i, ruin in enumerate(district.ruins):
+        print(
+            f"[DISTRICT] ruin[{i}] x={ruin['cx']:.3f} y={ruin['cy']:.3f} "
+            f"height={ruin['height']:.1f}"
+        )
+
+
+def nearest_ruin(district, origin=None):
+    """Ruin closest to origin (district center if omitted)."""
+    ox, oy = district.center if origin is None else origin
+    return min(
+        district.ruins,
+        key=lambda r: math.hypot(r["cx"] - ox, r["cy"] - oy),
+    )
+
+
+def verify_district_ruins(district):
+    """Numeric checks: 4 ruins near center, clear of intact interiors and cars."""
+    cx, cy = district.center
+    half = 0.5 * district.size
+    if len(district.ruins) != _N_RUINS:
+        raise RuntimeError(f"expected {_N_RUINS} ruins, got {len(district.ruins)}")
+    max_r = 0.0
+    for i, ruin in enumerate(district.ruins):
+        dist = math.hypot(ruin["cx"] - cx, ruin["cy"] - cy)
+        max_r = max(max_r, dist)
+        if dist > _RUIN_MAX_R + 1e-6:
+            raise RuntimeError(f"ruin[{i}] is {dist:.1f} m from center (>{_RUIN_MAX_R:.0f})")
+        if abs(ruin["cx"] - cx) > half - 1.0 or abs(ruin["cy"] - cy) > half - 1.0:
+            raise RuntimeError(f"ruin[{i}] is outside the district square")
+        if not (12.0 <= ruin["height"] <= 18.0):
+            raise RuntimeError(f"ruin[{i}] height {ruin['height']:.1f} not in 12–18 m")
+        rect = (ruin["xmin"], ruin["ymin"], ruin["xmax"], ruin["ymax"])
+        for b in district.buildings:
+            if _aabb_overlap(rect, (b["xmin"], b["ymin"], b["xmax"], b["ymax"]), 0.0):
+                raise RuntimeError(f"ruin[{i}] overlaps intact {b['kind']}")
+        for car in district.cars:
+            if _aabb_overlap(rect, _car_rect(car), 0.0):
+                raise RuntimeError(f"ruin[{i}] overlaps a car")
+        n_wall = sum(1 for p in ruin["pieces"] if p["kind"] == "wall")
+        n_floor = sum(1 for p in ruin["pieces"] if p["kind"] == "floor")
+        n_tip = sum(1 for p in ruin["pieces"] if p["kind"] == "tip")
+        n_chunk = sum(1 for p in ruin["pieces"] if p["kind"] == "chunk")
+        if not (2 <= n_wall <= 3 and n_floor == 1 and n_tip == 1 and 4 <= n_chunk <= 6):
+            raise RuntimeError(
+                f"ruin[{i}] pieces walls={n_wall} floor={n_floor} tip={n_tip} chunks={n_chunk}"
+            )
+        for piece in ruin["pieces"]:
+            if piece["kind"] == "chunk" and 2.0 * max(piece["hx"], piece["hy"]) < 3.0 - 1e-6:
+                raise RuntimeError(f"ruin[{i}] chunk is under 3 m across")
+    print(
+        f"[DISTRICT] ruin check ok: n={len(district.ruins)}  "
+        f"max_r={max_r:.1f} m  (center {cx:.1f}, {cy:.1f})"
+    )
+    return max_r
+
+
 def matching_tile_centers(terrain, center, square=DISTRICT_SIZE):
     """
     Four world centers: the given district plus the same local offset in
@@ -624,7 +1138,19 @@ class DistrictLayout:
         self.trees, self.cars, self.landmark = _layout_props(
             terrain, self.buildings, self.roads, self.center, self.size, self.seed
         )
+        self.ruins = _layout_ruins(
+            terrain,
+            self.buildings,
+            self.roads,
+            self.cars,
+            self.landmark,
+            self.center,
+            self.size,
+            self.seed,
+        )
         self.ground_z = _sample_heightmap(terrain, self.center[0], self.center[1])
+        _print_district_ruins(self)
+        verify_district_ruins(self)
 
     def counts(self):
         out = {"shop": 0, "midrise": 0, "tower": 0}
@@ -695,6 +1221,32 @@ class DistrictLayout:
         for box in lm["boxes"]:
             box["z"] = box["z"] + dz
         dest.landmark = lm
+        dest.ruins = []
+        for ruin in self.ruins:
+            nr = dict(ruin)
+            nr["cx"] = ruin["cx"] + dx
+            nr["cy"] = ruin["cy"] + dy
+            nr["xmin"] = ruin["xmin"] + dx
+            nr["xmax"] = ruin["xmax"] + dx
+            nr["ymin"] = ruin["ymin"] + dy
+            nr["ymax"] = ruin["ymax"] + dy
+            nr["z0"] = _sample_heightmap(terrain, nr["cx"], nr["cy"])
+            nr["pieces"] = []
+            for piece in ruin["pieces"]:
+                npiece = _ruin_piece(
+                    terrain,
+                    piece["cx"] + dx,
+                    piece["cy"] + dy,
+                    piece["hx"],
+                    piece["hy"],
+                    piece["hz"],
+                    piece["orn"],
+                    piece["rgba"],
+                    piece["kind"],
+                    lift=piece.get("lift", 0.0),
+                )
+                nr["pieces"].append(npiece)
+            dest.ruins.append(nr)
         dest.ground_z = _sample_heightmap(terrain, dest.center[0], dest.center[1])
         return dest
 
@@ -893,17 +1445,66 @@ def spawn_district_in_pybullet(client, district, window_tex=None, road_tex=None)
         f"prop_bodies={len(prop_bodies)}  "
         f"tower=({district.landmark['cx']:.1f}, {district.landmark['cy']:.1f})"
     )
-    return wall_bodies + roof_bodies + road_bodies + prop_bodies
+
+    ruin_bodies = []
+    for ruin in getattr(district, "ruins", []) or []:
+        for piece in ruin["pieces"]:
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[piece["hx"], piece["hy"], piece["hz"]],
+                rgbaColor=piece["rgba"],
+                physicsClientId=client,
+            )
+            ruin_bodies.append(
+                p.createMultiBody(
+                    baseMass=0,
+                    baseCollisionShapeIndex=-1,
+                    baseVisualShapeIndex=vis,
+                    basePosition=[piece["cx"], piece["cy"], piece["z"]],
+                    baseOrientation=piece["orn"],
+                    physicsClientId=client,
+                )
+            )
+    if district.ruins:
+        print(
+            f"[DISTRICT] ruin_bodies={len(ruin_bodies)}  ruins={len(district.ruins)}"
+        )
+    return wall_bodies + roof_bodies + road_bodies + prop_bodies + ruin_bodies
+
+
+def _default_overview_eye(district):
+    """Opening-view eye if the camera were still aimed at district center."""
+    cx, cy = district.center
+    dist, dz, yaw = 150.0, 80.0, 25.0
+    pitch = -math.asin(dz / dist)
+    return (
+        cx + dist * math.sin(math.radians(yaw)) * math.cos(pitch),
+        cy + dist * (-math.cos(math.radians(yaw))) * math.cos(pitch),
+        float(district.ground_z) + 12.0 + dist * (-math.sin(pitch)),
+    )
 
 
 def frame_district_camera(client, district):
-    """Look at the district from ~150 m away and ~80 m up."""
+    """Look at the nearest ruined shell from ~100 m away and ~55 m up."""
     cx, cy = district.center
-    target = np.array(
-        [cx, cy, float(district.ground_z) + 12.0], dtype=np.float64
-    )
-    dist = 150.0
-    dz = 80.0
+    ruins = getattr(district, "ruins", None) or []
+    if ruins:
+        eye = _default_overview_eye(district)
+        ruin = nearest_ruin(district, origin=(eye[0], eye[1]))
+        target = np.array(
+            [ruin["cx"], ruin["cy"], float(ruin["z0"]) + 8.0],
+            dtype=np.float64,
+        )
+        dist = 100.0
+        dz = 55.0
+        district.camera_ruin = ruin
+    else:
+        target = np.array(
+            [cx, cy, float(district.ground_z) + 12.0], dtype=np.float64
+        )
+        dist = 150.0
+        dz = 80.0
+        district.camera_ruin = None
     yaw = 25.0
     pitch = -math.degrees(math.asin(dz / dist))
     p.resetDebugVisualizerCamera(
@@ -916,5 +1517,10 @@ def frame_district_camera(client, district):
     print(
         f"[CAMERA] district yaw={yaw:g} pitch={pitch:.1f} dist={dist:.0f} m  "
         f"target=({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})"
+        + (
+            f"  ruin=({ruin['cx']:.1f}, {ruin['cy']:.1f})"
+            if ruins
+            else ""
+        )
     )
     return yaw, pitch, dist, target

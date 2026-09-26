@@ -314,6 +314,11 @@ def build_dem_world(client, dem_path):
     print(
         f"[DISTRICT] center=({district.center[0]:.3f}, {district.center[1]:.3f})"
     )
+    for i, ruin in enumerate(getattr(district, "ruins", []) or []):
+        print(
+            f"[DISTRICT] ruin[{i}] x={ruin['cx']:.3f} y={ruin['cy']:.3f} "
+            f"height={ruin['height']:.1f}"
+        )
     spawn_districts_in_pybullet(client, districts)
     t_district = time.perf_counter() - t0
     counts = district.counts()
@@ -322,6 +327,7 @@ def build_dem_world(client, dem_path):
         f"size={district.size:.0f} m  copies=0  "
         f"shops={counts['shop']}  midrises={counts['midrise']}  "
         f"towers={counts['tower']}  total={len(district.buildings)}  "
+        f"ruins={len(getattr(district, 'ruins', []) or [])}  "
         f"roads={len(district.roads)}  trees={len(district.trees)}  "
         f"cars={len(district.cars)}  place+spawn={t_district:.3f}s"
     )
@@ -509,6 +515,8 @@ def main():
             )
 
     if not gui:
+        if use_dem:
+            frame_district_camera(client, district)
         print("[VISUALIZER] Headless check done (GUI not opened).")
         try:
             p.disconnect(physicsClientId=client)
