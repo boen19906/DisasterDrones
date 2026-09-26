@@ -224,7 +224,6 @@ def main():
     last_dones = np.zeros(args.num_drones, dtype=np.float32)
     start_time = time.time()
     best_found = -1.0
-    cooled = False
     best_path = os.path.splitext(args.save_path)[0] + "_best.pt"
 
     for it in range(1, num_iterations + 1):
@@ -380,17 +379,8 @@ def main():
                 model.save(args.save_path)
                 print(f"  [BEST] found={best_found:.1f} kept at {args.save_path}")
             elif iteration % args.save_freq == 0 or iteration == num_iterations:
-                print(f"  [HOLD] found={found:.1f} below best {best_found:.1f}; {args.save_path} unchanged")
-            if (not cooled) and best_found >= 8.0:
-                cooled = True
-                for group in optimizer.param_groups:
-                    group["lr"] = min(group["lr"], 5e-5)
-                print(f"[PPO] found {best_found:.1f}; lr={optimizer.param_groups[0]['lr']} ent={args.ent_coef}")
-            if best_found >= 8.0 and found < 0.55 * best_found:
-                print(f"[STOP] found dropped {best_found:.1f} -> {found:.1f}; restoring best weights")
-                model.load(best_path, map_location=args.device)
                 model.save(args.save_path)
-                break
+                print(f"  [SAVE] found={found:.1f} best={best_found:.1f} -> {args.save_path}")
         elif iteration % args.save_freq == 0 or iteration == num_iterations:
             model.save(args.save_path)
             print(f"  [SAVED] Checkpoint saved to {args.save_path}")

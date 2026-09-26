@@ -78,17 +78,24 @@ def apply_orbit_camera(client, yaw, pitch, dist, target):
 
 
 class SearchCamera:
-    """Keyboard camera: arrows pan the map, 1-9 follow a drone."""
+    """Keyboard camera: arrows pan the map, 1-9 follow a drone, 0 overview."""
 
     def __init__(self, client, num_drones, env_size):
         self.client = client
         self.num_drones = int(num_drones)
-        self.yaw = 0.0
-        self.pitch = -89.0
-        self.dist = max(80.0, float(env_size) * 1.05)
-        self.target = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        self.home_yaw = 0.0
+        self.home_pitch = -89.0
+        self.home_dist = max(80.0, float(env_size) * 1.05)
+        self.home_target = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        self.reset_overview()
+
+    def reset_overview(self):
+        self.yaw = self.home_yaw
+        self.pitch = self.home_pitch
+        self.dist = self.home_dist
+        self.target = self.home_target.copy()
         self.follow = None
-        apply_orbit_camera(client, self.yaw, self.pitch, self.dist, self.target)
+        apply_orbit_camera(self.client, self.yaw, self.pitch, self.dist, self.target)
 
     def _pan(self, dx, dy, scale):
         if self.pitch <= -70.0:
@@ -109,8 +116,9 @@ class SearchCamera:
 
     def handle(self, keys, drone_positions):
         if _key_hit(keys, ord("0")):
-            self.follow = None
-            print("[CAM] Free look — arrow keys pan the map")
+            self.reset_overview()
+            print("[CAM] Overview")
+            return self.follow
         if _key_hit(keys, 9):
             if self.follow is None:
                 self.follow = 0
@@ -160,7 +168,7 @@ def main():
     print(f" [3D VISUALIZER] task={args.task}")
     if args.task == "search":
         print(" Search: 250 m downtown, 5 m AGL, capsule survivors, MAPPO XY")
-        print(" Camera: starts top-down, free look | arrows pan | 1/2/3 follow a drone")
+        print(" Camera: starts top-down | arrows pan | 1/2/3 follow a drone | 0 overview")
         print("         [ ] zoom | Space pause | R reset | Q quit")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")
     print("=" * 65)
@@ -348,8 +356,12 @@ def main():
                     for i in range(args.num_drones):
                         pos = env.drone_positions[i]
                         if args.task == "search":
-                            color = [0.2, 0.5, 1.0, 1.0]
-                            tag = f"D{i}"
+                            if not env.drone_alive[i]:
+                                color = [0.35, 0.35, 0.35, 1.0]
+                                tag = f"D{i} [DEAD]"
+                            else:
+                                color = [0.2, 0.5, 1.0, 1.0]
+                                tag = f"D{i}"
                         else:
                             batt = env.battery_levels[i]
                             is_gw = bool(env.gateway_roles[i])
@@ -414,11 +426,11 @@ def main():
 
                     stats = env.survivors.get_discovery_stats()
                     if args.task == "search":
-                        cover = float(getattr(env, "coverage", np.zeros(1)).mean())
+                        cover = float(infos[env.possible_agents[0]].get("coverage_frac", 0.0))
                         cam_txt = f"FOLLOW D{cam.follow}" if cam.follow is not None else "FREE CAM"
                         hud_line = (
                             f"SEARCH | {cam_txt} | Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
-                            f"| Cover: {cover*100:.0f}% | arrows pan  1-3 follow"
+                            f"| Cover: {cover*100:.0f}% | arrows pan  1-3 follow  0 overview"
                         )
                         hud_pos = cam.target + np.array([0.0, 0.0, 10.0])
                     else:

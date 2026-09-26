@@ -17,6 +17,7 @@ Rewards:
   -0.25  a drone paints nothing and is only re-covering
   -0.01  per step (shared)
   -1.0   drone-drone collision (that drone only)
+  -50.0  building crash, that drone is dead
   -1.0   not moving while cells or people remain (that drone only)
 """
 
@@ -24,6 +25,7 @@ import functools
 import importlib.util
 import os
 import time
+from heapq import heappop, heappush
 
 import numpy as np
 
@@ -47,18 +49,24 @@ from .town import TownLayout, spawn_town_in_pybullet
 COVER_CROP = 7  # local visited-map window (odd)
 GLOBAL_BINS = 8  # coarse coverage map shared by every drone and the critic
 N_ACTIONS = 9
-MAP_EDGE_MARGIN = 8.0
+MAP_EDGE_MARGIN = 0.75  # fly almost to the pad wall so a 5 m sensor covers the rim
 DRONE_VISUAL_SCALE = 2.5
 CRASH_RANGE = 3.5
+BUILDING_RADIUS = 0.55  # lethal airframe radius
+BUILDING_HARD_M = 1.25  # refuse a heading that would clip this soon
+BUILDING_STANDOFF_M = 2.5  # prefer street center; not a hard stop
+BUILDING_LOOKAHEAD_M = 3.5  # about one fast step; longer looks freeze them in town
+BUILDING_CRASH_PENALTY = 50.0  # lethal building hit, that drone only
 GOAL_HOLD_STEPS = 150
 COVER_CELL_M = 5.0
-HUNT_COVER_FRAC = 0.55  # after this much map is painted, finish leftover people
 TEAM_KEEP_M = 12.0  # do not claim cells inside another drone's sensor disk
 CLAIM_KEEP_M = 22.0  # keep assigned unmapped goals apart
 LOOKAHEAD_M = 8.0  # if this far ahead is already painted, peel off to new ground
-TURN_MARGIN = 8.0  # do not command into a wall inside this band
-BOUNCE_INSET = 10.0  # pop off the rim so they cannot sit on it
-WALL_COOLDOWN_STEPS = 90  # ignore outbound MAPPO after a wall hit
+TURN_MARGIN = 1.25  # only slide when actually on the wall, not 8 m inland
+GOAL_EDGE_M = 0.25  # claim streets on the rim
+LEFTOVER_CELLS = 80  # drop keep-out so last alleys are not abandoned
+WALL_COOLDOWN_STEPS = 12  # brief peel if a corner pins them
+STREET_LOOKAHEAD_CELLS = 6  # follow streets this far around a block
 
 # Eight neighbor headings, plus stay. Stay on the wall is turned back inward.
 _HEADING_XY = np.array(
@@ -174,6 +182,8 @@ class SurvivorSearchEnv(ParallelEnv):
         self.goal_hold = np.zeros(num_drones, dtype=np.int32)
         self.goal_is_person = np.zeros(num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(num_drones, dtype=np.int32)
+        self.street_mask = np.ones((self.cover_ny, self.cover_nx), dtype=bool)
+        self.street_clearance = np.full((self.cover_ny, self.cover_nx), 99.0)
 
         self.client = None
         self.drone_ids = []
@@ -227,19 +237,40 @@ class SurvivorSearchEnv(ParallelEnv):
         return np.array([wx, wy], dtype=np.float64)
 
     def _interior_coverage(self):
+        mask = getattr(self, "street_mask", None)
+        if mask is not None and mask.any():
+            return float(self.coverage[mask].mean())
         if self.cover_nx <= 2 or self.cover_ny <= 2:
             return float(self.coverage.mean())
         return float(self.coverage[1:-1, 1:-1].mean())
 
     def _playable_cell(self, w):
-        return abs(w[0]) <= self._lim_x() - TURN_MARGIN and abs(w[1]) <= self._lim_y() - TURN_MARGIN
+        return abs(w[0]) <= self._lim_x() - GOAL_EDGE_M and abs(w[1]) <= self._lim_y() - GOAL_EDGE_M
 
-    def _seal_map_border(self):
-        """Outer coverage ring is already searched so policies are not paid to leave."""
-        self.coverage[0, :] = 1.0
-        self.coverage[-1, :] = 1.0
-        self.coverage[:, 0] = 1.0
-        self.coverage[:, -1] = 1.0
+    def _seal_unsearchable(self):
+        """Roofs are not search ground. Coverage % is streets only."""
+        self.street_mask = np.zeros((self.cover_ny, self.cover_nx), dtype=bool)
+        self.street_clearance = np.full((self.cover_ny, self.cover_nx), 99.0)
+        if self.town is None:
+            self.street_mask[:] = True
+            return
+        lx, ly = self._lim_x(), self._lim_y()
+        boxes = self._town_boxes()
+        for gy in range(self.cover_ny):
+            for gx in range(self.cover_nx):
+                world = self._cell_to_world(gx, gy)
+                if abs(world[0]) > lx or abs(world[1]) > ly:
+                    self.coverage[gy, gx] = 1.0
+                    continue
+                if self.town.is_walkable(float(world[0]), float(world[1])):
+                    self.street_mask[gy, gx] = True
+                    z = self._agl_z(world[0], world[1])
+                    if boxes is not None:
+                        self.street_clearance[gy, gx] = TownLayout.sphere_clearance(
+                            [world[0], world[1], z], boxes
+                        )
+                else:
+                    self.coverage[gy, gx] = 1.0
 
     def _undiscovered_people(self):
         if self.survivors is None:
@@ -329,20 +360,120 @@ class SurvivorSearchEnv(ParallelEnv):
             return False
         return True
 
-    def _has_walkable_unmapped(self):
-        for gy in range(1, self.cover_ny - 1):
-            for gx in range(1, self.cover_nx - 1):
+    def _nearest_street_cell(self, gx, gy):
+        gx = int(np.clip(gx, 0, self.cover_nx - 1))
+        gy = int(np.clip(gy, 0, self.cover_ny - 1))
+        mask = getattr(self, "street_mask", None)
+        if mask is None or mask[gy, gx]:
+            return gx, gy
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            return gx, gy
+        d2 = (xs - gx) ** 2 + (ys - gy) ** 2
+        i = int(np.argmin(d2))
+        return int(xs[i]), int(ys[i])
+
+    def _line_clear_xy(self, a, b):
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        dist = float(np.hypot(bx - ax, by - ay))
+        if dist < 1e-3:
+            return True
+        steps = max(2, int(np.ceil(dist / 2.0)))
+        mask = getattr(self, "street_mask", None)
+        for i in range(steps + 1):
+            t = i / steps
+            x = ax + t * (bx - ax)
+            y = ay + t * (by - ay)
+            gx, gy = self._world_to_cell(x, y)
+            if mask is not None and not mask[gy, gx]:
+                return False
+            if self._hits_building([x, y, self._agl_z(x, y)], radius=BUILDING_HARD_M):
+                return False
+        return True
+
+    def _street_waypoint(self, start_xy, goal_xy):
+        """Next street point toward the goal, going around buildings."""
+        start = np.asarray(start_xy, dtype=np.float64).reshape(-1)[:2]
+        goal = np.asarray(goal_xy, dtype=np.float64).reshape(-1)[:2]
+        if self._line_clear_xy(start, goal):
+            return goal
+        mask = getattr(self, "street_mask", None)
+        if mask is None or not mask.any():
+            return goal
+        sgx, sgy = self._nearest_street_cell(*self._world_to_cell(start[0], start[1]))
+        ggx, ggy = self._nearest_street_cell(*self._world_to_cell(goal[0], goal[1]))
+        if sgx == ggx and sgy == ggy:
+            return self._cell_to_world(ggx, ggy)
+        neighbors = (
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        )
+        dist = np.full(mask.shape, np.inf, dtype=np.float64)
+        dist[sgy, sgx] = 0.0
+        parent = {}
+        heap = [(0.0, sgx, sgy)]
+        found = False
+        while heap:
+            cost, cx, cy = heappop(heap)
+            if cost > dist[cy, cx]:
+                continue
+            if cx == ggx and cy == ggy:
+                found = True
+                break
+            for dx, dy in neighbors:
+                nx, ny = cx + dx, cy + dy
+                if nx < 0 or ny < 0 or nx >= self.cover_nx or ny >= self.cover_ny:
+                    continue
+                if not mask[ny, nx]:
+                    continue
+                step = 1.414 if dx != 0 and dy != 0 else 1.0
+                clear = float(self.street_clearance[ny, nx])
+                if clear < BUILDING_STANDOFF_M:
+                    step += 3.0 * (BUILDING_STANDOFF_M - clear) / BUILDING_STANDOFF_M
+                ncost = cost + step
+                if ncost < dist[ny, nx]:
+                    dist[ny, nx] = ncost
+                    parent[(nx, ny)] = (cx, cy)
+                    heappush(heap, (ncost, nx, ny))
+        if not found:
+            return goal
+        path = [(ggx, ggy)]
+        cur = (ggx, ggy)
+        while cur != (sgx, sgy):
+            cur = parent[cur]
+            path.append(cur)
+        path.reverse()
+        idx = min(len(path) - 1, STREET_LOOKAHEAD_CELLS)
+        return self._cell_to_world(path[idx][0], path[idx][1])
+
+    def _unmapped_searchable_count(self):
+        mask = getattr(self, "street_mask", None)
+        if mask is not None:
+            return int(np.sum((self.coverage < 0.5) & mask))
+        n = 0
+        for gy in range(self.cover_ny):
+            for gx in range(self.cover_nx):
                 if self.coverage[gy, gx] >= 0.5:
                     continue
                 if self._cell_is_searchable(self._cell_to_world(gx, gy)):
-                    return True
-        return False
+                    n += 1
+        return n
+
+    def _has_walkable_unmapped(self):
+        return self._unmapped_searchable_count() > 0
 
     def _search_goal_xy(self, drone_index):
         """Hunt leftover people once mapping is mostly done; otherwise next-best-view."""
         people = self._undiscovered_people()
-        streets_left = self._has_walkable_unmapped()
-        if people and not streets_left:
+        leftover = self._unmapped_searchable_count()
+        if people and leftover == 0:
             hunt = self._hunt_survivor_xy(drone_index)
             if hunt is not None:
                 self.goal_is_person[drone_index] = True
@@ -366,37 +497,39 @@ class SurvivorSearchEnv(ParallelEnv):
             heading = heading / hnorm
         else:
             heading = None
+        share = leftover <= LEFTOVER_CELLS
 
         candidates = []
-        for gy in range(1, self.cover_ny - 1):
-            for gx in range(1, self.cover_nx - 1):
+        for gy in range(self.cover_ny):
+            for gx in range(self.cover_nx):
                 if self.coverage[gy, gx] >= 0.5:
                     continue
                 world = self._cell_to_world(gx, gy)
                 if not self._cell_is_searchable(world):
                     continue
                 my_d = float(np.linalg.norm(world - my_xy))
-                stolen = False
-                for other in others:
-                    other_d = float(np.linalg.norm(world - other))
-                    if other_d + 1.0 < my_d:
-                        stolen = True
-                        break
-                if stolen:
-                    continue
-                skip_claim = False
-                for claim in claimed:
-                    if float(np.linalg.norm(world - claim)) < CLAIM_KEEP_M:
-                        skip_claim = True
-                        break
-                if skip_claim:
-                    continue
+                if not share:
+                    stolen = False
+                    for other in others:
+                        other_d = float(np.linalg.norm(world - other))
+                        if other_d + 1.0 < my_d:
+                            stolen = True
+                            break
+                    if stolen:
+                        continue
+                    skip_claim = False
+                    for claim in claimed:
+                        if float(np.linalg.norm(world - claim)) < CLAIM_KEEP_M:
+                            skip_claim = True
+                            break
+                    if skip_claim:
+                        continue
                 candidates.append((world, gx, gy, my_d))
         if not candidates:
             fallback = None
             fallback_d = 1e18
-            for gy in range(1, self.cover_ny - 1):
-                for gx in range(1, self.cover_nx - 1):
+            for gy in range(self.cover_ny):
+                for gx in range(self.cover_nx):
                     if self.coverage[gy, gx] >= 0.5:
                         continue
                     world = self._cell_to_world(gx, gy)
@@ -406,6 +539,11 @@ class SurvivorSearchEnv(ParallelEnv):
                     if d < fallback_d:
                         fallback_d = d
                         fallback = world
+            if fallback is None and people:
+                hunt = self._hunt_survivor_xy(drone_index)
+                if hunt is not None:
+                    self.goal_is_person[drone_index] = True
+                    return hunt
             return fallback
 
         best = None
@@ -531,36 +669,41 @@ class SurvivorSearchEnv(ParallelEnv):
         target = self._search_target_xy(drone_index)
         if target is None:
             return 0.0, 0.0
-        return float(target[0] - x), float(target[1] - y)
+        waypoint = self._street_waypoint((x, y), target)
+        return float(waypoint[0] - x), float(waypoint[1] - y)
 
     def _inland_search_dir(self, drone_index, pos):
-        """Direction toward unfinished work, with an inland component if a wall is close.
-
-        Leftover-person goals stay on-target so a rim survivor can still be found.
-        """
+        """Fly at the search goal. On a wall, drop the outbound component so they slide."""
         ux, uy = self._metric_search_dir(drone_index, pos[0], pos[1])
-        if self.goal_is_person[drone_index]:
-            if abs(ux) + abs(uy) < 1.0:
-                ang = 0.35 * self.step_count + drone_index
-                ux, uy = float(np.cos(ang)), float(np.sin(ang))
-            return ux, uy
+        if abs(ux) + abs(uy) < 1.0:
+            ang = 0.35 * self.step_count + drone_index
+            ux, uy = float(np.cos(ang)), float(np.sin(ang))
         lx, ly = self._lim_x(), self._lim_y()
         if pos[0] >= lx - TURN_MARGIN:
-            ux = min(ux, -1.0)
+            ux = min(ux, 0.0)
         elif pos[0] <= -lx + TURN_MARGIN:
-            ux = max(ux, 1.0)
+            ux = max(ux, 0.0)
         if pos[1] >= ly - TURN_MARGIN:
-            uy = min(uy, -1.0)
+            uy = min(uy, 0.0)
         elif pos[1] <= -ly + TURN_MARGIN:
-            uy = max(uy, 1.0)
+            uy = max(uy, 0.0)
         if abs(ux) + abs(uy) < 1e-6:
-            ux = -float(np.sign(pos[0])) or 0.0
-            uy = -float(np.sign(pos[1])) or 0.0
+            if abs(pos[0]) >= lx - TURN_MARGIN:
+                uy = 1.0 if pos[1] <= 0.0 else -1.0
+            elif abs(pos[1]) >= ly - TURN_MARGIN:
+                ux = 1.0 if pos[0] <= 0.0 else -1.0
+            else:
+                ux = -float(np.sign(pos[0])) or 0.0
+                uy = -float(np.sign(pos[1])) or 0.0
         return ux, uy
 
     def _velocity_toward_unmapped(self, drone_index, pos):
         ux, uy = self._inland_search_dir(drone_index, pos)
-        if not self.goal_is_person[drone_index]:
+        keep_apart = (
+            not self.goal_is_person[drone_index]
+            and self._unmapped_searchable_count() > LEFTOVER_CELLS
+        )
+        if keep_apart:
             for j in range(self.num_drones):
                 if j == drone_index:
                     continue
@@ -574,7 +717,7 @@ class SurvivorSearchEnv(ParallelEnv):
             ang = 2.0 * np.pi * drone_index / max(self.num_drones, 1) + 0.15 * self.step_count
             ux = float(np.cos(ang))
             uy = float(np.sin(ang))
-        legal = self._best_legal_heading(pos, ux, uy)
+        legal = self._best_legal_heading(pos, ux, uy, drone_index=drone_index)
         n = float(np.hypot(legal[0], legal[1]))
         if n < 1e-6:
             legal = np.array([1.0, 0.0], dtype=np.float64)
@@ -631,13 +774,84 @@ class SurvivorSearchEnv(ParallelEnv):
         dx, dy = self._metric_search_dir(drone_index, x, y)
         return dx / max(self.size_x, 1.0), dy / max(self.size_y, 1.0)
 
+    def _town_boxes(self):
+        boxes = getattr(self.town, "boxes", None) if self.town is not None else None
+        if boxes is None or len(boxes) == 0:
+            return None
+        return np.asarray(boxes, dtype=np.float64)
+
+    def _hits_building(self, pos, radius=None):
+        boxes = self._town_boxes()
+        if boxes is None:
+            return False
+        r = BUILDING_RADIUS if radius is None else float(radius)
+        p = np.asarray(pos, dtype=np.float64).reshape(3)
+        return TownLayout.sphere_hits_boxes(p, r, boxes)
+
+    def _building_clearance(self, pos):
+        boxes = self._town_boxes()
+        if boxes is None:
+            return 1e6
+        p = np.asarray(pos, dtype=np.float64).reshape(3)
+        return TownLayout.sphere_clearance(p, boxes)
+
+    def _path_hits_building(self, pos_a, pos_b):
+        if self._hits_building(pos_b):
+            return True
+        boxes = self._town_boxes()
+        if boxes is None:
+            return False
+        a = np.asarray(pos_a, dtype=np.float64).reshape(3)
+        b = np.asarray(pos_b, dtype=np.float64).reshape(3)
+        if TownLayout.segment_hits_boxes(a, b, boxes):
+            return True
+        mid = 0.5 * (a + b)
+        mid[2] = self._agl_z(mid[0], mid[1])
+        return self._hits_building(mid)
+
+    def _heading_into_building(self, pos, heading):
+        """True only if this heading would actually clip a building soon."""
+        hx, hy = float(heading[0]), float(heading[1])
+        n = float(np.hypot(hx, hy))
+        if n < 1e-6:
+            return self._hits_building(pos, radius=BUILDING_HARD_M)
+        hx, hy = hx / n, hy / n
+        start = np.array(
+            [float(pos[0]), float(pos[1]), float(self._agl_z(pos[0], pos[1]))],
+            dtype=np.float64,
+        )
+        look = start.copy()
+        look[0] += hx * BUILDING_LOOKAHEAD_M
+        look[1] += hy * BUILDING_LOOKAHEAD_M
+        look[2] = self._agl_z(look[0], look[1])
+        if self._hits_building(look, radius=BUILDING_HARD_M):
+            return True
+        return self._path_hits_building(start, look)
+
+    def _push_out_of_buildings(self, pos, radius=None):
+        r = BUILDING_HARD_M if radius is None else float(radius)
+        p = np.asarray(pos, dtype=np.float64).reshape(3).copy()
+        p[2] = self._agl_z(p[0], p[1])
+        if not self._hits_building(p, radius=r):
+            return p
+        for dist in (r, r + 1.0, r + 2.5, r + 4.0, 8.0, 12.0):
+            for heading in _MOVE_HEADINGS:
+                cand = p.copy()
+                cand[0] += heading[0] * dist
+                cand[1] += heading[1] * dist
+                cand[0] = float(np.clip(cand[0], -self._lim_x(), self._lim_x()))
+                cand[1] = float(np.clip(cand[1], -self._lim_y(), self._lim_y()))
+                cand[2] = self._agl_z(cand[0], cand[1])
+                if not self._hits_building(cand, radius=r):
+                    return cand
+        return p
+
     def _on_border(self, pos, margin=None):
         if margin is None:
             margin = TURN_MARGIN
         return abs(pos[0]) >= self._lim_x() - margin or abs(pos[1]) >= self._lim_y() - margin
 
-    def _heading_blocked(self, pos, heading):
-        """True when this heading would drive into a wall the drone is near."""
+    def _map_edge_blocked(self, pos, heading):
         lx, ly = self._lim_x(), self._lim_y()
         x, y = float(pos[0]), float(pos[1])
         hx, hy = float(heading[0]), float(heading[1])
@@ -651,16 +865,30 @@ class SurvivorSearchEnv(ParallelEnv):
             return True
         return False
 
-    def _best_legal_heading(self, pos, ux, uy):
-        """Neighbor heading toward (ux, uy) that does not point out of the map."""
+    def _heading_blocked(self, pos, heading, drone_index=None):
+        """True when this heading would leave the pad or fly into a building."""
+        if self._map_edge_blocked(pos, heading):
+            return True
+        if self._heading_into_building(pos, heading):
+            return True
+        return False
+
+    def _best_legal_heading(self, pos, ux, uy, drone_index=None):
+        """Move toward (ux, uy). Refuse a clip; prefer a bit of facade clearance."""
         best = None
-        best_dot = -np.inf
+        best_key = None
         for heading in _MOVE_HEADINGS:
-            if self._heading_blocked(pos, heading):
-                continue
+            map_ok = not self._map_edge_blocked(pos, heading)
+            crash = self._heading_into_building(pos, heading)
+            n = float(np.hypot(heading[0], heading[1]))
+            look_x = float(pos[0]) + heading[0] / max(n, 1e-6) * 3.0
+            look_y = float(pos[1]) + heading[1] / max(n, 1e-6) * 3.0
+            clear = self._building_clearance([look_x, look_y, self._agl_z(look_x, look_y)])
+            prefer = min(clear, BUILDING_STANDOFF_M)
             dot = float(heading[0]) * float(ux) + float(heading[1]) * float(uy)
-            if dot > best_dot:
-                best_dot = dot
+            key = (map_ok, not crash, prefer, dot)
+            if best_key is None or key > best_key:
+                best_key = key
                 best = heading
         if best is None:
             inward = np.array([-np.sign(pos[0]), -np.sign(pos[1])], dtype=np.float64)
@@ -669,42 +897,86 @@ class SurvivorSearchEnv(ParallelEnv):
         return best
 
     def _move_with_soft_walls(self, drone_index, pos, vel, dt):
-        """Fly the chosen heading. Hitting a wall pops inland and turns toward unfinished ground."""
+        """Fly to the rim if the goal is there. Map walls slide; buildings block."""
         pos = np.asarray(pos, dtype=np.float64).copy()
         vel = np.asarray(vel, dtype=np.float64).copy()
+        old = pos.copy()
         lx, ly = self._lim_x(), self._lim_y()
         heading = vel[:2]
         speed = float(np.hypot(heading[0], heading[1]))
-        blocked = self._heading_blocked(pos, heading) if speed > 0.5 else False
-        stuck_on_rim = speed <= 0.5 and self._on_border(pos)
-        if blocked or stuck_on_rim:
-            self.wall_cooldown[drone_index] = max(
-                int(self.wall_cooldown[drone_index]), WALL_COOLDOWN_STEPS
-            )
-        if self.wall_cooldown[drone_index] > 0 or blocked or stuck_on_rim:
+        if speed <= 0.5 or self._heading_blocked(pos, heading, drone_index=drone_index):
             vel = self._velocity_toward_unmapped(drone_index, pos)
         pos = pos + vel * dt
-        bounced = False
-        if pos[0] >= lx:
-            pos[0] = lx - BOUNCE_INSET
-            bounced = True
-        elif pos[0] <= -lx:
-            pos[0] = -lx + BOUNCE_INSET
-            bounced = True
-        if pos[1] >= ly:
-            pos[1] = ly - BOUNCE_INSET
-            bounced = True
-        elif pos[1] <= -ly:
-            pos[1] = -ly + BOUNCE_INSET
-            bounced = True
-        if bounced:
-            self.wall_cooldown[drone_index] = WALL_COOLDOWN_STEPS
-            vel = self._velocity_toward_unmapped(drone_index, pos)
+        hit_x = False
+        hit_y = False
+        if pos[0] > lx:
+            pos[0] = lx
+            vel[0] = 0.0
+            hit_x = True
+        elif pos[0] < -lx:
+            pos[0] = -lx
+            vel[0] = 0.0
+            hit_x = True
+        if pos[1] > ly:
+            pos[1] = ly
+            vel[1] = 0.0
+            hit_y = True
+        elif pos[1] < -ly:
+            pos[1] = -ly
+            vel[1] = 0.0
+            hit_y = True
+        if (hit_x or hit_y) and float(np.hypot(vel[0], vel[1])) < 0.5 * self.drone_max_speed:
+            ux, uy = self._metric_search_dir(drone_index, pos[0], pos[1])
+            if hit_x:
+                ux = 0.0
+            if hit_y:
+                uy = 0.0
+            n = float(np.hypot(ux, uy))
+            if n < 1e-6:
+                if hit_x and not hit_y:
+                    uy = 1.0 if pos[1] <= 0.0 else -1.0
+                    n = 1.0
+                elif hit_y and not hit_x:
+                    ux = 1.0 if pos[0] <= 0.0 else -1.0
+                    n = 1.0
+            if n >= 1e-6:
+                vel[0] = ux / n * self.drone_max_speed
+                vel[1] = uy / n * self.drone_max_speed
+                if hit_x:
+                    vel[0] = 0.0
+                if hit_y:
+                    vel[1] = 0.0
+            if float(np.hypot(vel[0], vel[1])) < 1e-6:
+                self.wall_cooldown[drone_index] = WALL_COOLDOWN_STEPS
+                vel[0] = -float(np.sign(pos[0]) or 1.0) * self.drone_max_speed
+                vel[1] = -float(np.sign(pos[1]) or 1.0) * self.drone_max_speed
         pos[0] = float(np.clip(pos[0], -lx, lx))
         pos[1] = float(np.clip(pos[1], -ly, ly))
         pos[2] = float(self._agl_z(pos[0], pos[1]))
         vel[2] = 0.0
-        return pos, vel
+        building_hit = False
+        if self._path_hits_building(old, pos):
+            slid = False
+            for axis in (0, 1):
+                cand = old.copy()
+                cand[axis] = pos[axis]
+                cand[2] = self._agl_z(cand[0], cand[1])
+                if not self._path_hits_building(old, cand):
+                    pos = cand
+                    vel[1 - axis] = 0.0
+                    slid = True
+                    break
+            if not slid:
+                building_hit = True
+                pos = self._push_out_of_buildings(old)
+                vel[:] = 0.0
+        if self._hits_building(pos):
+            building_hit = True
+            pos = self._push_out_of_buildings(pos)
+            vel[:] = 0.0
+        pos[2] = float(self._agl_z(pos[0], pos[1]))
+        vel[2] = 0.0
+        return pos, vel, building_hit
 
     def _mark_coverage(self, positions):
         """Paint sensor footprints. Credit a new cell only to the drone that painted it."""
@@ -714,6 +986,8 @@ class SurvivorSearchEnv(ParallelEnv):
         per_overlap = np.zeros(len(positions), dtype=np.int32)
         already = self.coverage >= 1.0
         for i, pos in enumerate(positions):
+            if i < len(self.drone_alive) and not self.drone_alive[i]:
+                continue
             cx, cy = self._world_to_cell(pos[0], pos[1])
             cell_mx = self.size_x / self.cover_nx
             cell_my = self.size_y / self.cover_ny
@@ -881,6 +1155,8 @@ class SurvivorSearchEnv(ParallelEnv):
             x = -lx * 0.7 + frac * (1.4 * lx)
             y = -ly * 0.35 + (i % 2) * (0.25 * ly)
             z = self._agl_z(x, y)
+            cleared = self._push_out_of_buildings([x, y, z], radius=BUILDING_HARD_M)
+            x, y, z = float(cleared[0]), float(cleared[1]), float(cleared[2])
             self.drone_positions[i] = [x, y, z]
             if self.client is None:
                 self.drone_ids.append(-1)
@@ -1028,7 +1304,6 @@ class SurvivorSearchEnv(ParallelEnv):
         self.agents = list(self.possible_agents)
         self.step_count = 0
         self.coverage = np.zeros((self.cover_ny, self.cover_nx), dtype=np.float32)
-        self._seal_map_border()
         self.drone_velocities = np.zeros((self.num_drones, 3))
         self.drone_alive = np.ones(self.num_drones, dtype=bool)
         self.newly_discovered = 0
@@ -1095,6 +1370,11 @@ class SurvivorSearchEnv(ParallelEnv):
             seed=surv_seed,
         )
         self.survivors.place_on_walkable(self.town)
+        hx, hy = self._lim_x(), self._lim_y()
+        self.survivors.positions[:, 0] = np.clip(self.survivors.positions[:, 0], -hx, hx)
+        self.survivors.positions[:, 1] = np.clip(self.survivors.positions[:, 1], -hy, hy)
+        self.survivors._snap_to_ground()
+        self._seal_unsearchable()
 
         self._init_pybullet()
         self._build_ground()
@@ -1111,6 +1391,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self._refresh_nav_goals()
 
         for i, agent in enumerate(self.possible_agents):
+            if not self.drone_alive[i]:
+                self.drone_velocities[i][:] = 0.0
+                continue
             if agent not in actions:
                 continue
             raw = np.asarray(actions[agent], dtype=np.float32).reshape(-1)
@@ -1129,22 +1412,39 @@ class SurvivorSearchEnv(ParallelEnv):
                     self.drone_velocities[i, 1] = heading[1] * self.drone_max_speed
                     self.drone_velocities[i, 2] = 0.0
 
+        collisions = np.zeros(self.num_drones, dtype=bool)
+        building_kills = np.zeros(self.num_drones, dtype=bool)
         for i in range(self.num_drones):
+            if not self.drone_alive[i]:
+                self.drone_velocities[i][:] = 0.0
+                continue
             if self.wall_cooldown[i] > 0:
                 self.wall_cooldown[i] -= 1
             if self._work_remains():
                 self._keep_moving(i)
-            pos, vel = self._move_with_soft_walls(
+            pos, vel, building_hit = self._move_with_soft_walls(
                 i, self.drone_positions[i], self.drone_velocities[i], dt
             )
-            if self._work_remains() and float(np.hypot(vel[0], vel[1])) < 0.5 * self.drone_max_speed:
+            if (
+                self.drone_alive[i]
+                and self._work_remains()
+                and float(np.hypot(vel[0], vel[1])) < 0.5 * self.drone_max_speed
+            ):
                 vel = self._velocity_toward_unmapped(i, pos)
             self.drone_positions[i] = pos
             self.drone_velocities[i] = vel
+            if building_hit:
+                self.drone_alive[i] = False
+                building_kills[i] = True
+                self.drone_velocities[i][:] = 0.0
+                self.drone_positions[i, 2] = self._ground_z(pos[0], pos[1]) + 0.35
 
-        collisions = np.zeros(self.num_drones, dtype=bool)
         for i in range(self.num_drones):
+            if not self.drone_alive[i]:
+                continue
             for j in range(i + 1, self.num_drones):
+                if not self.drone_alive[j]:
+                    continue
                 dist = float(np.linalg.norm(self.drone_positions[i][:2] - self.drone_positions[j][:2]))
                 if dist < CRASH_RANGE:
                     collisions[i] = True
@@ -1164,20 +1464,25 @@ class SurvivorSearchEnv(ParallelEnv):
                 )
 
         self.new_cells, self.overlap_cells = self._mark_coverage(self.drone_positions)
-        self.newly_discovered, _ = self.survivors.update_discovery(
-            list(self.drone_positions), self.terrain
-        )
+        alive_pos = [
+            self.drone_positions[i] for i in range(self.num_drones) if self.drone_alive[i]
+        ]
+        self.newly_discovered, _ = self.survivors.update_discovery(alive_pos, self.terrain)
         self._sync_person_capsules()
 
-        rewards = self._compute_rewards(collisions)
+        rewards = self._compute_rewards(collisions, building_kills)
         all_found = int(self.survivors.discovered.sum()) == self.survivors.num_survivors
+        mapped = self._interior_coverage() >= 0.995
         maxed = self.step_count >= self.max_steps
-        truncations = {a: (all_found or maxed) for a in self.possible_agents}
+        all_dead = not bool(self.drone_alive.any())
+        truncations = {a: ((all_found and mapped) or maxed or all_dead) for a in self.possible_agents}
         terminations = {a: False for a in self.possible_agents}
         return self._get_observations(), rewards, terminations, truncations, self._infos()
 
-    def _compute_rewards(self, collisions):
+    def _compute_rewards(self, collisions, building_kills=None):
         """New cells and new people. Sitting still is costly while work remains."""
+        if building_kills is None:
+            building_kills = np.zeros(self.num_drones, dtype=bool)
         stats = self.survivors.get_discovery_stats()
         all_found = (
             stats["discovered_survivors"] == stats["total_survivors"] and stats["total_survivors"] > 0
@@ -1194,11 +1499,14 @@ class SurvivorSearchEnv(ParallelEnv):
             rew = shared + float(self._drone_new_cells[i])
             if self._drone_new_cells[i] == 0 and self._drone_overlap[i] > 0:
                 rew -= 0.25
-            speed = float(np.hypot(self.drone_velocities[i][0], self.drone_velocities[i][1]))
-            if speed < 0.5 and work_remains:
-                rew -= 1.0
+            if self.drone_alive[i]:
+                speed = float(np.hypot(self.drone_velocities[i][0], self.drone_velocities[i][1]))
+                if speed < 0.5 and work_remains:
+                    rew -= 1.0
             if collisions[i]:
                 rew -= 1.0
+            if building_kills[i]:
+                rew -= BUILDING_CRASH_PENALTY
             rewards[agent] = rew
         return rewards
 
@@ -1248,6 +1556,7 @@ class SurvivorSearchEnv(ParallelEnv):
             "total_survivors": stats["total_survivors"],
             "discovery_rate": stats["discovery_rate"],
             "coverage_frac": self._interior_coverage(),
+            "alive_drones": int(self.drone_alive.sum()),
             "new_cells": int(self.new_cells),
             "overlap_cells": int(self.overlap_cells),
         }

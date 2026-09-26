@@ -1051,6 +1051,22 @@ class TownLayout:
         return bool(np.any(d2 <= radius * radius))
 
     @staticmethod
+    def sphere_clearance(pos, boxes):
+        """Meters from pos to the nearest AABB. 0 if inside or touching."""
+        if boxes is None or len(boxes) == 0:
+            return 1e6
+        pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        closest = np.column_stack(
+            [
+                np.clip(pos[0], boxes[:, 0], boxes[:, 3]),
+                np.clip(pos[1], boxes[:, 1], boxes[:, 4]),
+                np.clip(pos[2], boxes[:, 2], boxes[:, 5]),
+            ]
+        )
+        d2 = np.sum((closest - pos) ** 2, axis=1)
+        return float(np.sqrt(np.min(d2)))
+
+    @staticmethod
     def sphere_hit_mask(positions, radius, boxes):
         """Boolean mask of which sphere centers intersect any box."""
         positions = np.asarray(positions, dtype=np.float64)
