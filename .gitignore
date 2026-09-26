@@ -17,9 +17,7 @@ ENV/
 *.swo
 
 # Project specific
-# Models generated during training
-models/
-*/models/
+# Trained weight files only (keep models/*.py source tracked)
 *.pth
 *.pt
 *.h5
