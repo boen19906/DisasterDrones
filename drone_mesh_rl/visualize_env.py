@@ -1,8 +1,8 @@
 """
 visualize_env.py — Lightweight 3D spectator for the damaged town.
 
-Loads the damaged city + green wilderness rim once in PyBullet and runs a
-camera-only loop (no drones, RF mesh, survivors, weather, or multi-agent stepping).
+Loads the 250 m town once in PyBullet and runs a camera-only loop
+(no drones, RF mesh, survivors, weather, or multi-agent stepping).
 
 Usage:
   cd drone_mesh_rl && python3 visualize_env.py
@@ -27,12 +27,10 @@ from envs.town import (
     connect_pybullet,
     spawn_town_in_pybullet,
     frame_town_camera,
-    DEFAULT_ENV_SIZE,
-    RESOLUTION,
 )
 
 # Spectator fly defaults (meters / degrees per key-poll at target FPS)
-_SPEC_MOVE_SPEED = 4.0  # several meters per poll — usable on the larger map
+_SPEC_MOVE_SPEED = 3.0  # several meters per poll — usable on a 250 m map
 _SPEC_FAST_MULT = 3.0  # Left Ctrl sprint only (Left Shift is descend)
 _SPEC_TURN_SPEED = 2.5
 _SPEC_FLY_DIST = 1.0  # short boom so look-around feels FPS-like
@@ -41,12 +39,7 @@ _PITCH_MIN, _PITCH_MAX = -89.0, 89.0
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Damaged-town spectator viewer")
-    parser.add_argument(
-        "--env_size",
-        type=float,
-        default=DEFAULT_ENV_SIZE,
-        help=f"Full map size in meters (default {DEFAULT_ENV_SIZE:.0f}: 250 m city + green rim)",
-    )
+    parser.add_argument("--env_size", type=float, default=250.0, help="Town size in meters")
     parser.add_argument("--fps", type=float, default=30.0, help="Display FPS target")
     parser.add_argument("--seed", type=int, default=42, help="World seed")
     return parser.parse_args()
@@ -199,10 +192,9 @@ def build_world(client, env_size, seed):
     terrain = Terrain(
         size_x=env_size,
         size_y=env_size,
-        resolution=RESOLUTION,
+        resolution=2.0,
         seed=seed,
         obstacle_boxes=town.boxes,
-        city_half=town.city_half,
     )
     spawn_town_in_pybullet(client, town, terrain, env_size)
     return town, terrain
@@ -239,12 +231,8 @@ def main():
     p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=client)
 
     town, terrain = build_world(client, args.env_size, args.seed)
-    n_buildings = town.building_count()
-    print(
-        f"[TOWN] {n_buildings} buildings (+ rubble/overpass), "
-        f"{len(town.trees)} trees, {len(town.cabins)} cabins on "
-        f"{args.env_size:.0f}m map (city ~{town.city_half * 2:.0f}m)."
-    )
+    n_buildings = len(town.boxes)
+    print(f"[TOWN] Loaded {n_buildings} building/rubble/overpass boxes on {args.env_size:.0f}m map.")
 
     frame_town_camera(client, args.env_size)
     spectator = True
@@ -272,10 +260,7 @@ def main():
                 seed = int(seed) + 1
                 clear_world(client)
                 town, terrain = build_world(client, args.env_size, seed)
-                print(
-                    f"[TOWN] {town.building_count()} buildings, "
-                    f"{len(town.trees)} trees, {len(town.cabins)} cabins (seed={seed})."
-                )
+                print(f"[TOWN] Loaded {len(town.boxes)} boxes (seed={seed}).")
                 frame_town_camera(client, args.env_size)
                 yaw, pitch, dist, target, eye = read_debug_camera(client)
                 # Re-frame overview, then return to fly mode
