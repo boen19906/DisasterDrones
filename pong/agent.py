@@ -72,8 +72,8 @@ class Agent:
             final_move[move] = 1
             return final_move
 
-        # Slowed down epsilon decay so it explores for the first 2000 games instead of 100
-        self.epsilon = max(0.02, 1.0 - (self.n_games / 2000.0))
+        # Slowed down epsilon decay so it explores for the first 8000 games
+        self.epsilon = max(0.10, 1.0 - (self.n_games / 8000.0))
 
         if random.random() < self.epsilon:
             move = random.randint(0, 2)

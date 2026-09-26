@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Autonomous Drone Swarm Mesh Network - Architecture & Roadmap</title>
+  <style>
+    @page {
+      size: letter;
+      margin: 18mm 16mm;
+      @bottom-right {
+        content: counter(page);
+      }
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 10.5pt;
+      line-height: 1.55;
+      color: #1a202c;
+      background: #ffffff;
+      padding: 0;
+      margin: 0;
+    }
+    h1 {
+      font-size: 20pt;
+      font-weight: 700;
+      color: #0f172a;
+      border-bottom: 2px solid #0ea5e9;
+      padding-bottom: 6px;
+      margin-top: 0;
+      margin-bottom: 6px;
+    }
+    h2 {
+      font-size: 14pt;
+      font-weight: 700;
+      color: #1e293b;
+      border-bottom: 1px solid #e2e8f0;
+      padding-bottom: 4px;
+      margin-top: 18pt;
+      margin-bottom: 8pt;
+      page-break-after: avoid;
+    }
+    h3 {
+      font-size: 11.5pt;
+      font-weight: 600;
+      color: #334155;
+      margin-top: 12pt;
+      margin-bottom: 4pt;
+      page-break-after: avoid;
+    }
+    p {
+      margin-top: 0;
+      margin-bottom: 8pt;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10pt 0;
+      font-size: 9pt;
+      page-break-inside: avoid;
+    }
+    th, td {
+      padding: 6pt 8pt;
+      border: 1px solid #cbd5e1;
+      text-align: left;
+    }
+    th {
+      background-color: #f1f5f9;
+      font-weight: 600;
+      color: #0f172a;
+    }
+    tr:nth-child(even) {
+      background-color: #f8fafc;
+    }
+    pre {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 4px;
+      padding: 8pt 10pt;
+      font-family: "Consolas", "Courier New", monospace;
+      font-size: 8.5pt;
+      line-height: 1.45;
+      overflow-x: auto;
+      page-break-inside: avoid;
+      margin: 8pt 0;
+    }
+    code {
+      font-family: "Consolas", "Courier New", monospace;
+      background: #f1f5f9;
+      padding: 1.5pt 3pt;
+      border-radius: 3px;
+      font-size: 9pt;
+      color: #0f172a;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }
+    ul, ol {
+      margin-top: 0;
+      margin-bottom: 8pt;
+      padding-left: 18pt;
+    }
+    li {
+      margin-bottom: 3pt;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #e2e8f0;
+      margin: 14pt 0;
+    }
+    blockquote {
+      border-left: 3px solid #0ea5e9;
+      margin: 8pt 0;
+      padding: 4pt 10pt;
+      color: #475569;
+      background: #f0f9ff;
+    }
+  </style>
+</head>
+<body>
+<h1>🛰️ Autonomous LEO-Integrated Drone Swarm Mesh Network</h1>
+<h2>Complete System Architecture, Mathematical Formulations, and Engineering Roadmap</h2>
+<hr />
+<h2>1. Executive Summary &amp; Problem Formulation</h2>
+<p>In humanitarian disaster operations (mountain landslides, forest floods, earthquakes), terrestrial communications towers and power infrastructure are frequently wiped out. Ground search-and-rescue (SAR) teams and isolated survivor clusters are trapped in rugged, non-line-of-sight terrain without cellular or satellite uplink capabilities.</p>
+<p>This project designs, trains, and visualizes an <strong>autonomous multi-agent drone swarm</strong> that dynamically deploys over mountainous terrain to:</p>
+<ol>
+<li><strong>Explore and locate moving ground survivor clusters</strong> hidden in mountain basins and valleys.</li>
+<li><strong>Establish a self-healing radio frequency (RF) mesh network</strong> across the swarm using multi-hop relaying.</li>
+<li><strong>Route critical ground telemetry to a passing Low Earth Orbit (LEO) satellite</strong> via specialized Gateway drones.</li>
+<li><strong>Manage severe energy constraints</strong> (rapid battery depletion during Starlink phased-array uplinks and against high-altitude mountain wind gusts).</li>
+</ol>
+<p>The swarm is trained entirely through <strong>Multi-Agent Reinforcement Learning (MARL)</strong> using <strong>MAPPO (Multi-Agent Proximal Policy Optimization)</strong> under the <strong>Centralized Training with Decentralized Execution (CTDE)</strong> paradigm.</p>
+<hr />
+<h2>2. Complete Technology Stack &amp; Technical Rationale</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Technology</th>
+<th>Version</th>
+<th>Engineering Justification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Multi-Agent Environment</strong></td>
+<td><code>PettingZoo</code> (<code>ParallelEnv</code>)</td>
+<td><code>v1.27.0</code></td>
+<td>Standardized Farama foundation for multi-agent RL; enables simultaneous synchronous stepping across all swarm drones.</td>
+</tr>
+<tr>
+<td><strong>Physics &amp; Kinematics</strong></td>
+<td><code>PyBullet</code></td>
+<td><code>v3.2.7</code></td>
+<td>C++ physics engine with fast headless simulation for RL rollouts (~440+ FPS on CPU) and native OpenGL 3D visualization.</td>
+</tr>
+<tr>
+<td><strong>Deep Learning Framework</strong></td>
+<td><code>PyTorch</code></td>
+<td><code>v2.14.0</code></td>
+<td>Powers the MAPPO Actor-Critic neural networks, orthogonal layer initializations, and Generalized Advantage Estimation (GAE).</td>
+</tr>
+<tr>
+<td><strong>Graph &amp; Topology Routing</strong></td>
+<td><code>NetworkX</code></td>
+<td><code>v3.6.1</code></td>
+<td>Efficient dynamic graph construction, edge weight path loss analysis, and shortest-path survivor-to-satellite data routing verification.</td>
+</tr>
+<tr>
+<td><strong>Scientific Computing</strong></td>
+<td><code>NumPy</code> &amp; <code>SciPy</code></td>
+<td><code>v2.5.3</code> / <code>v1.18.1</code></td>
+<td>Vectorized heightmap generation, fast line-of-sight raycasting, and terrain gradient calculations.</td>
+</tr>
+<tr>
+<td><strong>Web Telemetry Backend</strong></td>
+<td><code>FastAPI</code> &amp; <code>Uvicorn</code></td>
+<td><code>v0.141.1</code> / <code>v0.53.0</code></td>
+<td>Async Python web server providing high-frequency (20 Hz) WebSocket broadcasting of swarm states with minimal latency.</td>
+</tr>
+<tr>
+<td><strong>Real-time Protocol</strong></td>
+<td><code>WebSockets</code></td>
+<td><code>v14.2</code></td>
+<td>Bi-directional streaming between the running simulation loop and the browser frontend for live telemetry and remote commands.</td>
+</tr>
+<tr>
+<td><strong>Mission Control Dashboard</strong></td>
+<td><code>HTML5 Canvas</code> / Vanilla CSS</td>
+<td>Native ES6</td>
+<td>Zero-dependency, lightweight, high-performance tactical radar canvas and telemetry dashboard with zero buffer tearing.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>3. High-Level System Architecture</h2>
+<pre><code class="language-mermaid">graph TD
+    subgraph &quot;Simulation &amp; Environment Layer (envs/)&quot;
+        A[&quot;Terrain Engine&lt;br/&gt;(terrain.py)&lt;br/&gt;• 2.5D Gaussian Heightmap&lt;br/&gt;• Fast Vectorized Raycast LoS&quot;]
+        B[&quot;Survivors Engine&lt;br/&gt;(survivors.py)&lt;br/&gt;• Gaussian Clustered Spawning&lt;br/&gt;• Downhill Gradient Drift&lt;br/&gt;• Discovery Tracking&quot;]
+        C[&quot;Weather &amp; Battery&lt;br/&gt;(weather.py)&lt;br/&gt;• Ornstein-Uhlenbeck Wind&lt;br/&gt;• Ridgeline Gust Multipliers&lt;br/&gt;• Phased-Array Drain (3.5x)&quot;]
+        D[&quot;Network &amp; Satellite&lt;br/&gt;(network.py)&lt;br/&gt;• FSPL Link Budget (-85 dBm)&lt;br/&gt;• LEO Orbital Sweep (550km)&lt;br/&gt;• 25° Elevation Uplink Cone&quot;]
+        
+        E[&quot;DisasterMeshEnv (disaster_env.py)&lt;br/&gt;PettingZoo ParallelEnv + PyBullet Server&quot;]
+        A --&gt; E
+        B --&gt; E
+        C --&gt; E
+        D --&gt; E
+    end
+
+    subgraph &quot;MARL Training Pipeline (models/ &amp; train.py)&quot;
+        F[&quot;Decentralized Actors&lt;br/&gt;(actor_critic.py)&lt;br/&gt;25-dim obs → 5-dim actions&quot;]
+        G[&quot;Centralized Critic&lt;br/&gt;(actor_critic.py)&lt;br/&gt;125-dim global state → V(s)&quot;]
+        H[&quot;MultiAgentRolloutBuffer&lt;br/&gt;(buffer.py)&lt;br/&gt;GAE Advantage Calculation&quot;]
+        I[&quot;MAPPO Trainer (train.py)&lt;br/&gt;Headless Training Loop (~440 FPS)&quot;]
+        
+        E &lt;--&gt; F
+        E &lt;--&gt; G
+        F &amp; G --&gt; H --&gt; I
+    end
+
+    subgraph &quot;Visualization &amp; Operations Layer&quot;
+        J[&quot;3D PyBullet GUI&lt;br/&gt;(visualize_env.py)&lt;br/&gt;Stabilized 10Hz Mesh Overlays&quot;]
+        K[&quot;Mission Operations Control Center&lt;br/&gt;(server/telemetry_server.py)&lt;br/&gt;FastAPI + WebSocket @ localhost:8000&quot;]
+        L[&quot;Evaluation Suite&lt;br/&gt;(evaluate.py)&lt;br/&gt;Metrics &amp; Baseline Benchmarking&quot;]
+        
+        E --&gt; J
+        E --&gt; K
+        I -. Checkpoint .-&gt; L
+    end
+</code></pre>
+<hr />
+<h2>4. Detailed Component Mechanics &amp; Mathematical Formulations</h2>
+<h3>4.1. Topography &amp; Fast Line-of-Sight (<code>envs/terrain.py</code>)</h3>
+<ul>
+<li><strong>Continuous 2.5D Heightfield</strong>: Generated as an overlapping superposition of $K=15$ two-dimensional bivariate Gaussian distributions:
+$$Z(x, y) = \sum_{k=1}^{K} A_k \exp\left( -\frac{(x - c_{x,k})^2 + (y - c_{y,k})^2}{2\sigma_k^2} \right)$$
+where amplitudes $A_k \in [2.0, 5.0]\text{ m}$ create realistic rolling mountainous peaks and passes across a $100\text{ m} \times 100\text{ m}$ domain.</li>
+<li><strong>Fast Vectorized Raycasting (<code>check_los</code>)</strong>: Line-of-Sight (LoS) between 3D points $\mathbf{p}_A$ and $\mathbf{p}_B$ is evaluated in $O(N)$ vector operations:
+$$\mathbf{p}(t) = (1 - t)\mathbf{p}_A + t\mathbf{p}_B, \quad t \in [0, 1]$$
+If $Z(\mathbf{p}_x(t), \mathbf{p}_y(t)) &gt; \mathbf{p}_z(t)$ at any sampled interpolation point along the ray, LoS is flagged as obstructed (<code>False</code>).</li>
+</ul>
+<h3>4.2. Ground Survivors &amp; Downhill Drift (<code>envs/survivors.py</code>)</h3>
+<ul>
+<li><strong>Gaussian Clustered Spawning</strong>: Survivors spawn in $C=4$ realistic clusters with $2\text{ to }5$ individuals per cluster, confined within the safe inner $70%$ terrain envelope ($[-35\text{ m}, +35\text{ m}]$) to ensure no entities spawn off map edges.</li>
+<li><strong>Downhill Gradient Drift</strong>: Survivors move via biased Brownian motion pulled toward natural valleys and riverbeds along the negative terrain gradient:
+$$\mathbf{v}<em>{\text{drift}} = -\alpha \nabla Z(x, y) = -\alpha \left[ \frac{\partial Z}{\partial x}, \frac{\partial Z}{\partial y} \right]^T$$
+$$\mathbf{x}</em>{t+1} = \mathbf{x}<em>t + \mathbf{v}</em>{\text{drift}} \Delta t + \mathcal{N}(0, \sigma^2_{\text{noise}}) \Delta t$$</li>
+<li><strong>Discovery Mechanism</strong>: A survivor is discovered if and only if:
+$$|\mathbf{p}<em>{\text{drone}} - \mathbf{p}</em>{\text{surv}}|<em>{xy} \le 15.0\text{ m} \quad \text{AND} \quad \text{check_los}(\mathbf{p}</em>{\text{drone}}, \mathbf{p}_{\text{surv}}) = \text{True}$$</li>
+</ul>
+<h3>4.3. Dynamic Weather &amp; Battery Consumption (<code>envs/weather.py</code>)</h3>
+<ul>
+<li><strong>Ornstein-Uhlenbeck (OU) Wind Field</strong>: Models continuous, stochastic, mean-reverting atmospheric turbulence:
+$$d\mathbf{w}_t = \theta (\boldsymbol{\mu}_w - \mathbf{w}_t) dt + \sigma_w d\mathbf{W}_t$$</li>
+<li><strong>Ridgeline Gust Amplification</strong>: Wind forces intensify over steep ridges proportional to the local topography gradient:
+$$k_{\text{gust}}(x, y) = 1.0 + 2.0 \cdot \min\left( \frac{|\nabla Z(x,y)|}{0.5}, 1.0 \right)$$</li>
+<li><strong>Calibrated Battery Consumption Model</strong>:
+$$\dot{B} = \left( \beta_{\text{base}} + \beta_{\text{wind}}|\mathbf{w}| + \beta_{\text{alt}}\max(z, 0) \right) \times M_{\text{role}}$$
+<ul>
+<li><strong>Relay Drones</strong>: $\beta_{\text{base}} = 1.2% / \text{sec}$ ($\approx 70\text{ s}$ operational endurance).</li>
+<li><strong>Gateway Drones</strong>: $M_{\text{role}} = 3.5\times$ power multiplier ($\approx 4.8% / \text{sec}$, depletes in $\approx 20\text{ s}$ without role handoff).</li>
+</ul>
+</li>
+</ul>
+<h3>4.4. RF Mesh Link Budget &amp; LEO Satellite Sweeps (<code>envs/network.py</code>)</h3>
+<ul>
+<li><strong>Free Space Path Loss (FSPL)</strong>: Operates at $f = 2.4\text{ GHz}$:
+$$\text{FSPL}(\text{dB}) = 20\log_{10}(d_{\text{km}}) + 20\log_{10}(f_{\text{MHz}}) + 32.44$$
+$$P_{\text{rx}} = P_{\text{tx}} - \text{FSPL} - (30\text{ dBm if LoS is blocked})$$
+Link active if $P_{\text{rx}} \ge -85\text{ dBm}$. Decoupled design allows drop-in replacement with real hardware telemetry.</li>
+<li><strong>LEO Satellite Orbital Kinematics</strong>:
+<ul>
+<li>Orbit Altitude: $550\text{ km}$ (Starlink constellation tier).</li>
+<li>Sweeps west-to-east across the $100\text{ m}$ simulation boundary in $\approx 60\text{ s}$, followed by a $30\text{ s}$ orbital blackout.</li>
+<li>Uplink Condition: Gateway role active, satellite in visible pass, and elevation angle:
+$$\theta_{\text{elev}} = \arctan\left( \frac{z_{\text{sat}} - z_{\text{drone}}}{\sqrt{(x_{\text{sat}} - x)^2 + (y_{\text{sat}} - y)^2}} \right) &gt; 25.0^\circ$$</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>5. Multi-Agent Reinforcement Learning (MARL) Formulation</h2>
+<h3>5.1. Observation Space (Decentralized, 25-dim per drone)</h3>
+<p>Each drone receives a normalized local observation vector:</p>
+<ul>
+<li><code>obs[0:3]</code>: Drone normalized position $(x, y, z) / (L/2)$</li>
+<li><code>obs[3:6]</code>: Drone velocity $(v_x, v_y, v_z) / v_{\max}$</li>
+<li><code>obs[6:9]</code>: Orientation Euler angles (roll, pitch, yaw) $/ \pi$</li>
+<li><code>obs[9:12]</code>: Instantaneous local wind vector $\mathbf{w} \times 10$</li>
+<li><code>obs[12:15]</code>: Relative satellite vector $(\Delta x, \Delta y, \Delta z)$</li>
+<li><code>obs[15]</code>: Satellite visibility flag ($1.0$ if in pass, $0.0$ if blackout)</li>
+<li><code>obs[16]</code>: Normalized battery state $B_i / 100 \in [0, 1]$</li>
+<li><code>obs[17]</code>: Active role indicator ($1.0$ for Gateway, $0.0$ for Relay)</li>
+<li><code>obs[18:21]</code>: Relative vector to nearest undiscovered survivor cluster</li>
+<li><code>obs[21]</code>: Swarm discovery rate ($%$)</li>
+<li><code>obs[22]</code>: Normalized distance to nearest neighbor drone</li>
+<li><code>obs[23]</code>: Normalized nearest neighbor RSSI signal strength</li>
+<li><code>obs[24]</code>: Terrain clearance / height directly below drone</li>
+</ul>
+<h3>5.2. Action Space (Continuous, 5-dim per drone)</h3>
+<ul>
+<li><code>act[0:3]</code>: 3D velocity setpoint $(v_x, v_y, v_z) \in [-1, 1] \implies [-2.0, 2.0]\text{ m/s}$</li>
+<li><code>act[3]</code>: Gateway role selector ($&gt; 0.0 \implies \text{Gateway}$, $\le 0.0 \implies \text{Relay}$)</li>
+<li><code>act[4]</code>: RF transmission power level setpoint $[0.0, 1.0]$</li>
+</ul>
+<h3>5.3. 12-Signal Reward &amp; Penalty Formulation</h3>
+<pre><code>R_total = +20.0 * (new_clusters_discovered)
+          + 5.0 * (survivors_connected_to_satellite)
+          + 100.0 * (all_survivors_located_bonus)
+          + 1.0 * (if battery &gt; 50%)
+          - 50.0 * (if terrain collision)
+          - 30.0 * (if drone-to-drone collision)
+          - 40.0 * (on battery exhaustion / crash)
+          -  2.0 * (low battery warning when B &lt; 20%)
+          -  5.0 * (dropped survivor mesh link)
+          -  3.0 * (if satellite is visible but no gateway uplinks)
+          -  1.0 * (altitude penalty if AGL &gt; 20m)
+</code></pre>
+<hr />
+<h2>6. What Has Been Completed &amp; Verified</h2>
+<ol>
+<li><strong><code>envs/terrain.py</code></strong>: Complete 2.5D Gaussian topography generator with fast raycast line-of-sight obstruction detection.</li>
+<li><strong><code>envs/survivors.py</code></strong>: Bounded cluster spawning ($[-35, 35]\text{ m}$), downhill gradient drift, and LoS discovery logic.</li>
+<li><strong><code>envs/weather.py</code></strong>: Ornstein-Uhlenbeck wind field with ridgeline gusts, storm bursts, and dynamic battery drain.</li>
+<li><strong><code>envs/network.py</code></strong>: Decoupled FSPL RF link budget, NetworkX mesh topology routing, and LEO satellite orbital sweep model.</li>
+<li><strong><code>envs/disaster_env.py</code></strong>: Full PettingZoo <code>ParallelEnv</code> wrapper with PyBullet physics, Crazyflie bodies, and 12-signal reward engine.</li>
+<li><strong><code>models/actor_critic.py</code> &amp; <code>models/buffer.py</code></strong>: MAPPO decentralized actor, centralized critic, and GAE rollout buffer.</li>
+<li><strong><code>train.py</code></strong>: Headless multi-agent PPO trainer achieving <strong>~440+ FPS on CPU</strong> with checkpointing to <code>models/</code>.</li>
+<li><strong><code>evaluate.py</code></strong>: Benchmark suite evaluating discovery percentage, connected survivors, and battery retention against baselines.</li>
+<li><strong><code>visualize_env.py</code></strong>: Stabilized 3D PyBullet GUI (strobe flickering eliminated, wide-angle $85\text{ m}$ camera framing the entire mountain basin).</li>
+<li><strong><code>server/telemetry_server.py</code></strong>: High-performance FastAPI + WebSocket Mission Control Center featuring an interactive HTML5 tactical radar map, live satellite pass tracker, swarm health diagnostics, and remote command deck.</li>
+</ol>
+<hr />
+<h2>7. Prioritized Future Additions Roadmap</h2>
+<pre><code class="language-mermaid">gantt
+    title Engineering Roadmap for Future Expansions
+    dateFormat  YYYY-MM
+    section Phase A: Algorithmic Advancements
+    Emergent Communication Channel (8-dim)     :a1, 2026-10, 30d
+    Occupancy Grid Coverage Painting           :a2, 2026-10, 20d
+    Sensor Overlap &amp; Redundancy Penalty        :a3, after a2, 15d
+    
+    section Phase B: Mission Intelligence
+    Unexplored Area Centroid Gradient Vector   :b1, after a3, 15d
+    Heterogeneous Drone Swarms (Scout vs Heavy):b2, 2026-11, 25d
+    
+    section Phase C: Interface &amp; Hardware
+    Three.js / WebGL 3D Digital Twin Web View :c1, 2026-11, 30d
+    Hardware-in-the-Loop Telemetry Adapter    :c2, 2026-12, 30d
+</code></pre>
+<h3>7.1. Emergent Communication Channel (Highest Priority)</h3>
+<ul>
+<li><strong>Concept</strong>: Add an $M=8$ continuous action channel to each drone. When Drone $i$ acts, it emits latent vector $\mathbf{m}_i \in \mathbb{R}^8$. Neighbors within RF range receive $\mathbf{m}_i$ in their observation space.</li>
+<li><strong>Impact</strong>: Removes human bias in coordination rules. Drones autonomously invent an emergent communication protocol to negotiate search sectors (e.g. <em>&quot;I am clearing North, you sweep South&quot;</em>) and coordinate battery-saving Gateway handoffs.</li>
+</ul>
+<h3>7.2. Occupancy Grid &quot;Coverage Painting&quot; &amp; Overlap Penalty</h3>
+<ul>
+<li><strong>Concept</strong>: Discretize the mountain basin into a $50 \times 50$ occupancy grid. As drones fly overhead, their downward sensor cone marks unvisited cells as &quot;scanned&quot; (rendered as a glowing sweep trail on the radar).</li>
+<li><strong>Overlap Penalty</strong>: Penalize multiple drones if their scanning cones overlap on the same timestep:
+$$R_{\text{overlap}} = -\gamma \cdot \text{Area}(\text{Footprint}_A \cap \text{Footprint}_B)$$
+Forces the swarm to diverge and sweep the disaster zone with maximal efficiency.</li>
+</ul>
+<h3>7.3. Unexplored Centroid Vector (Observation Gradient)</h3>
+<ul>
+<li><strong>Concept</strong>: Compute the 2D center-of-mass of all remaining unvisited grid cells:
+$$\mathbf{c}<em>{\text{unexplored}} = \frac{1}{|U|} \sum</em>{\mathbf{u} \in U} \mathbf{u}$$
+Feed the unit vector $(\mathbf{c}_{\text{unexplored}} - \mathbf{p}_i) / |\dots|$ into the drone's observation vector so the policy has an explicit directional gradient to follow when searching unexplored sectors.</li>
+</ul>
+<h3>7.4. Heterogeneous Drone Swarm Roles</h3>
+<ul>
+<li>Differentiate the swarm into:
+<ul>
+<li><strong>Scout Crazyflies</strong>: Small, lightweight, high speed ($3.5\text{ m/s}$), small battery, dedicated to valley exploration.</li>
+<li><strong>Gateway Heavy-Lifters</strong>: Larger quadcopters carrying high-gain directional antennas, high battery capacity, dedicated to high-altitude ridge hovering.</li>
+</ul>
+</li>
+</ul>
+<h3>7.5. Three.js / WebGL 3D Browser Digital Twin</h3>
+<ul>
+<li>Expand the web-based Mission Control Center with a full 3D interactive terrain twin using <strong>Three.js</strong> or <strong>Babylon.js</strong>, allowing users to fly through the mountain terrain directly in their browser without requiring local PyBullet GUI dependencies.</li>
+</ul>
+<h3>7.6. Hardware-in-the-Loop (HIL) Satellite Testbed</h3>
+<ul>
+<li>Replace the synthetic FSPL link budget in <code>envs/network.py</code> with physical Software Defined Radio (SDR) or hardware serial telemetry from an actual benchtop CubeSat / Starlink receiver module.</li>
+</ul>
+<hr />
+<h2>8. Verification &amp; Quick-Start Execution Guide</h2>
+<h3>Start the Mission Operations Control Center (Web UI):</h3>
+<pre><code class="language-bash">python drone_mesh_rl/server/telemetry_server.py
+</code></pre>
+<p>Open <strong><code>http://localhost:8000</code></strong> in any web browser to view the interactive tactical radar, live satellite orbit passes, and drone battery telemetry.</p>
+<h3>Launch Headless MAPPO Swarm Training:</h3>
+<pre><code class="language-bash">python drone_mesh_rl/train.py --num_drones 5 --num_clusters 4 --total_timesteps 50000 --save_path drone_mesh_rl/models/mappo_drone_mesh.pt
+</code></pre>
+<h3>Benchmark Policy vs. Baseline:</h3>
+<pre><code class="language-bash">python drone_mesh_rl/evaluate.py --model_path drone_mesh_rl/models/mappo_drone_mesh.pt --episodes 10
+</code></pre>
+<h3>Launch Stabilized 3D PyBullet Visualizer:</h3>
+<pre><code class="language-bash">python drone_mesh_rl/visualize_env.py --model_path drone_mesh_rl/models/mappo_drone_mesh.pt
+</code></pre>
+<p><em>(Key controls: <code>Space</code> = Pause/Resume, <code>R</code> = Reset Episode, <code>Q</code> or <code>ESC</code> = Exit)</em></p>
+
+</body>
+</html>

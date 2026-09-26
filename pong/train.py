@@ -56,11 +56,15 @@ def train(target_episodes=200, speed=60, headless=False):
                     agent.save_model("model_best.pth")
                     is_new_record = True
 
-                if agent.n_games in (1, 10, 25, 50, 75, 100, 150, 200):
+                if agent.n_games % 100 == 0 or agent.n_games in (1, 10, 25, 50, 75, 100, 150, 200):
                     agent.save_model(f"model_ep{agent.n_games}.pth")
                     print(f">>> [Checkpoint Saved] models/model_ep{agent.n_games}.pth")
 
-                agent.save_model("model_latest.pth")
+                if agent.n_games % 10 == 0:
+                    try:
+                        agent.save_model("model_latest.pth")
+                    except RuntimeError as e:
+                        print(f"Warning: Failed to save model_latest.pth: {e}")
 
                 total_score += score
                 mean_score = total_score / agent.n_games
