@@ -95,7 +95,9 @@ _RUIN_CHUNK_RGB = (
 RUBBLE_TOWN_SIZE = 240.0
 RUBBLE_TOWN_GAP = 200.0
 RUBBLE_TOWN_SEED = 71
-_N_RUBBLE_SHELLS = 12
+_N_RUBBLE_SHELLS = 36
+_RUBBLE_PITCH = 28.0
+_RUBBLE_LINES = tuple(i * _RUBBLE_PITCH for i in range(-3, 4))
 _RUBBLE_H = (
     13.5,
     14.6,
@@ -114,23 +116,20 @@ _BROKEN_ROAD_TEX_NAME = "rubble_town_road.png"
 _BROKEN_ROAD_WIDTH = 6.4
 _BROKEN_ROAD_LIFT = 0.08
 _BROKEN_ROAD_HALF_THICK = 0.045
-# Two NS streets at ± this offset, plus one EW street through the center
-_RUBBLE_NS_OFF = 38.0
-# Relative lots: (dx, dy, sx, sy, open_side) along the 3-street grid
-_RUBBLE_LOTS = (
-    (-49.9, -72.0, 16.0, 14.0, "e"),
-    (-26.1, -28.0, 16.0, 14.0, "w"),
-    (-49.9, 28.0, 16.0, 14.0, "e"),
-    (-26.1, 72.0, 16.0, 14.0, "w"),
-    (26.1, -72.0, 16.0, 14.0, "e"),
-    (49.9, -28.0, 16.0, 14.0, "w"),
-    (26.1, 28.0, 16.0, 14.0, "e"),
-    (49.9, 72.0, 16.0, 14.0, "w"),
-    (-82.0, -10.9, 16.0, 14.0, "n"),
-    (8.0, -10.9, 16.0, 14.0, "n"),
-    (-8.0, 10.9, 16.0, 14.0, "s"),
-    (82.0, 10.9, 16.0, 14.0, "s"),
-)
+def _rubble_lots():
+    """One shell in every block of the 28 m street grid."""
+    lines = _RUBBLE_LINES
+    sides = ("e", "n", "w", "s")
+    lots = []
+    for iy in range(len(lines) - 1):
+        for ix in range(len(lines) - 1):
+            dx = 0.5 * (lines[ix] + lines[ix + 1])
+            dy = 0.5 * (lines[iy] + lines[iy + 1])
+            lots.append((dx, dy, 15.0, 13.0, sides[(ix + iy) % 4]))
+    return tuple(lots)
+
+
+_RUBBLE_LOTS = _rubble_lots()
 
 
 def find_flattest_square(terrain, size=DISTRICT_SIZE):
@@ -646,8 +645,166 @@ def _ruin_piece(terrain, cx, cy, hx, hy, hz, orn, rgba, kind, lift=0.0):
     }
 
 
-def _build_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, buildings, cars):
+def _build_varied_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, buildings, cars):
+    """A charred shell whose walls, slab, and debris are not a rotated copy."""
+    rng = np.random.default_rng(50_003 + int(index) * 97)
+    hx, hy = 0.5 * sx, 0.5 * sy
+    xmin, xmax = cx - hx, cx + hx
+    ymin, ymax = cy - hy, cy + hy
+    t = float(rng.uniform(0.38, 0.85))
+    z0 = _support_z(
+        terrain,
+        [(xmin, ymin), (xmax, ymin), (xmin, ymax), (xmax, ymax), (cx, cy)],
+    )
+    opposite = {"n": "s", "s": "n", "e": "w", "w": "e"}[open_side]
+    choices = [s for s in ("n", "s", "e", "w") if s != open_side]
+    rng.shuffle(choices)
+    n_walls = int(rng.integers(2, 4))
+    if opposite not in choices[:n_walls] and rng.random() < 0.7:
+        choices = [opposite] + [s for s in choices if s != opposite]
+    sides = choices[:n_walls]
+    yaw = float(rng.uniform(-0.22, 0.22))
+    orn = _quat_axis_angle(0.0, 0.0, 1.0, yaw)
+    pieces = []
+    for wi, side in enumerate(sides):
+        if side == "w":
+            x0, x1, y0, y1 = xmin, xmin + t, ymin, ymax
+        elif side == "e":
+            x0, x1, y0, y1 = xmax - t, xmax, ymin, ymax
+        elif side == "s":
+            x0, x1, y0, y1 = xmin, xmax, ymin, ymin + t
+        else:
+            x0, x1, y0, y1 = xmin, xmax, ymax - t, ymax
+        wh = height * float(rng.uniform(0.40, 1.0))
+        pieces.append(
+            _ruin_piece(
+                terrain,
+                0.5 * (x0 + x1),
+                0.5 * (y0 + y1),
+                0.5 * (x1 - x0),
+                0.5 * (y1 - y0),
+                0.5 * wh,
+                orn,
+                list(_RUIN_WALL_RGB[int(rng.integers(0, len(_RUIN_WALL_RGB)))]),
+                "wall",
+            )
+        )
+
+    ix0, ix1 = xmin + t, xmax - t
+    iy0, iy1 = ymin + t, ymax - t
+    span_x, span_y = max(ix1 - ix0, 1.0), max(iy1 - iy0, 1.0)
+    frac = float(rng.uniform(0.35, 0.78))
+    if open_side == "e":
+        fx0, fx1, fy0, fy1 = ix0, ix0 + frac * span_x, iy0, iy1
+    elif open_side == "w":
+        fx0, fx1, fy0, fy1 = ix1 - frac * span_x, ix1, iy0, iy1
+    elif open_side == "n":
+        fx0, fx1, fy0, fy1 = ix0, ix1, iy0, iy0 + frac * span_y
+    else:
+        fx0, fx1, fy0, fy1 = ix0, ix1, iy1 - frac * span_y, iy1
+    pieces.append(
+        _ruin_piece(
+            terrain,
+            0.5 * (fx0 + fx1),
+            0.5 * (fy0 + fy1),
+            0.5 * (fx1 - fx0),
+            0.5 * (fy1 - fy0),
+            float(rng.uniform(0.16, 0.34)),
+            orn,
+            list(_RUIN_SLAB_RGB),
+            "floor",
+            lift=height * float(rng.uniform(0.22, 0.62)),
+        )
+    )
+
+    tip = math.radians(float(rng.uniform(24.0, 56.0)))
+    length = float(rng.uniform(6.4, 11.2))
+    width = float(rng.uniform(4.0, 7.2))
+    thick = float(rng.uniform(0.38, 0.7))
+    if open_side in ("e", "w"):
+        sign = 1.0 if open_side == "e" else -1.0
+        tcx = (xmax if open_side == "e" else xmin) + sign * float(rng.uniform(0.6, 2.8))
+        tcy = cy + float(rng.uniform(-2.5, 2.5))
+        tip_orn = _quat_axis_angle(0.0, 1.0, 0.0, sign * tip)
+        thx, thy, thz = 0.5 * length, 0.5 * width, 0.5 * thick
+    else:
+        sign = 1.0 if open_side == "n" else -1.0
+        tcx = cx + float(rng.uniform(-2.5, 2.5))
+        tcy = (ymax if open_side == "n" else ymin) + sign * float(rng.uniform(0.6, 2.8))
+        tip_orn = _quat_axis_angle(1.0, 0.0, 0.0, -sign * tip)
+        thx, thy, thz = 0.5 * width, 0.5 * length, 0.5 * thick
+    pieces.append(
+        _ruin_piece(terrain, tcx, tcy, thx, thy, thz, tip_orn, list(_RUIN_SLAB_RGB), "tip")
+    )
+
+    n_chunks = int(rng.integers(4, 7))
+    catalog = (
+        (3.6, 3.1, 1.7),
+        (4.4, 3.2, 2.4),
+        (3.2, 4.1, 1.5),
+        (5.1, 3.4, 2.2),
+        (3.8, 3.8, 1.9),
+        (4.6, 2.9, 2.6),
+    )
+    order = rng.permutation(len(catalog))
+    for ci in range(n_chunks):
+        full = catalog[int(order[ci])]
+        chx = 0.5 * full[0] * float(rng.uniform(0.85, 1.15))
+        chy = 0.5 * full[1] * float(rng.uniform(0.85, 1.15))
+        chx = max(chx, 1.6)
+        chy = max(chy, 1.6)
+        ang = float(rng.uniform(0.0, 2.0 * math.pi))
+        rad = float(rng.uniform(0.15 * min(sx, sy), 0.55 * min(sx, sy)))
+        px = cx + math.cos(ang) * rad
+        py = cy + math.sin(ang) * rad
+        if open_side == "e":
+            px += float(rng.uniform(0.0, 3.0))
+        elif open_side == "w":
+            px -= float(rng.uniform(0.0, 3.0))
+        elif open_side == "n":
+            py += float(rng.uniform(0.0, 3.0))
+        else:
+            py -= float(rng.uniform(0.0, 3.0))
+        crect = (px - chx, py - chy, px + chx, py + chy)
+        if not _footprint_clear(crect, buildings, cars, None, [], gap_b=0.0, gap_c=0.15):
+            px = 0.55 * px + 0.45 * cx
+            py = 0.55 * py + 0.45 * cy
+        pieces.append(
+            _ruin_piece(
+                terrain,
+                px,
+                py,
+                chx,
+                chy,
+                0.5 * full[2],
+                _quat_axis_angle(0.0, 0.0, 1.0, float(rng.uniform(-0.8, 0.8))),
+                list(_RUIN_CHUNK_RGB[ci % len(_RUIN_CHUNK_RGB)]),
+                "chunk",
+            )
+        )
+
+    return {
+        "cx": float(cx),
+        "cy": float(cy),
+        "sx": float(sx),
+        "sy": float(sy),
+        "height": float(height),
+        "z0": float(z0),
+        "xmin": float(xmin),
+        "xmax": float(xmax),
+        "ymin": float(ymin),
+        "ymax": float(ymax),
+        "open_side": open_side,
+        "pieces": pieces,
+    }
+
+
+def _build_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, buildings, cars, vary=False):
     """Broken shell: 2–3 walls, one attached floor, one tipped slab, 4–6 chunks."""
+    if vary:
+        return _build_varied_ruin_shell(
+            terrain, cx, cy, sx, sy, height, open_side, index, buildings, cars
+        )
     index = int(index) % 4
     hx, hy = 0.5 * sx, 0.5 * sy
     xmin, xmax = cx - hx, cx + hx
@@ -723,7 +880,7 @@ def _build_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, buildin
     )
 
     # Tipped floor slab, 30–50°, into the street through the missing wall
-    tip = math.radians(_RUIN_TIP_DEG[index])
+    tip = math.radians(_RUIN_TIP_DEG[index % len(_RUIN_TIP_DEG)])
     length, width, thick = 9.2, 5.8, 0.50
     if open_side in ("e", "w"):
         sign = 1.0 if open_side == "e" else -1.0
@@ -743,7 +900,7 @@ def _build_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, buildin
         )
     )
 
-    n_chunks = (5, 4, 6, 5)[index]
+    n_chunks = (5, 4, 6, 5)[index % 4]
     chunk_sizes = (
         (3.5, 3.2, 1.9),
         (4.2, 3.4, 2.3),
@@ -1327,84 +1484,267 @@ def _broken_road_texture_path(filename=_BROKEN_ROAD_TEX_NAME, tex_w=96, tex_h=25
     return path
 
 
-def _layout_broken_streets(terrain, center, size, seed=RUBBLE_TOWN_SEED):
-    """Three short streets (2 NS + 1 EW) of longer gapped, tilted cracked slabs."""
-    cx, cy = float(center[0]), float(center[1])
-    reach = 0.5 * size - 16.0
-    rng = np.random.default_rng(int(seed) + 3)
-    hw = 0.5 * _BROKEN_ROAD_WIDTH
-    hz = _BROKEN_ROAD_HALF_THICK
-    gap_at = hw + 1.0
-    ns_w = cx - _RUBBLE_NS_OFF
-    ns_e = cx + _RUBBLE_NS_OFF
-    slabs = []
+def _bezier(p0, p1, p2, p3, n=28):
+    pts = []
+    for i in range(n):
+        t = i / (n - 1)
+        u = 1.0 - t
+        pts.append((
+            u ** 3 * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t ** 3 * p3[0],
+            u ** 3 * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t ** 3 * p3[1],
+        ))
+    return pts
 
-    def add_run(along, coord, t0, t1):
-        t = float(t0)
-        while t < t1 - 8.0:
-            length = float(rng.uniform(14.0, 24.0))
-            gap = float(rng.uniform(0.55, 1.35))
-            t1s = min(t + length, float(t1))
-            if t1s - t < 8.0:
+
+def _rubble_curves(center, size, seed):
+    """Two bends only: a gentle avenue and a short corner connector."""
+    rng = np.random.default_rng(int(seed) + 23)
+    cx, cy = float(center[0]), float(center[1])
+    h = 0.5 * float(size) - 28.0
+    bow = float(rng.uniform(22.0, 34.0))
+    return [
+        _bezier(
+            (cx - 6.0, cy - 0.85 * h),
+            (cx + bow, cy - 0.25 * h),
+            (cx + bow, cy + 0.25 * h),
+            (cx - 4.0, cy + 0.85 * h),
+            n=22,
+        ),
+        _bezier(
+            (cx - 0.72 * h, cy - 0.08 * h),
+            (cx - 0.58 * h, cy - 0.42 * h),
+            (cx - 0.22 * h, cy - 0.55 * h),
+            (cx + 0.05 * h, cy - 0.78 * h),
+            n=16,
+        ),
+    ]
+
+
+def _resample_polyline(points, step):
+    """Evenly spaced samples, keeping the original corners."""
+    pts = [(float(x), float(y)) for x, y in points]
+    if len(pts) < 2:
+        return pts
+    out = [pts[0]]
+    remain = float(step)
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        seg = math.hypot(dx, dy)
+        if seg < 1e-6:
+            continue
+        ux, uy = dx / seg, dy / seg
+        traveled = 0.0
+        while traveled + remain <= seg + 1e-6:
+            traveled += remain
+            if traveled >= seg - 1e-4:
                 break
-            mid = 0.5 * (t + t1s)
-            tilt = math.radians(float(rng.choice([-1.0, 1.0])) * rng.uniform(1.8, 5.5))
-            if along == "y":
-                scx, scy = coord, mid
-                hx, hy = hw, 0.5 * (t1s - t)
-                orn = _quat_axis_angle(0.0, 1.0, 0.0, tilt)
-            else:
-                scx, scy = mid, coord
-                hx, hy = 0.5 * (t1s - t), hw
-                orn = _quat_axis_angle(1.0, 0.0, 0.0, tilt)
-            z = _sit_oriented(terrain, scx, scy, hx, hy, hz, orn) + _BROKEN_ROAD_LIFT
-            slabs.append(
-                {
-                    "along": along,
-                    "cx": float(scx),
-                    "cy": float(scy),
-                    "hx": float(hx),
-                    "hy": float(hy),
-                    "hz": float(hz),
-                    "z": float(z),
-                    "orn": list(orn),
-                    "xmin": float(scx - hx),
-                    "xmax": float(scx + hx),
-                    "ymin": float(scy - hy),
-                    "ymax": float(scy + hy),
-                }
-            )
-            t = t1s + gap
-
-    add_run("y", ns_w, cy - reach, cy - gap_at)
-    add_run("y", ns_w, cy + gap_at, cy + reach)
-    add_run("y", ns_e, cy - reach, cy - gap_at)
-    add_run("y", ns_e, cy + gap_at, cy + reach)
-    add_run("x", cy, cx - reach, ns_w - gap_at)
-    add_run("x", cy, ns_w + gap_at, ns_e - gap_at)
-    add_run("x", cy, ns_e + gap_at, cx + reach)
-    return slabs
+            out.append((x0 + ux * traveled, y0 + uy * traveled))
+            remain = float(step)
+        remain -= seg - traveled
+        if remain <= 1e-4:
+            remain = float(step)
+        if math.hypot(out[-1][0] - x1, out[-1][1] - y1) > 0.4:
+            out.append((x1, y1))
+    return out
 
 
-def _layout_rubble_shells(terrain, center):
-    """Twelve charred shells along the three-street broken grid."""
+def _dist_to_polyline(px, py, pts):
+    best = 1e9
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        seg2 = dx * dx + dy * dy
+        if seg2 < 1e-8:
+            dist = math.hypot(px - x0, py - y0)
+        else:
+            t = max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / seg2))
+            dist = math.hypot(px - (x0 + t * dx), py - (y0 + t * dy))
+        if dist < best:
+            best = dist
+    return best
+
+
+def _road_ribbon(terrain, points, z_lift):
+    """One mesh for a whole street, so the asphalt is a single surface."""
+    samples = _resample_polyline(points, 3.0)
+    if len(samples) < 2:
+        return None
+    half_w = 0.5 * _BROKEN_ROAD_WIDTH
+    thick = 0.05
+    n = len(samples)
+    left, right, dist_along = [], [], []
+    traveled = 0.0
+    for i, (x, y) in enumerate(samples):
+        if i == 0:
+            tx, ty = samples[1][0] - x, samples[1][1] - y
+        elif i == n - 1:
+            tx, ty = x - samples[i - 1][0], y - samples[i - 1][1]
+        else:
+            tx = samples[i + 1][0] - samples[i - 1][0]
+            ty = samples[i + 1][1] - samples[i - 1][1]
+        ln = math.hypot(tx, ty) or 1.0
+        nx, ny = -ty / ln, tx / ln
+        scale = 1.0
+        if 0 < i < n - 1:
+            pdx = x - samples[i - 1][0]
+            pdy = y - samples[i - 1][1]
+            pl = math.hypot(pdx, pdy) or 1.0
+            dot = nx * (-pdy / pl) + ny * (pdx / pl)
+            scale = min(2.0, 1.0 / max(abs(dot), 0.45))
+        left.append((x + nx * half_w * scale, y + ny * half_w * scale))
+        right.append((x - nx * half_w * scale, y - ny * half_w * scale))
+        if i:
+            traveled += math.hypot(x - samples[i - 1][0], y - samples[i - 1][1])
+        dist_along.append(traveled)
+
+    verts, uvs = [], []
+    for i in range(n):
+        lx, ly = left[i]
+        rx, ry = right[i]
+        zl = _sample_heightmap(terrain, lx, ly) + z_lift
+        zr = _sample_heightmap(terrain, rx, ry) + z_lift
+        v = dist_along[i] / _ROAD_REPEAT_M
+        verts.append([lx, ly, zl])
+        uvs.append([0.0, v])
+        verts.append([rx, ry, zr])
+        uvs.append([1.0, v])
+    bot = len(verts)
+    for i in range(n):
+        lx, ly, zl = verts[2 * i]
+        rx, ry, zr = verts[2 * i + 1]
+        v = uvs[2 * i][1]
+        verts.append([lx, ly, zl - thick])
+        uvs.append([0.0, v])
+        verts.append([rx, ry, zr - thick])
+        uvs.append([1.0, v])
+
+    indices = []
+    for i in range(n - 1):
+        a, b = 2 * i, 2 * i + 1
+        c, d = 2 * (i + 1), 2 * (i + 1) + 1
+        indices.extend([a, b, d, a, d, c])
+        ba, bb, bc, bd = bot + a, bot + b, bot + c, bot + d
+        indices.extend([ba, bd, bb, ba, bc, bd])
+    xs = [p[0] for p in left + right]
+    ys = [p[1] for p in left + right]
+    return {
+        "ribbon": True,
+        "verts": verts,
+        "indices": indices,
+        "uvs": uvs,
+        "along": "y",
+        "cx": float(sum(xs) / len(xs)),
+        "cy": float(sum(ys) / len(ys)),
+        "hx": float(0.5 * (max(xs) - min(xs))),
+        "hy": float(0.5 * (max(ys) - min(ys))),
+        "hz": float(thick),
+        "z": float(z_lift),
+        "orn": [0.0, 0.0, 0.0, 1.0],
+        "xmin": float(min(xs)),
+        "xmax": float(max(xs)),
+        "ymin": float(min(ys)),
+        "ymax": float(max(ys)),
+        "centerline": samples,
+    }
+
+
+def _city_block_axes(center, size, seed):
+    """Mostly even streets, with a little stagger so the blocks are not identical."""
+    rng = np.random.default_rng(int(seed) + 19)
+    pitch = 34.0
+    n = 6
+    span = (n - 1) * pitch
+    base = np.linspace(-0.5 * span, 0.5 * span, n)
     cx, cy = float(center[0]), float(center[1])
+    ns = cx + base + rng.normal(0.0, 1.6, n)
+    ew = cy + base + rng.normal(0.0, 1.6, n)
+    return ns, ew
+
+
+def _rubble_road_lines(center, size, seed):
+    """Grid polylines plus two bends. Each entry is one continuous street."""
+    cx, cy = float(center[0]), float(center[1])
+    reach = 0.5 * float(size) - 18.0
+    ns, ew = _city_block_axes(center, size, seed)
+    y0, y1 = cy - reach, cy + reach
+    x0, x1 = cx - reach, cx + reach
+    lines = []
+    for i, coord in enumerate(ns):
+        if i == 1:
+            lines.append(([(coord, y0), (coord, cy - 6.0)], 0.08))
+        elif i == 3:
+            lines.append((
+                [(coord, y0), (coord, cy - 10.0), (coord + 11.0, cy + 10.0), (coord + 11.0, y1)],
+                0.08,
+            ))
+        else:
+            lines.append(([(coord, y0), (coord, y1)], 0.08))
+    for i, coord in enumerate(ew):
+        if i == 2:
+            lines.append(([(x0, coord), (cx - 18.0, coord)], 0.10))
+            lines.append(([(cx + 18.0, coord), (x1, coord)], 0.10))
+        else:
+            lines.append(([(x0, coord), (x1, coord)], 0.10))
+    for curve in _rubble_curves(center, size, seed):
+        lines.append((curve, 0.13))
+    return lines
+
+
+def _layout_broken_streets(terrain, center, size, seed=RUBBLE_TOWN_SEED):
+    """Continuous streets: a block grid, one jog, one dead end, one gap, two bends."""
+    roads = []
+    for points, lift in _rubble_road_lines(center, size, seed):
+        ribbon = _road_ribbon(terrain, points, lift)
+        if ribbon is not None:
+            roads.append(ribbon)
+    return roads
+
+
+def _near_roads(px, py, lines, clearance):
+    for points, _lift in lines:
+        if _dist_to_polyline(px, py, points) < clearance:
+            return True
+    return False
+
+
+def _layout_rubble_shells(terrain, center, size, seed):
+    """One ruin in most blocks. A few lots stay empty, and the bends stay clear."""
+    rng = np.random.default_rng(int(seed) + 41)
+    cx, cy = float(center[0]), float(center[1])
+    half = 0.5 * float(size)
+    xs, ys = _city_block_axes(center, size, seed)
+    lines = _rubble_road_lines(center, size, seed)
+    empty = {(1, 2), (3, 0)}
+    sides = ("n", "s", "e", "w")
     ruins = []
-    for i, (dx, dy, sx, sy, open_side) in enumerate(_RUBBLE_LOTS):
-        ruins.append(
-            _build_ruin_shell(
-                terrain,
-                cx + dx,
-                cy + dy,
-                sx,
-                sy,
-                float(_RUBBLE_H[i]),
-                open_side,
-                i,
-                [],
-                [],
+    for iy in range(len(ys) - 1):
+        for ix in range(len(xs) - 1):
+            if (ix, iy) in empty:
+                continue
+            cell_w = float(xs[ix + 1] - xs[ix])
+            cell_h = float(ys[iy + 1] - ys[iy])
+            sx = float(np.clip(0.48 * cell_w, 11.0, 16.5))
+            sy = float(np.clip(0.48 * cell_h, 10.0, 15.5))
+            px = 0.5 * (xs[ix] + xs[ix + 1]) + float(rng.uniform(-2.5, 2.5))
+            py = 0.5 * (ys[iy] + ys[iy + 1]) + float(rng.uniform(-2.5, 2.5))
+            px = float(np.clip(px, cx - half + 0.5 * sx + 2.0, cx + half - 0.5 * sx - 2.0))
+            py = float(np.clip(py, cy - half + 0.5 * sy + 2.0, cy + half - 0.5 * sy - 2.0))
+            if _near_roads(px, py, lines, 8.0):
+                continue
+            ruins.append(
+                _build_ruin_shell(
+                    terrain,
+                    px,
+                    py,
+                    sx,
+                    sy,
+                    float(rng.uniform(12.0, 18.0)),
+                    sides[(ix + 2 * iy) % 4],
+                    len(ruins),
+                    [],
+                    [],
+                    vary=True,
+                )
             )
-        )
     return ruins
 
 
@@ -1421,9 +1761,9 @@ def _print_rubble_town(town):
 
 
 def verify_rubble_town(town, district):
-    """Numeric checks: 12 shells, 220–250 m square, ≥200 m from the district AABB."""
-    if len(town.ruins) != _N_RUBBLE_SHELLS:
-        raise RuntimeError(f"expected {_N_RUBBLE_SHELLS} rubble shells, got {len(town.ruins)}")
+    """Numeric checks: a full ruined block, 220–250 m square, ≥200 m from the district."""
+    if not (18 <= len(town.ruins) <= 42):
+        raise RuntimeError(f"expected 18–42 rubble shells, got {len(town.ruins)}")
     if not (220.0 <= town.size <= 250.0):
         raise RuntimeError(f"rubble town size {town.size:.0f} m not in 220–250 m")
     half = 0.5 * town.size
@@ -1463,7 +1803,7 @@ def verify_rubble_town(town, district):
 
 
 class RubbleTownLayout:
-    """~240 m collapsed town: twelve reused ruin shells and broken streets only."""
+    """~240 m collapsed town: a block grid with two bends and a few broken streets."""
 
     def __init__(self, terrain, district, scenery=None, size=RUBBLE_TOWN_SIZE, seed=RUBBLE_TOWN_SEED):
         self.size = float(size)
@@ -1489,7 +1829,7 @@ class RubbleTownLayout:
             f"slope={self.mean_slope:.4f}  relief={self.relief:.2f} m"
         )
         self.roads = _layout_broken_streets(terrain, self.center, self.size, self.seed)
-        self.ruins = _layout_rubble_shells(terrain, self.center)
+        self.ruins = _layout_rubble_shells(terrain, self.center, self.size, self.seed)
         self.ground_z = _sample_heightmap(terrain, self.center[0], self.center[1])
         _print_rubble_town(self)
         verify_rubble_town(self, district)
@@ -1844,7 +2184,7 @@ def spawn_district_in_pybullet(client, district, window_tex=None, road_tex=None)
 
 
 def spawn_rubble_town_in_pybullet(client, town):
-    """Broken cracked-road slabs plus twelve reused ruin shells. No intact buildings."""
+    """Continuous cracked-asphalt streets plus the ruined shells. No intact buildings."""
     road_path = _broken_road_texture_path()
     try:
         road_tex = p.loadTexture(road_path, physicsClientId=client)
@@ -1853,9 +2193,16 @@ def spawn_rubble_town_in_pybullet(client, town):
 
     road_bodies = []
     for slab in town.roads:
-        verts, indices, uvs = _road_slab_geometry(
-            slab["hx"], slab["hy"], slab.get("hz", _BROKEN_ROAD_HALF_THICK), slab["along"]
-        )
+        if slab.get("ribbon"):
+            verts, indices, uvs = slab["verts"], slab["indices"], slab["uvs"]
+            pos = [0.0, 0.0, 0.0]
+            orn = [0.0, 0.0, 0.0, 1.0]
+        else:
+            verts, indices, uvs = _road_slab_geometry(
+                slab["hx"], slab["hy"], slab.get("hz", _BROKEN_ROAD_HALF_THICK), slab["along"]
+            )
+            pos = [slab["cx"], slab["cy"], slab["z"]]
+            orn = slab.get("orn", [0.0, 0.0, 0.0, 1.0])
         vis = p.createVisualShape(
             p.GEOM_MESH,
             vertices=verts,
@@ -1868,8 +2215,8 @@ def spawn_rubble_town_in_pybullet(client, town):
             baseMass=0,
             baseCollisionShapeIndex=-1,
             baseVisualShapeIndex=vis,
-            basePosition=[slab["cx"], slab["cy"], slab["z"]],
-            baseOrientation=slab.get("orn", [0.0, 0.0, 0.0, 1.0]),
+            basePosition=pos,
+            baseOrientation=orn,
             physicsClientId=client,
         )
         if road_tex >= 0:

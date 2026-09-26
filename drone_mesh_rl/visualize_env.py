@@ -11,6 +11,7 @@ Usage:
   cd drone_mesh_rl && python3 visualize_env.py
   cd drone_mesh_rl && python3 visualize_env.py --headless   # load/spawn check only
   cd drone_mesh_rl && python3 visualize_env.py --procedural # old metro scene
+  cd drone_mesh_rl && python3 visualize_env.py --rubble     # dense rubble town only
 """
 
 
@@ -88,6 +89,11 @@ def parse_args():
         "--procedural",
         action="store_true",
         help="Load the procedural two-downtown metro instead of the DEM",
+    )
+    parser.add_argument(
+        "--rubble",
+        action="store_true",
+        help="Show only the dense rubble town on the DEM",
     )
     return parser.parse_args()
 
@@ -473,6 +479,81 @@ def clear_world(client):
             pass
 
 
+def frame_rubble_camera(client, town):
+    """Overview of the whole rubble town, not a single shell."""
+    cx, cy = town.center
+    target = np.array([cx, cy, float(town.ground_z) + 10.0], dtype=np.float64)
+    dist = max(340.0, float(town.size) * 1.45)
+    yaw, pitch = 32.0, -48.0
+    p.resetDebugVisualizerCamera(
+        cameraDistance=dist,
+        cameraYaw=yaw,
+        cameraPitch=pitch,
+        cameraTargetPosition=target.tolist(),
+        physicsClientId=client,
+    )
+    print(
+        f"[CAMERA] rubble yaw={yaw:g} pitch={pitch:g} dist={dist:.0f} m  "
+        f"target=({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f})  "
+        f"shells={len(town.ruins)}"
+    )
+    return yaw, pitch, dist, target
+
+
+def spawn_city_pad(client, terrain, center, size, margin=6.0):
+    """Heightfield cropped to the city square. The surrounding DEM is not drawn."""
+    cx, cy = float(center[0]), float(center[1])
+    half = 0.5 * float(size) + margin
+    xs, ys = terrain.vertex_axes()
+    j = np.flatnonzero((xs >= cx - half) & (xs <= cx + half))
+    i = np.flatnonzero((ys >= cy - half) & (ys <= cy + half))
+    if j.size < 2 or i.size < 2:
+        raise RuntimeError("rubble city does not fit on the heightmap")
+    patch = np.ascontiguousarray(terrain.heightmap[i[0] : i[-1] + 1, j[0] : j[-1] + 1])
+    pcx = 0.5 * (float(xs[j[0]]) + float(xs[j[-1]]))
+    pcy = 0.5 * (float(ys[i[0]]) + float(ys[i[-1]]))
+    mid = 0.5 * (float(patch.min()) + float(patch.max()))
+    shape = p.createCollisionShape(
+        p.GEOM_HEIGHTFIELD,
+        meshScale=[float(terrain.resolution_x), float(terrain.resolution_y), 1.0],
+        heightfieldData=patch.ravel().tolist(),
+        numHeightfieldRows=int(patch.shape[1]),
+        numHeightfieldColumns=int(patch.shape[0]),
+        heightfieldTextureScaling=1.0,
+        physicsClientId=client,
+    )
+    body = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=shape,
+        basePosition=[pcx, pcy, mid],
+        physicsClientId=client,
+    )
+    p.changeVisualShape(
+        body, -1, rgbaColor=[0.36, 0.32, 0.28, 1.0], physicsClientId=client
+    )
+    print(
+        f"[RUBBLE-ONLY] city pad {patch.shape[1]}x{patch.shape[0]} cells "
+        f"({2 * half:.0f} m), surrounding terrain omitted"
+    )
+    return body
+
+
+def build_rubble_only(client, dem_path):
+    """Rubble town on a city-sized pad. The intact district and hills are not drawn."""
+    t0 = time.perf_counter()
+    terrain = Terrain.from_dem(dem_path)
+    district = DistrictLayout(terrain)
+    rubble_town = RubbleTownLayout(terrain, district, scenery=None)
+    spawn_city_pad(client, terrain, rubble_town.center, rubble_town.size)
+    spawn_rubble_town_in_pybullet(client, rubble_town)
+    print(
+        f"[RUBBLE-ONLY] shells={len(rubble_town.ruins)}  "
+        f"roads={len(rubble_town.roads)}  "
+        f"place+spawn={time.perf_counter() - t0:.3f}s"
+    )
+    return terrain, rubble_town
+
+
 def main():
     args = parse_args()
     # macOS has no DISPLAY (X11); only --headless opts out of the GUI.
@@ -480,6 +561,8 @@ def main():
     print("=" * 65)
     if args.procedural:
         print(" [3D METRO VIEWER] Two-downtown spectator")
+    elif args.rubble:
+        print(" [3D RUBBLE TOWN] Dense collapsed city only")
     else:
         print(" [3D TERRAIN VIEWER] USGS elevation + one district + scenery")
     if not gui:
@@ -506,7 +589,19 @@ def main():
     use_dem = not args.procedural
     dem_path = None
     move_speed = _SPEC_MOVE_SPEED
-    if use_dem:
+    rubble_town = None
+    district = None
+    districts = []
+    scenery = {}
+    if args.rubble:
+        dem_path = args.dem or find_dem_file()
+        terrain, rubble_town = build_rubble_only(client, dem_path)
+        move_speed = dem_move_speed(terrain)
+        print(
+            f"[SPECTATOR] move speed {move_speed:.2f} m/poll "
+            f"(x{_SPEC_FAST_MULT:g} with Left Ctrl) at {args.fps:g} FPS"
+        )
+    elif use_dem:
         dem_path = args.dem or find_dem_file()
         terrain, district, districts, scenery = build_dem_world(client, dem_path)
         move_speed = dem_move_speed(terrain)
@@ -531,7 +626,9 @@ def main():
             )
 
     if not gui:
-        if use_dem:
+        if args.rubble:
+            frame_rubble_camera(client, rubble_town)
+        elif use_dem:
             frame_district_camera(client, district)
         print("[VISUALIZER] Headless check done (GUI not opened).")
         try:
@@ -541,7 +638,7 @@ def main():
         return
 
     hud = None
-    if use_dem:
+    if use_dem and not args.rubble:
         hud = spawn_minimap_hud(client, terrain, districts, scenery)
 
     def sync_minimap(eye_xyz, yaw_deg, pitch_deg):
@@ -556,6 +653,8 @@ def main():
         The GUI applies resetDebugVisualizerCamera asynchronously, so reading
         the camera straight back can return the previous pose.
         """
+        if args.rubble:
+            return frame_rubble_camera(client, rubble_town)
         if use_dem:
             return frame_district_camera(client, district)
         # Overview near the west downtown
@@ -598,7 +697,11 @@ def main():
                 print(f"[{'PAUSED' if paused else 'RESUMED'}]")
             if _key_triggered(keys, ord("r")) or _key_triggered(keys, ord("R")):
                 clear_world(client)
-                if use_dem:
+                if args.rubble:
+                    print("[RESET] Reloading the rubble town...")
+                    terrain, rubble_town = build_rubble_only(client, dem_path)
+                    hud = None
+                elif use_dem:
                     print("[RESET] Reloading DEM, district, and reframing...")
                     terrain, district, districts, scenery = build_dem_world(
                         client, dem_path
