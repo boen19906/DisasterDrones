@@ -1269,10 +1269,13 @@ def spawn_terrain_in_pybullet(client, terrain):
     if texture_id >= 0:
         p.changeVisualShape(
             body, -1, rgbaColor=[1, 1, 1, 1], textureUniqueId=texture_id,
+            specularColor=[0.08, 0.08, 0.08],
             physicsClientId=client,
         )
     else:
         p.changeVisualShape(
-            body, -1, rgbaColor=[*_GRASS_RGB, 1.0], physicsClientId=client
+            body, -1, rgbaColor=[*_GRASS_RGB, 1.0],
+            specularColor=[0.08, 0.08, 0.08],
+            physicsClientId=client,
         )
     return body

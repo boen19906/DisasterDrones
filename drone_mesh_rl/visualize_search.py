@@ -32,6 +32,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from envs.disaster_env import DisasterMeshEnv
 from envs.search_env import SurvivorSearchEnv
+from envs.town import apply_spectator_sun
 from visualize_rubble import (
     _SPEC_MOVE_SPEED,
     enter_spectator_fly,
@@ -68,6 +69,11 @@ def parse_args():
         default="model",
         choices=["sweep", "model"],
         help="search: sweep = scripted lawnmower. model = learned MAPPO (default)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Skip GUI: DIRECT lighting check, then exit",
     )
     return parser.parse_args()
 
@@ -485,6 +491,15 @@ class SearchDroneLabels:
 
 def main():
     args = parse_args()
+    if args.headless:
+        client = p.connect(p.DIRECT)
+        apply_spectator_sun(client, shadows=False, spawn_disc=False)
+        print("[VISUALIZER] Headless check done (GUI not opened).")
+        try:
+            p.disconnect(physicsClientId=client)
+        except Exception:
+            pass
+        return
     if args.env_size is None:
         args.env_size = 250.0 if args.task == "search" else 100.0
     print("=" * 65)

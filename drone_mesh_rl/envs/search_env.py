@@ -52,7 +52,7 @@ from .district import (
 )
 from .survivors import SurvivorCluster
 from .terrain import Terrain, spawn_terrain_in_pybullet
-from .town import TownLayout
+from .town import TownLayout, apply_spectator_sun
 
 
 COVER_CROP = 7  # local visited-map window (odd)
@@ -1196,16 +1196,17 @@ class SurvivorSearchEnv(ParallelEnv):
         if self.render_mode == "human":
             self.client = p.connect(p.GUI)
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.client)
-            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=self.client)
             p.configureDebugVisualizer(
                 p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=self.client
             )
             p.configureDebugVisualizer(
                 p.COV_ENABLE_WIREFRAME, 0, physicsClientId=self.client
             )
+            apply_spectator_sun(self.client, shadows=True, spawn_disc=True)
             p.setRealTimeSimulation(0, physicsClientId=self.client)
         else:
             self.client = p.connect(p.DIRECT)
+            apply_spectator_sun(self.client, shadows=False, spawn_disc=False)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, 0, physicsClientId=self.client)
         p.setTimeStep(1.0 / self.pyb_freq, physicsClientId=self.client)

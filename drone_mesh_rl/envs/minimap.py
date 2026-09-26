@@ -269,6 +269,26 @@ def _arrow_mesh(scale):
     return verts, [0, 1, 2], normals
 
 
+def _protect_hud_overlay(client, body):
+    """Keep HUD readable under the town sun: no specular, no extra tint.
+
+    PyBullet has no per-body shadow flag. HUD meshes stay visual-only
+    (collision -1) and start parked off-map so they are not town casters.
+    Once attached they sit 2.4 m in front of the camera, inside the
+    camera-centered shadow volume; zero specular keeps the texture from
+    washing out or self-shadowing to black.
+    """
+    try:
+        p.changeVisualShape(
+            body,
+            -1,
+            specularColor=[0.0, 0.0, 0.0],
+            physicsClientId=client,
+        )
+    except Exception:
+        pass
+
+
 def spawn_minimap_hud(client, terrain, districts, scenery):
     """Create the static map panel and a tiny arrow. GUI only."""
     path, base = build_minimap_image(terrain, districts, scenery)
@@ -307,6 +327,7 @@ def spawn_minimap_hud(client, terrain, districts, scenery):
             -1,
             textureUniqueId=tex_id,
             rgbaColor=[1.0, 1.0, 1.0, 1.0],
+            specularColor=[0.0, 0.0, 0.0],
             flags=p.VISUAL_SHAPE_DOUBLE_SIDED,
             physicsClientId=client,
         )
@@ -329,6 +350,8 @@ def spawn_minimap_hud(client, terrain, districts, scenery):
         basePosition=_PARK,
         physicsClientId=client,
     )
+    _protect_hud_overlay(client, panel)
+    _protect_hud_overlay(client, arrow)
     hud = {
         "panel": panel,
         "arrow": arrow,
