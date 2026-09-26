@@ -2,8 +2,9 @@
 visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
 Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
-PyBullet heightfield (terrain body only, no town). --procedural restores the
-two-downtown metro. Camera-only loop (no drones).
+PyBullet heightfield, then tiles that patch 2x2 in memory (terrain body
+only, no town, roads, or props). --procedural restores the two-downtown
+metro. Camera-only loop (no drones).
 
 Usage:
   cd drone_mesh_rl && python3 visualize_env.py
@@ -313,10 +314,12 @@ def build_dem_world(client, dem_path):
         f"{px_x:.6g} x {px_y:.6g} {unit} (~{ncx:.2f} m E-W x {ncy:.2f} m N-S)"
     )
     print(f"[DEM] nodata filled={info['nodata_filled']} (nodata value {info['nodata_value']})")
+    tile_y, tile_x = getattr(terrain, "dem_tile", (1, 1))
     print(
         f"[DEM] grid={terrain.grid_x}x{terrain.grid_y} (x cols x y rows, "
-        f"downsample x{info['downsample']})  cell={terrain.resolution_x:.2f} x "
-        f"{terrain.resolution_y:.2f} m  world={terrain.size_x:.1f} x {terrain.size_y:.1f} m"
+        f"downsample x{info['downsample']}, tile {tile_x}x{tile_y})  "
+        f"cell={terrain.resolution_x:.2f} x {terrain.resolution_y:.2f} m  "
+        f"world={terrain.size_x:.1f} x {terrain.size_y:.1f} m"
     )
     print(
         f"[DEM] elevation min={zmin:.2f} m  max={zmax:.2f} m  relief={zmax - zmin:.2f} m  "
@@ -338,64 +341,64 @@ def dem_move_speed(terrain):
     return max(1.0, max(terrain.size_x, terrain.size_y) / 400.0)
 
 
-def frame_dem_camera(client, terrain):
-    """Overview looking north from south of center that fits the whole DEM.
-
-    The GUI's far clip plane is fixed (~1000 m), so the pitch steepens from
-    -60 toward top-down until every footprint corner is inside the frustum.
-    """
-    proj = None
+def _debug_far_plane(client, default=1000.0):
+    """Near/far from the active debug projection; GUI far is typically ~1000 m."""
     try:
         proj = p.getDebugVisualizerCamera(physicsClientId=client)[3]
     except Exception:
-        pass
+        proj = None
     if not proj or proj[0] <= 0:
-        proj = p.computeProjectionMatrixFOV(90.0, 4.0 / 3.0, 0.01, 1000.0)
+        return float(default)
     P = np.array(proj, dtype=np.float64).reshape(4, 4).T
     far = P[2, 3] / (P[2, 2] + 1.0)
+    if not np.isfinite(far) or far <= 0:
+        return float(default)
+    return float(far)
+
+
+def frame_dem_camera(client, terrain):
+    """Downward overview of the tiled DEM, kept inside the GUI far plane.
+
+    A 2x2 USGS world is ~3 km across, but the OpenGL GUI far clip is fixed
+    near 1000 m. Fitting every corner (the old approach) pushed the eye
+    past that clip at pitch -89, so the heightfield vanished. Aim at the
+    origin from the south, pitch about -40, and keep the look-at point
+    well inside the far plane so the land is visible on launch.
+    """
+    far = _debug_far_plane(client)
     top = float(terrain.heightmap.max())
-    target = [0.0, 0.0, 0.5 * top]
+    target = np.array([0.0, 0.0, max(8.0, 0.4 * top)], dtype=np.float64)
     yaw = 0.0
-    xs, ys = terrain.vertex_axes()
-    corners = np.array(
-        [[x, y, z, 1.0] for x in (xs[0], xs[-1]) for y in (ys[0], ys[-1]) for z in (0.0, top)]
-    )
+    pitch = -40.0
+    long_axis = max(float(terrain.size_x), float(terrain.size_y))
+    # Ideal orbit would be ~1.5x the long axis; clamp so the target stays
+    # in front of the far clip (otherwise the map is not drawn).
+    dist = min(1.5 * long_axis, 0.72 * far)
+    dist = max(dist, 250.0)
 
-    def fit(pitch):
-        """Smallest distance with all corners inside 90% of the view; max depth."""
-        dist = 0.1 * max(terrain.size_x, terrain.size_y)
-        for _ in range(400):
-            V = np.array(
-                p.computeViewMatrixFromYawPitchRoll(target, dist, yaw, pitch, 0.0, 2),
-                dtype=np.float64,
-            ).reshape(4, 4).T
-            clip = corners @ (P @ V).T
-            if np.all(clip[:, 3] > 0):
-                ndc = clip[:, :2] / clip[:, 3:4]
-                if np.max(np.abs(ndc)) <= 0.9:
-                    return dist, float(np.max(clip[:, 3]))
-            dist *= 1.03
-        return dist, float("inf")
+    eye = eye_from_camera(yaw, pitch, dist, target)
+    if eye[2] <= top + 15.0:
+        lift = (top + 25.0) - float(eye[2])
+        target = target.copy()
+        target[2] += lift
+        eye = eye_from_camera(yaw, pitch, dist, target)
 
-    for pitch in (-60.0, -65.0, -70.0, -75.0, -80.0, -85.0, -89.0):
-        dist, depth = fit(pitch)
-        if depth < 0.95 * far:
-            break
-    else:
-        print(
-            f"[CAMERA] DEM too large for the GUI far plane ({far:.0f} m); "
-            f"distant edges will clip at start"
-        )
     p.resetDebugVisualizerCamera(
         cameraDistance=dist,
         cameraYaw=yaw,
         cameraPitch=pitch,
-        cameraTargetPosition=target,
+        cameraTargetPosition=target.tolist(),
         physicsClientId=client,
     )
-    eye = eye_from_camera(yaw, pitch, dist, target)
+    print(
+        f"[CAMERA] overview yaw={yaw:g} pitch={pitch:g} dist={dist:.0f} m  "
+        f"eye=({eye[0]:.0f}, {eye[1]:.0f}, {eye[2]:.0f})  "
+        f"target=({target[0]:.0f}, {target[1]:.0f}, {target[2]:.0f})  "
+        f"far={far:.0f} m"
+    )
     assert eye[2] > top, "spectator must start above the highest terrain"
-    return yaw, pitch, dist, np.asarray(target, dtype=np.float64)
+    assert dist < far, "overview target must sit in front of the GUI far plane"
+    return yaw, pitch, dist, target
 
 
 def clear_world(client):
@@ -417,7 +420,7 @@ def main():
     if args.procedural:
         print(" [3D METRO VIEWER] Two-downtown spectator")
     else:
-        print(" [3D TERRAIN VIEWER] USGS elevation spectator")
+        print(" [3D TERRAIN VIEWER] USGS elevation spectator (2x2 tiled, no city)")
     if not gui:
         print(" --headless: timing/body-count check (p.DIRECT).")
     else:
