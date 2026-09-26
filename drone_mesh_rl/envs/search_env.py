@@ -22,7 +22,7 @@ Rewards:
 """
 
 import functools
-import importlib.util
+import math
 import os
 import time
 from heapq import heappop, heappush
@@ -55,7 +55,11 @@ COVER_CROP = 7  # local visited-map window (odd)
 GLOBAL_BINS = 8  # coarse coverage map shared by every drone and the critic
 N_ACTIONS = 9
 MAP_EDGE_MARGIN = 0.75  # fly almost to the pad wall so a 5 m sensor covers the rim
-DRONE_VISUAL_SCALE = 2.5
+PERSON_TARGET_H = 1.7
+DRONE_TARGET_LONG = 1.8
+_PERSON_LETTERS = tuple(chr(c) for c in range(ord("a"), ord("r") + 1))
+_MESH_RGBA = [1.0, 1.0, 1.0, 1.0]
+_CRASH_RGBA = [0.45, 0.06, 0.06, 1.0]
 CRASH_RANGE = 3.5
 BUILDING_RADIUS = 0.55  # lethal airframe radius
 BUILDING_HARD_M = 1.25  # refuse a heading that would clip this soon
@@ -98,6 +102,55 @@ _MOVE_HEADINGS = np.array(
 _HEADING_NORM = np.linalg.norm(_HEADING_XY, axis=1)
 _HEADING_NORM[_HEADING_NORM == 0.0] = 1.0
 _HEADING_XY = _HEADING_XY / _HEADING_NORM[:, None]
+
+
+def _obj_bounds(path):
+    xs, ys, zs = [], [], []
+    with open(path) as handle:
+        for line in handle:
+            if not line.startswith("v "):
+                continue
+            parts = line.split()
+            xs.append(float(parts[1]))
+            ys.append(float(parts[2]))
+            zs.append(float(parts[3]))
+    return {
+        "xmin": min(xs),
+        "xmax": max(xs),
+        "ymin": min(ys),
+        "ymax": max(ys),
+        "zmin": min(zs),
+        "zmax": max(zs),
+    }
+
+
+def _search_prefabs_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in (("..", "Prefabs"), ("..", "..", "Prefabs")):
+        cand = os.path.normpath(os.path.join(here, *rel))
+        if os.path.isdir(cand):
+            return cand
+    return os.path.normpath(os.path.join(here, "..", "Prefabs"))
+
+
+def _upright_fix_euler(bounds):
+    """Rotate the thin file axis onto world Z (Kenney Y-up uses +90 deg about X)."""
+    dx = bounds["xmax"] - bounds["xmin"]
+    dy = bounds["ymax"] - bounds["ymin"]
+    dz = bounds["zmax"] - bounds["zmin"]
+    thin = min((dx, "x"), (dy, "y"), (dz, "z"))[1]
+    if thin == "y":
+        return [math.pi / 2.0, 0.0, 0.0]
+    if thin == "x":
+        return [0.0, -math.pi / 2.0, 0.0]
+    return [0.0, 0.0, 0.0]
+
+
+def _mesh_yaw_orn(yaw):
+    """Y-up → Z-up, then world yaw. Same compose as scenery._q_yaw."""
+    q_fix = p.getQuaternionFromEuler([math.pi / 2.0, 0.0, 0.0])
+    q_yaw = p.getQuaternionFromEuler([0.0, 0.0, float(yaw)])
+    return p.multiplyTransforms([0, 0, 0], q_yaw, [0, 0, 0], q_fix)[1]
 
 
 class SurvivorSearchEnv(ParallelEnv):
@@ -200,11 +253,15 @@ class SurvivorSearchEnv(ParallelEnv):
         self.drone_ids = []
         self.terrain_body = None
         self.town = None
-        self.person_torso_ids = []
-        self.person_head_ids = []
-        self._person_vis_discovered = np.zeros(0, dtype=bool)
-        self.capsule_color_updates = 0
-        self.capsule_pose_updates = 0
+        self.person_ids = []
+        self._person_vis = []
+        self._person_ymin = []
+        self._person_scale = []
+        self._drone_vis = -1
+        self._drone_yaw = np.zeros(num_drones, dtype=np.float64)
+        self._drone_crash_tinted = np.zeros(num_drones, dtype=bool)
+        self._drone_fix_euler = [math.pi / 2.0, 0.0, 0.0]
+        self._drone_yaw_offset = 0.5 * math.pi
 
         self._observation_spaces = {
             agent: spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
@@ -1132,6 +1189,12 @@ class SurvivorSearchEnv(ParallelEnv):
             self.client = p.connect(p.GUI)
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.client)
             p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=self.client)
+            p.configureDebugVisualizer(
+                p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=self.client
+            )
+            p.configureDebugVisualizer(
+                p.COV_ENABLE_WIREFRAME, 0, physicsClientId=self.client
+            )
             p.setRealTimeSimulation(0, physicsClientId=self.client)
         else:
             self.client = p.connect(p.DIRECT)
@@ -1165,21 +1228,67 @@ class SurvivorSearchEnv(ParallelEnv):
             physicsClientId=self.client,
         )
 
+    def _uses_search_meshes(self):
+        return self.render_mode == "human" and self.client is not None
+
+    def _load_search_visuals(self):
+        """Load character and drone meshes once per GUI client. Headless skips files."""
+        self._person_vis = []
+        self._person_ymin = []
+        self._person_scale = []
+        self._drone_vis = -1
+        if not self._uses_search_meshes():
+            return
+        prefabs = _search_prefabs_dir()
+        char_dir = os.path.join(prefabs, "CharacterModels")
+        for letter in _PERSON_LETTERS:
+            path = os.path.join(char_dir, f"character-{letter}.pb.obj")
+            bounds = _obj_bounds(path)
+            height = bounds["ymax"] - bounds["ymin"]
+            scale = PERSON_TARGET_H / height if height > 1e-6 else 1.0
+            vis = p.createVisualShape(
+                p.GEOM_MESH,
+                fileName=path,
+                meshScale=[scale, scale, scale],
+                rgbaColor=_MESH_RGBA,
+                physicsClientId=self.client,
+            )
+            self._person_vis.append(vis)
+            self._person_ymin.append(bounds["ymin"])
+            self._person_scale.append(scale)
+
+        drone_path = os.path.join(prefabs, "Drone.obj")
+        bounds = _obj_bounds(drone_path)
+        longest = max(
+            bounds["xmax"] - bounds["xmin"],
+            bounds["ymax"] - bounds["ymin"],
+            bounds["zmax"] - bounds["zmin"],
+        )
+        dscale = DRONE_TARGET_LONG / longest if longest > 1e-6 else 1.0
+        self._drone_vis = p.createVisualShape(
+            p.GEOM_MESH,
+            fileName=drone_path,
+            meshScale=[dscale, dscale, dscale],
+            rgbaColor=_MESH_RGBA,
+            physicsClientId=self.client,
+        )
+        self._drone_fix_euler = _upright_fix_euler(bounds)
+        # File +Z is the nose; after +90 X that axis is world -Y, so +90 yaw faces +X.
+        self._drone_yaw_offset = 0.5 * math.pi
+
+    def _drone_orn(self, yaw):
+        q_fix = p.getQuaternionFromEuler(list(self._drone_fix_euler))
+        q_yaw = p.getQuaternionFromEuler(
+            [0.0, 0.0, float(yaw) + float(self._drone_yaw_offset)]
+        )
+        return p.multiplyTransforms([0, 0, 0], q_yaw, [0, 0, 0], q_fix)[1]
+
     def _spawn_drones(self):
         self.drone_ids = []
-        urdf_path = None
-        try:
-            gp = importlib.util.find_spec("gym_pybullet_drones")
-            if gp is not None:
-                assets_dir = os.path.join(os.path.dirname(gp.origin), "assets")
-                candidate = os.path.join(assets_dir, "cf2x.urdf")
-                if os.path.exists(candidate):
-                    urdf_path = candidate
-        except Exception:
-            urdf_path = None
-
-        z = self._agl_z(0.0, 0.0)
+        self._drone_yaw = np.zeros(self.num_drones, dtype=np.float64)
+        self._drone_crash_tinted = np.zeros(self.num_drones, dtype=bool)
         lx, ly = self._lim_x(), self._lim_y()
+        use_mesh = self._uses_search_meshes() and self._drone_vis >= 0
         for i in range(self.num_drones):
             frac = (i + 0.5) / max(self.num_drones, 1)
             x = -lx * 0.7 + frac * (1.4 * lx)
@@ -1188,25 +1297,17 @@ class SurvivorSearchEnv(ParallelEnv):
             cleared = self._push_out_of_buildings([x, y, z], radius=BUILDING_HARD_M)
             x, y, z = float(cleared[0]), float(cleared[1]), float(cleared[2])
             self.drone_positions[i] = [x, y, z]
-            if self.client is None:
+            if not use_mesh:
                 self.drone_ids.append(-1)
                 continue
-            if urdf_path is not None:
-                original_cwd = os.getcwd()
-                os.chdir(os.path.dirname(urdf_path))
-                try:
-                    did = p.loadURDF(
-                        os.path.basename(urdf_path),
-                        [x, y, z],
-                        globalScaling=DRONE_VISUAL_SCALE,
-                        physicsClientId=self.client,
-                    )
-                except Exception:
-                    did = self._sphere_drone([x, y, z], i)
-                finally:
-                    os.chdir(original_cwd)
-            else:
-                did = self._sphere_drone([x, y, z], i)
+            did = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=self._drone_vis,
+                basePosition=[x, y, z],
+                baseOrientation=self._drone_orn(self._drone_yaw[i]),
+                physicsClientId=self.client,
+            )
             self.drone_ids.append(did)
 
         if self.render_mode == "human" and self.client is not None:
@@ -1218,116 +1319,29 @@ class SurvivorSearchEnv(ParallelEnv):
                 physicsClientId=self.client,
             )
 
-    def _sphere_drone(self, pos, idx):
-        colors = [
-            [1, 0.2, 0.2, 1],
-            [0.2, 0.5, 1, 1],
-            [1, 0.8, 0, 1],
-            [0.2, 1, 0.4, 1],
-            [1, 0.4, 1, 1],
-        ]
-        color = colors[idx % len(colors)]
-        col = p.createCollisionShape(p.GEOM_SPHERE, radius=0.5, physicsClientId=self.client)
-        vis = p.createVisualShape(
-            p.GEOM_SPHERE, radius=0.5, rgbaColor=color, physicsClientId=self.client
-        )
-        return p.createMultiBody(
-            baseMass=0.027,
-            baseCollisionShapeIndex=col,
-            baseVisualShapeIndex=vis,
-            basePosition=pos,
-            physicsClientId=self.client,
-        )
-
-    def _person_rgba(self, discovered):
-        if discovered:
-            return [0.15, 0.82, 0.28, 1.0]
-        return [0.88, 0.22, 0.18, 1.0]
-
-    def _spawn_person_capsules(self):
-        """Two-capsule figures (torso + head) snapped to ground."""
-        self.person_torso_ids = []
-        self.person_head_ids = []
-        if self.client is None or self.survivors is None:
+    def _spawn_person_meshes(self, rng):
+        """One textured character per survivor. Pose is set once; no per-step updates."""
+        self.person_ids = []
+        if not self._uses_search_meshes() or self.survivors is None or not self._person_vis:
             return
         positions = self.survivors.get_positions()
+        n_models = len(self._person_vis)
         for i in range(self.survivors.num_survivors):
-            rgba = self._person_rgba(bool(self.survivors.discovered[i]))
-            x, y, z = float(positions[i][0]), float(positions[i][1]), float(positions[i][2])
-            ground = z - 0.3
-            torso_z = ground + 0.95
-            head_z = ground + 1.85
-            torso_col = p.createCollisionShape(
-                p.GEOM_CAPSULE, radius=0.32, height=0.95, physicsClientId=self.client
-            )
-            try:
-                torso_vis = p.createVisualShape(
-                    p.GEOM_CAPSULE,
-                    radius=0.32,
-                    length=0.95,
-                    rgbaColor=rgba,
-                    physicsClientId=self.client,
-                )
-            except Exception:
-                torso_vis = p.createVisualShape(
-                    p.GEOM_CAPSULE,
-                    radius=0.32,
-                    height=0.95,
-                    rgbaColor=rgba,
-                    physicsClientId=self.client,
-                )
-            torso = p.createMultiBody(
+            model = int(rng.integers(0, n_models))
+            yaw = float(rng.uniform(0.0, 2.0 * math.pi))
+            x, y = float(positions[i][0]), float(positions[i][1])
+            gz = self._ground_z(x, y)
+            scale = self._person_scale[model]
+            z = gz - self._person_ymin[model] * scale
+            bid = p.createMultiBody(
                 baseMass=0,
-                baseCollisionShapeIndex=torso_col,
-                baseVisualShapeIndex=torso_vis,
-                basePosition=[x, y, torso_z],
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=self._person_vis[model],
+                basePosition=[x, y, z],
+                baseOrientation=_mesh_yaw_orn(yaw),
                 physicsClientId=self.client,
             )
-            head_col = p.createCollisionShape(
-                p.GEOM_SPHERE, radius=0.28, physicsClientId=self.client
-            )
-            head_vis = p.createVisualShape(
-                p.GEOM_SPHERE, radius=0.28, rgbaColor=rgba, physicsClientId=self.client
-            )
-            head = p.createMultiBody(
-                baseMass=0,
-                baseCollisionShapeIndex=head_col,
-                baseVisualShapeIndex=head_vis,
-                basePosition=[x, y, head_z],
-                physicsClientId=self.client,
-            )
-            self.person_torso_ids.append(torso)
-            self.person_head_ids.append(head)
-        n = len(self.person_torso_ids)
-        self._person_vis_discovered = np.array(
-            [bool(self.survivors.discovered[i]) for i in range(n)],
-            dtype=bool,
-        )
-        self.capsule_color_updates = 0
-        self.capsule_pose_updates = 0
-
-    def _sync_person_capsules(self):
-        """Survivors are frozen. Recolor only the person whose discovered flag flipped."""
-        if self.client is None or not self.person_torso_ids:
-            return
-        n = min(len(self.person_torso_ids), self.survivors.num_survivors)
-        vis = self._person_vis_discovered
-        if vis is None or len(vis) != n:
-            vis = np.zeros(n, dtype=bool)
-            self._person_vis_discovered = vis
-        for i in range(n):
-            found = bool(self.survivors.discovered[i])
-            if found == bool(vis[i]):
-                continue
-            rgba = self._person_rgba(found)
-            p.changeVisualShape(
-                self.person_torso_ids[i], -1, rgbaColor=rgba, physicsClientId=self.client
-            )
-            p.changeVisualShape(
-                self.person_head_ids[i], -1, rgbaColor=rgba, physicsClientId=self.client
-            )
-            vis[i] = found
-            self.capsule_color_updates += 1
+            self.person_ids.append(bid)
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -1349,8 +1363,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
         self.town = None
-        self.person_torso_ids = []
-        self.person_head_ids = []
+        self.person_ids = []
+        self._person_vis = []
+        self._drone_vis = -1
         if hasattr(self, "_lanes"):
             del self._lanes
 
@@ -1410,9 +1425,10 @@ class SurvivorSearchEnv(ParallelEnv):
         self._seal_unsearchable()
 
         self._init_pybullet()
+        self._load_search_visuals()
         self._build_ground()
         self._spawn_drones()
-        self._spawn_person_capsules()
+        self._spawn_person_meshes(np.random.default_rng(surv_seed))
         self._mark_coverage(self.drone_positions)
         self._refresh_nav_goals()
 
@@ -1479,13 +1495,27 @@ class SurvivorSearchEnv(ParallelEnv):
                 if self.drone_ids[i] < 0:
                     continue
                 pos = self.drone_positions[i]
-                orn = p.getQuaternionFromEuler([0, 0, 0])
+                vx = float(self.drone_velocities[i][0])
+                vy = float(self.drone_velocities[i][1])
+                if math.hypot(vx, vy) > 0.15:
+                    self._drone_yaw[i] = math.atan2(vy, vx)
                 p.resetBasePositionAndOrientation(
-                    self.drone_ids[i], pos.tolist(), orn, physicsClientId=self.client
+                    self.drone_ids[i],
+                    pos.tolist(),
+                    self._drone_orn(self._drone_yaw[i]),
+                    physicsClientId=self.client,
                 )
                 p.resetBaseVelocity(
                     self.drone_ids[i], [0, 0, 0], [0, 0, 0], physicsClientId=self.client
                 )
+                if (not self.drone_alive[i]) and (not self._drone_crash_tinted[i]):
+                    p.changeVisualShape(
+                        self.drone_ids[i],
+                        -1,
+                        rgbaColor=_CRASH_RGBA,
+                        physicsClientId=self.client,
+                    )
+                    self._drone_crash_tinted[i] = True
 
         self.new_cells, self.overlap_cells = self._mark_coverage(self.drone_positions)
         alive_pos = [
@@ -1494,7 +1524,6 @@ class SurvivorSearchEnv(ParallelEnv):
         prev_discovered = np.asarray(self.survivors.discovered, dtype=bool).copy()
         self.newly_discovered, _ = self.survivors.update_discovery(alive_pos, self.terrain)
         self._credit_drone_finds(prev_discovered)
-        self._sync_person_capsules()
 
         rewards = self._compute_rewards(collisions, building_kills, rubble_blocks)
         all_found = int(self.survivors.discovered.sum()) == self.survivors.num_survivors
