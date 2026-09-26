@@ -32,6 +32,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from envs.disaster_env import DisasterMeshEnv
 from envs.search_env import SurvivorSearchEnv
+from visualize_town import camera_basis_from_yaw_pitch
 
 try:
     from models.actor_critic import MAPPOModel
@@ -58,14 +59,109 @@ def parse_args():
     return parser.parse_args()
 
 
+def _key_down(keys, code):
+    return bool(keys.get(code, 0) & p.KEY_IS_DOWN)
+
+
+def _key_hit(keys, code):
+    return bool(keys.get(code, 0) & p.KEY_WAS_TRIGGERED)
+
+
+def apply_orbit_camera(client, yaw, pitch, dist, target):
+    p.resetDebugVisualizerCamera(
+        cameraDistance=float(dist),
+        cameraYaw=float(yaw),
+        cameraPitch=float(pitch),
+        cameraTargetPosition=np.asarray(target, dtype=float).tolist(),
+        physicsClientId=client,
+    )
+
+
+class SearchCamera:
+    """Keyboard camera: arrows pan the map, 1-9 follow a drone."""
+
+    def __init__(self, client, num_drones, env_size):
+        self.client = client
+        self.num_drones = int(num_drones)
+        self.yaw = 0.0
+        self.pitch = -89.0
+        self.dist = max(80.0, float(env_size) * 1.05)
+        self.target = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        self.follow = None
+        apply_orbit_camera(client, self.yaw, self.pitch, self.dist, self.target)
+
+    def _pan(self, dx, dy, scale):
+        if self.pitch <= -70.0:
+            self.target[0] += dx * scale
+            self.target[1] += dy * scale
+        else:
+            forward, right, _up = camera_basis_from_yaw_pitch(self.yaw, self.pitch)
+            right[2] = 0.0
+            rn = float(np.linalg.norm(right[:2]))
+            if rn > 1e-6:
+                right[:2] /= rn
+            fwd = np.array([forward[0], forward[1], 0.0], dtype=np.float64)
+            fn = float(np.linalg.norm(fwd))
+            if fn > 1e-6:
+                fwd /= fn
+            self.target = self.target - right * dx * scale + fwd * dy * scale
+        self.target[2] = float(np.clip(self.target[2], 0.0, 40.0))
+
+    def handle(self, keys, drone_positions):
+        if _key_hit(keys, ord("0")):
+            self.follow = None
+            print("[CAM] Free look — arrow keys pan the map")
+        if _key_hit(keys, 9):
+            if self.follow is None:
+                self.follow = 0
+            else:
+                self.follow = (int(self.follow) + 1) % self.num_drones
+            print(f"[CAM] Follow D{self.follow}")
+        for i in range(min(9, self.num_drones)):
+            if _key_hit(keys, ord(str(i + 1))):
+                self.follow = i
+                self.dist = min(self.dist, 28.0)
+                self.pitch = min(self.pitch, -24.0)
+                print(f"[CAM] Follow D{i}")
+
+        if _key_down(keys, ord("[")) or _key_down(keys, ord("-")):
+            self.dist = min(220.0, self.dist * 1.04)
+        if _key_down(keys, ord("]")) or _key_down(keys, ord("=")) or _key_down(keys, ord("+")):
+            self.dist = max(8.0, self.dist * 0.96)
+
+        step = 1.2 + 0.04 * self.dist
+        dx = dy = 0.0
+        if _key_down(keys, p.B3G_UP_ARROW):
+            dy += step
+        if _key_down(keys, p.B3G_DOWN_ARROW):
+            dy -= step
+        if _key_down(keys, p.B3G_LEFT_ARROW):
+            dx -= step
+        if _key_down(keys, p.B3G_RIGHT_ARROW):
+            dx += step
+        if dx or dy:
+            self.follow = None
+            self._pan(dx * 12.0, dy * 12.0, 1.0)
+
+        if self.follow is not None and drone_positions is not None:
+            idx = int(np.clip(self.follow, 0, len(drone_positions) - 1))
+            pos = np.asarray(drone_positions[idx], dtype=np.float64)
+            self.target = pos + np.array([0.0, 0.0, 1.2], dtype=np.float64)
+
+        apply_orbit_camera(self.client, self.yaw, self.pitch, self.dist, self.target)
+        return self.follow
+
+
 def main():
     args = parse_args()
     if args.env_size is None:
-        args.env_size = 200.0 if args.task == "search" else 100.0
+        args.env_size = 250.0 if args.task == "search" else 100.0
     print("=" * 65)
     print(f" [3D VISUALIZER] task={args.task}")
-    if args.task == "search" and args.policy == "sweep":
-        print(" Coverage: lawnmower lanes across the full 100 m map")
+    if args.task == "search":
+        print(" Search: 250 m downtown, 5 m AGL, capsule survivors, MAPPO XY")
+        print(" Camera: starts top-down, free look | arrows pan | 1/2/3 follow a drone")
+        print("         [ ] zoom | Space pause | R reset | Q quit")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")
     print("=" * 65)
 
@@ -124,6 +220,7 @@ def main():
     dt_target = 1.0 / args.fps
     paused = False
     step_num = 0
+    cam = SearchCamera(env.client, args.num_drones, args.env_size)
 
     try:
         while True:
@@ -141,7 +238,10 @@ def main():
                 print("[RESET] Resetting environment...")
                 obs_dict, info_dict = env.reset()
                 step_num = 0
+                cam = SearchCamera(env.client, args.num_drones, args.env_size)
                 continue
+
+            cam.handle(keys, env.drone_positions)
 
             if not paused:
                 playback = 4 if args.task == "search" else 1
@@ -185,7 +285,7 @@ def main():
                                 elif pos[1] < -half + 8.0:
                                     env.sweep_dir[i] = 1.0
                                 vy = float(env.sweep_dir[i])
-                                hover_z = getattr(env, "hover_altitude", 8.0)
+                                hover_z = getattr(env, "hover_altitude", 5.0)
                                 vz = float(np.clip((hover_z - pos[2]) / 5.0, -1.0, 1.0))
                                 actions[agent] = np.array([vx, vy, vz], dtype=np.float32)
                         else:
@@ -268,23 +368,36 @@ def main():
                             tag,
                             [pos[0], pos[1], pos[2] + 1.2],
                             textColorRGB=color[:3],
-                            textSize=1.0,
+                            textSize=1.4 if cam.follow == i else 1.0,
                             physicsClientId=env.client,
                         )
 
-                    # 4. Survivor status markers
-                    surv_pos = env.survivors.get_positions()
-                    for s_idx in range(env.survivors.num_survivors):
-                        is_disc = bool(env.survivors.discovered[s_idx])
-                        marker = "[*]" if is_disc else "?"
-                        color = [0.0, 1.0, 0.2] if is_disc else [1.0, 0.3, 0.3]
-                        p.addUserDebugText(
-                            marker,
-                            [surv_pos[s_idx][0], surv_pos[s_idx][1], surv_pos[s_idx][2] + 0.5],
-                            textColorRGB=color,
-                            textSize=1.2,
-                            physicsClientId=env.client,
-                        )
+                    if args.task == "search":
+                        surv_pos = env.survivors.get_positions()
+                        for s_idx in range(env.survivors.num_survivors):
+                            is_disc = bool(env.survivors.discovered[s_idx])
+                            marker = "[*]" if is_disc else "?"
+                            color = [0.0, 1.0, 0.2] if is_disc else [1.0, 0.35, 0.25]
+                            p.addUserDebugText(
+                                marker,
+                                [surv_pos[s_idx][0], surv_pos[s_idx][1], surv_pos[s_idx][2] + 2.2],
+                                textColorRGB=color,
+                                textSize=1.35,
+                                physicsClientId=env.client,
+                            )
+                    elif args.task != "search":
+                        surv_pos = env.survivors.get_positions()
+                        for s_idx in range(env.survivors.num_survivors):
+                            is_disc = bool(env.survivors.discovered[s_idx])
+                            marker = "[*]" if is_disc else "?"
+                            color = [0.0, 1.0, 0.2] if is_disc else [1.0, 0.3, 0.3]
+                            p.addUserDebugText(
+                                marker,
+                                [surv_pos[s_idx][0], surv_pos[s_idx][1], surv_pos[s_idx][2] + 0.5],
+                                textColorRGB=color,
+                                textSize=1.2,
+                                physicsClientId=env.client,
+                            )
 
                     # Structure labels (school, apartments, houses)
                     for box in getattr(env.terrain, "structures", []) or []:
@@ -302,10 +415,12 @@ def main():
                     stats = env.survivors.get_discovery_stats()
                     if args.task == "search":
                         cover = float(getattr(env, "coverage", np.zeros(1)).mean())
+                        cam_txt = f"FOLLOW D{cam.follow}" if cam.follow is not None else "FREE CAM"
                         hud_line = (
-                            f"SEARCH | Step: {step_num} | Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
-                            f"({stats['discovery_rate']*100:.0f}%) | Cover: {cover*100:.0f}%"
+                            f"SEARCH | {cam_txt} | Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
+                            f"| Cover: {cover*100:.0f}% | arrows pan  1-3 follow"
                         )
+                        hud_pos = cam.target + np.array([0.0, 0.0, 10.0])
                     else:
                         sat_text = (
                             f"LEO SAT: Active (x={env.satellite.current_x:.1f}m)"
@@ -318,7 +433,7 @@ def main():
                         )
                     p.addUserDebugText(
                         hud_line,
-                        [-args.env_size / 2 + 5, -args.env_size / 2 + 5, 25.0],
+                        (hud_pos.tolist() if args.task == "search" else [-args.env_size / 2 + 5, -args.env_size / 2 + 5, 25.0]),
                         textColorRGB=[1.0, 1.0, 1.0],
                         textSize=1.2,
                         physicsClientId=env.client,

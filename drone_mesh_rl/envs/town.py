@@ -11,7 +11,11 @@ tower, L-shape, setback) with cheap visual detail overlays.
 from __future__ import annotations
 
 import numpy as np
-import pybullet as p
+
+try:
+    import pybullet as p
+except ImportError:
+    p = None
 
 # Nominal story height for typed buildings
 STORY = 3.5

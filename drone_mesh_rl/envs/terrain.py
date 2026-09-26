@@ -790,7 +790,10 @@ class Terrain:
 
         perim = 2.0 * (self.size_x + self.size_y)
         n_lo, n_hi = self.n_rim_ranges
-        n_ranges = int(rng.integers(n_lo, n_hi + 1))
+        n_ranges = int(rng.integers(n_lo, n_hi + 1)) if n_hi >= n_lo else 0
+        if n_ranges < 1 or self.rim_width <= 0.0:
+            self._rim_peaks = []
+            return np.zeros_like(X)
         slot = perim / n_ranges
         offset = float(rng.uniform(0.0, slot))
 

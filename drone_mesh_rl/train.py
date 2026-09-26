@@ -126,7 +126,7 @@ def eval_search(env, model, agent_names, device, episodes=5, base_seed=9000):
 def main():
     args = parse_args()
     if args.env_size is None:
-        args.env_size = 200.0 if args.task == "search" else 100.0
+        args.env_size = 250.0 if args.task == "search" else 100.0
     if args.task == "search" and args.max_steps == 800:
         args.max_steps = int(args.env_size * 6.0)
     np.random.seed(args.seed)

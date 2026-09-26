@@ -159,14 +159,31 @@ class SurvivorCluster:
 
         for i in range(self.num_survivors):
             x, y = self.positions[i, 0], self.positions[i, 1]
-            grid_x = int((x + self.env_size_x / 2) / self.terrain.resolution)
-            grid_y = int((y + self.env_size_y / 2) / self.terrain.resolution)
+            if hasattr(self.terrain, "get_height"):
+                ground = float(self.terrain.get_height(x, y))
+            else:
+                grid_x = int((x + self.env_size_x / 2) / self.terrain.resolution)
+                grid_y = int((y + self.env_size_y / 2) / self.terrain.resolution)
+                grid_x = np.clip(grid_x, 0, self.terrain.grid_x - 1)
+                grid_y = np.clip(grid_y, 0, self.terrain.grid_y - 1)
+                ground = float(self.terrain.heightmap[grid_y, grid_x])
+            self.positions[i, 2] = ground + 0.3
 
-            grid_x = np.clip(grid_x, 0, self.terrain.grid_x - 1)
-            grid_y = np.clip(grid_y, 0, self.terrain.grid_y - 1)
-
-            # Float 0.3m above the terrain surface so the marker is clearly visible
-            self.positions[i, 2] = self.terrain.heightmap[grid_y, grid_x] + 0.3
+    def place_on_walkable(self, town, prefer_street=True):
+        """Move every survivor onto streets / open lots of a TownLayout."""
+        if town is None or self.num_survivors <= 0:
+            return
+        pts = town.sample_walkable(self.rng, n=self.num_survivors, prefer_street=prefer_street)
+        if pts is None or len(pts) == 0:
+            return
+        self.positions[:, 0] = pts[:, 0]
+        self.positions[:, 1] = pts[:, 1]
+        n_centers = len(self.cluster_centers)
+        for cid in range(n_centers):
+            mask = self.cluster_ids == cid
+            if mask.any():
+                self.cluster_centers[cid] = self.positions[mask, :2].mean(axis=0)
+        self._snap_to_ground()
 
     def _get_terrain_gradient(self, x, y):
         """

@@ -1,13 +1,14 @@
 """
 visualize_env.py — Viewer entry point.
 
---task search (default) and --task mesh play the learned drone policy.
+--task search (default) plays MAPPO over a 250 m downtown (5 m AGL).
+--task mesh plays the LEO mesh demo.
 --task town opens the USGS / metro spectator (no drones).
 
 Usage:
   cd drone_mesh_rl && python visualize_env.py
+  cd drone_mesh_rl && python visualize_env.py --task search --policy model
   cd drone_mesh_rl && python visualize_env.py --task town
-  cd drone_mesh_rl && python visualize_env.py --task town --procedural
 """
 
 import sys

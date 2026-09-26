@@ -1,11 +1,11 @@
 """
 search_env.py - Multi-agent search on a rectangular map.
 
-The world is the partner's rectangular search pad: next-best-view coverage
+The world is a 250 m downtown pad: next-best-view coverage
 and a leftover-survivor hunt choose where unfinished work is. The learning
 interface is Boen's. Each drone picks one of 9 headings (8 neighbors or
 stay), reads a shared coarse 8x8 coverage map, and is turned back when a
-heading would pin it on a wall. The heading in the observation points at
+heading would pin it on a wall. Drones hold 5 m AGL over the heightfield. The heading in the observation points at
 that search goal (a high-gain unpainted patch, or a leftover person), not
 at the nearest uncovered cell. Every drone reads the same painted map and
 teammate XY; overlapping headings are turned toward cells that drone owns.
@@ -41,6 +41,7 @@ from pettingzoo import ParallelEnv
 
 from .survivors import SurvivorCluster
 from .terrain import Terrain
+from .town import TownLayout, spawn_town_in_pybullet
 
 
 COVER_CROP = 7  # local visited-map window (odd)
@@ -100,12 +101,12 @@ class SurvivorSearchEnv(ParallelEnv):
         num_loners=12,
         env_size=None,
         env_size_x=250.0,
-        env_size_y=160.0,
+        env_size_y=250.0,
         max_steps=2500,
         render_mode=None,
         drone_max_speed=40.0,
         drone_max_altitude=20.0,
-        hover_altitude=8.0,
+        hover_altitude=5.0,
         sensor_radius=5.0,
         cover_cells=None,
         pyb_freq=30,
@@ -177,6 +178,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.client = None
         self.drone_ids = []
         self.terrain_body = None
+        self.town = None
+        self.person_torso_ids = []
+        self.person_head_ids = []
 
         self._observation_spaces = {
             agent: spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
@@ -206,6 +210,16 @@ class SurvivorSearchEnv(ParallelEnv):
 
     def _lim_y(self):
         return max(5.0, self.size_y / 2.0 - MAP_EDGE_MARGIN)
+
+    def _ground_z(self, x, y):
+        if self.terrain is None:
+            return 0.0
+        if hasattr(self.terrain, "get_height"):
+            return float(self.terrain.get_height(x, y))
+        return 0.0
+
+    def _agl_z(self, x, y):
+        return self._ground_z(x, y) + float(self.hover_altitude)
 
     def _cell_to_world(self, gx, gy):
         wx = (gx + 0.5) / self.cover_nx * self.size_x - self.size_x / 2.0
@@ -308,12 +322,27 @@ class SurvivorSearchEnv(ParallelEnv):
                     painted += 1
         return painted
 
+    def _cell_is_searchable(self, world):
+        if not self._playable_cell(world):
+            return False
+        if self.town is not None and not self.town.is_walkable(float(world[0]), float(world[1])):
+            return False
+        return True
+
+    def _has_walkable_unmapped(self):
+        for gy in range(1, self.cover_ny - 1):
+            for gx in range(1, self.cover_nx - 1):
+                if self.coverage[gy, gx] >= 0.5:
+                    continue
+                if self._cell_is_searchable(self._cell_to_world(gx, gy)):
+                    return True
+        return False
+
     def _search_goal_xy(self, drone_index):
         """Hunt leftover people once mapping is mostly done; otherwise next-best-view."""
         people = self._undiscovered_people()
-        missed = any(self._person_was_missed(person) for person in people)
-        map_done = self._interior_coverage() >= 0.995
-        if people and (missed or map_done):
+        streets_left = self._has_walkable_unmapped()
+        if people and not streets_left:
             hunt = self._hunt_survivor_xy(drone_index)
             if hunt is not None:
                 self.goal_is_person[drone_index] = True
@@ -344,13 +373,13 @@ class SurvivorSearchEnv(ParallelEnv):
                 if self.coverage[gy, gx] >= 0.5:
                     continue
                 world = self._cell_to_world(gx, gy)
-                if not self._playable_cell(world):
+                if not self._cell_is_searchable(world):
                     continue
                 my_d = float(np.linalg.norm(world - my_xy))
                 stolen = False
                 for other in others:
                     other_d = float(np.linalg.norm(world - other))
-                    if other_d <= my_d or other_d < TEAM_KEEP_M:
+                    if other_d + 1.0 < my_d:
                         stolen = True
                         break
                 if stolen:
@@ -364,7 +393,20 @@ class SurvivorSearchEnv(ParallelEnv):
                     continue
                 candidates.append((world, gx, gy, my_d))
         if not candidates:
-            return None
+            fallback = None
+            fallback_d = 1e18
+            for gy in range(1, self.cover_ny - 1):
+                for gx in range(1, self.cover_nx - 1):
+                    if self.coverage[gy, gx] >= 0.5:
+                        continue
+                    world = self._cell_to_world(gx, gy)
+                    if not self._cell_is_searchable(world):
+                        continue
+                    d = float(np.linalg.norm(world - my_xy))
+                    if d < fallback_d:
+                        fallback_d = d
+                        fallback = world
+            return fallback
 
         best = None
         best_score = -1e18
@@ -408,13 +450,15 @@ class SurvivorSearchEnv(ParallelEnv):
         mine_y = []
         for x, y in zip(wx, wy):
             cell = np.array([x, y], dtype=np.float64)
+            if not self._cell_is_searchable(cell):
+                continue
             my_d = float(np.linalg.norm(cell - my_xy))
-            if any(float(np.linalg.norm(cell - other)) < my_d for other in others):
+            if any(float(np.linalg.norm(cell - other)) + 1.0 < my_d for other in others):
                 continue
             mine_x.append(x)
             mine_y.append(y)
         if not mine_x:
-            return np.array([float(wx.mean()), float(wy.mean())], dtype=np.float64)
+            return None
         return np.array([float(np.mean(mine_x)), float(np.mean(mine_y))], dtype=np.float64)
 
     def _unfinished_centroid(self):
@@ -432,7 +476,15 @@ class SurvivorSearchEnv(ParallelEnv):
             return None
         wx = (xs.astype(np.float64) + 0.5) / self.cover_nx * self.size_x - self.size_x / 2.0
         wy = (ys.astype(np.float64) + 0.5) / self.cover_ny * self.size_y - self.size_y / 2.0
-        return np.array([float(wx.mean()), float(wy.mean())], dtype=np.float64)
+        keep_x = []
+        keep_y = []
+        for x, y in zip(wx, wy):
+            if self._cell_is_searchable(np.array([x, y], dtype=np.float64)):
+                keep_x.append(x)
+                keep_y.append(y)
+        if not keep_x:
+            return None
+        return np.array([float(np.mean(keep_x)), float(np.mean(keep_y))], dtype=np.float64)
 
     def _goal_still_valid(self, drone_index):
         if not self.has_nav_goal[drone_index]:
@@ -508,15 +560,16 @@ class SurvivorSearchEnv(ParallelEnv):
 
     def _velocity_toward_unmapped(self, drone_index, pos):
         ux, uy = self._inland_search_dir(drone_index, pos)
-        for j in range(self.num_drones):
-            if j == drone_index:
-                continue
-            rel = pos[:2] - self.drone_positions[j][:2]
-            dist = float(np.hypot(rel[0], rel[1]))
-            if 1e-3 < dist < TEAM_KEEP_M:
-                push = (TEAM_KEEP_M - dist) / TEAM_KEEP_M
-                ux += float(rel[0]) / dist * push
-                uy += float(rel[1]) / dist * push
+        if not self.goal_is_person[drone_index]:
+            for j in range(self.num_drones):
+                if j == drone_index:
+                    continue
+                rel = pos[:2] - self.drone_positions[j][:2]
+                dist = float(np.hypot(rel[0], rel[1]))
+                if 1e-3 < dist < TEAM_KEEP_M:
+                    push = (TEAM_KEEP_M - dist) / TEAM_KEEP_M
+                    ux += float(rel[0]) / dist * push
+                    uy += float(rel[1]) / dist * push
         if abs(ux) + abs(uy) < 1e-6:
             ang = 2.0 * np.pi * drone_index / max(self.num_drones, 1) + 0.15 * self.step_count
             ux = float(np.cos(ang))
@@ -649,7 +702,7 @@ class SurvivorSearchEnv(ParallelEnv):
             vel = self._velocity_toward_unmapped(drone_index, pos)
         pos[0] = float(np.clip(pos[0], -lx, lx))
         pos[1] = float(np.clip(pos[1], -ly, ly))
-        pos[2] = float(self.hover_altitude)
+        pos[2] = float(self._agl_z(pos[0], pos[1]))
         vel[2] = 0.0
         return pos, vel
 
@@ -784,6 +837,12 @@ class SurvivorSearchEnv(ParallelEnv):
     def _build_ground(self):
         if self.client is None:
             return
+        if self.town is not None:
+            terrain_body, _, _ = spawn_town_in_pybullet(
+                self.client, self.town, self.terrain, self.size_x
+            )
+            self.terrain_body = terrain_body
+            return
         hx, hy = self.size_x / 2.0, self.size_y / 2.0
         col = p.createCollisionShape(
             p.GEOM_BOX, halfExtents=[hx, hy, 0.2], physicsClientId=self.client
@@ -815,12 +874,13 @@ class SurvivorSearchEnv(ParallelEnv):
         except Exception:
             urdf_path = None
 
-        z = self.hover_altitude
+        z = self._agl_z(0.0, 0.0)
         lx, ly = self._lim_x(), self._lim_y()
         for i in range(self.num_drones):
             frac = (i + 0.5) / max(self.num_drones, 1)
             x = -lx * 0.7 + frac * (1.4 * lx)
             y = -ly * 0.35 + (i % 2) * (0.25 * ly)
+            z = self._agl_z(x, y)
             self.drone_positions[i] = [x, y, z]
             if self.client is None:
                 self.drone_ids.append(-1)
@@ -845,10 +905,10 @@ class SurvivorSearchEnv(ParallelEnv):
 
         if self.render_mode == "human" and self.client is not None:
             p.resetDebugVisualizerCamera(
-                cameraDistance=max(self.size_x, self.size_y) * 0.85,
-                cameraYaw=45,
-                cameraPitch=-40,
-                cameraTargetPosition=[0, 0, 2.0],
+                cameraDistance=max(self.size_x, self.size_y) * 1.05,
+                cameraYaw=0,
+                cameraPitch=-89,
+                cameraTargetPosition=[0.0, 0.0, 0.0],
                 physicsClientId=self.client,
             )
 
@@ -873,6 +933,95 @@ class SurvivorSearchEnv(ParallelEnv):
             physicsClientId=self.client,
         )
 
+    def _person_rgba(self, discovered):
+        if discovered:
+            return [0.15, 0.82, 0.28, 1.0]
+        return [0.88, 0.22, 0.18, 1.0]
+
+    def _spawn_person_capsules(self):
+        """Two-capsule figures (torso + head) snapped to ground."""
+        self.person_torso_ids = []
+        self.person_head_ids = []
+        if self.client is None or self.survivors is None:
+            return
+        positions = self.survivors.get_positions()
+        for i in range(self.survivors.num_survivors):
+            rgba = self._person_rgba(bool(self.survivors.discovered[i]))
+            x, y, z = float(positions[i][0]), float(positions[i][1]), float(positions[i][2])
+            ground = z - 0.3
+            torso_z = ground + 0.95
+            head_z = ground + 1.85
+            torso_col = p.createCollisionShape(
+                p.GEOM_CAPSULE, radius=0.32, height=0.95, physicsClientId=self.client
+            )
+            try:
+                torso_vis = p.createVisualShape(
+                    p.GEOM_CAPSULE,
+                    radius=0.32,
+                    length=0.95,
+                    rgbaColor=rgba,
+                    physicsClientId=self.client,
+                )
+            except Exception:
+                torso_vis = p.createVisualShape(
+                    p.GEOM_CAPSULE,
+                    radius=0.32,
+                    height=0.95,
+                    rgbaColor=rgba,
+                    physicsClientId=self.client,
+                )
+            torso = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=torso_col,
+                baseVisualShapeIndex=torso_vis,
+                basePosition=[x, y, torso_z],
+                physicsClientId=self.client,
+            )
+            head_col = p.createCollisionShape(
+                p.GEOM_SPHERE, radius=0.28, physicsClientId=self.client
+            )
+            head_vis = p.createVisualShape(
+                p.GEOM_SPHERE, radius=0.28, rgbaColor=rgba, physicsClientId=self.client
+            )
+            head = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=head_col,
+                baseVisualShapeIndex=head_vis,
+                basePosition=[x, y, head_z],
+                physicsClientId=self.client,
+            )
+            self.person_torso_ids.append(torso)
+            self.person_head_ids.append(head)
+
+    def _sync_person_capsules(self):
+        if self.client is None or not self.person_torso_ids:
+            return
+        positions = self.survivors.get_positions()
+        orn = [0, 0, 0, 1]
+        n = min(len(self.person_torso_ids), self.survivors.num_survivors)
+        for i in range(n):
+            x, y, z = float(positions[i][0]), float(positions[i][1]), float(positions[i][2])
+            ground = z - 0.3
+            rgba = self._person_rgba(bool(self.survivors.discovered[i]))
+            p.resetBasePositionAndOrientation(
+                self.person_torso_ids[i],
+                [x, y, ground + 0.95],
+                orn,
+                physicsClientId=self.client,
+            )
+            p.resetBasePositionAndOrientation(
+                self.person_head_ids[i],
+                [x, y, ground + 1.85],
+                orn,
+                physicsClientId=self.client,
+            )
+            p.changeVisualShape(
+                self.person_torso_ids[i], -1, rgbaColor=rgba, physicsClientId=self.client
+            )
+            p.changeVisualShape(
+                self.person_head_ids[i], -1, rgbaColor=rgba, physicsClientId=self.client
+            )
+
     def reset(self, seed=None, options=None):
         if seed is not None:
             self._seed = seed
@@ -892,6 +1041,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.goal_hold = np.zeros(self.num_drones, dtype=np.int32)
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
+        self.town = None
+        self.person_torso_ids = []
+        self.person_head_ids = []
         if hasattr(self, "_lanes"):
             del self._lanes
 
@@ -899,14 +1051,34 @@ class SurvivorSearchEnv(ParallelEnv):
         if seed is not None:
             surv_seed ^= int(seed) & 0x7FFFFFFF
 
+        pad = max(self.size_x, self.size_y)
         self.terrain = Terrain(
             size_x=self.size_x,
             size_y=self.size_y,
-            resolution=1.0,
+            resolution=5.0,
             seed=self._seed if self._seed is not None else 42,
-            flat=True,
+            flat=False,
             with_structures=False,
+            city_size=pad,
+            city_centers=[(0.0, 0.0)],
+            connector_segment=None,
+            rim_width=0.0,
+            n_rim_ranges=(0, 0),
+            n_tall_hills=(0, 0),
+            n_hill_clusters=(0, 0),
+            meadow_amp=0.12,
+            grass_amp=0.35,
         )
+        self.town = TownLayout(
+            size=pad,
+            seed=surv_seed,
+            altitude_cap=40.0,
+            origin=(0.0, 0.0),
+        )
+        self.town.apply_ground_heights(self.terrain)
+        if hasattr(self.terrain, "set_obstacle_boxes"):
+            self.terrain.set_obstacle_boxes(self.town.boxes)
+
         self.survivors = SurvivorCluster(
             num_clusters=self.num_clusters,
             survivors_per_cluster=self.survivors_per_cluster,
@@ -922,10 +1094,12 @@ class SurvivorSearchEnv(ParallelEnv):
             frozen=True,
             seed=surv_seed,
         )
+        self.survivors.place_on_walkable(self.town)
 
         self._init_pybullet()
         self._build_ground()
         self._spawn_drones()
+        self._spawn_person_capsules()
         self._mark_coverage(self.drone_positions)
         self._refresh_nav_goals()
 
@@ -993,6 +1167,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.newly_discovered, _ = self.survivors.update_discovery(
             list(self.drone_positions), self.terrain
         )
+        self._sync_person_capsules()
 
         rewards = self._compute_rewards(collisions)
         all_found = int(self.survivors.discovered.sum()) == self.survivors.num_survivors
