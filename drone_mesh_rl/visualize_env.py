@@ -252,8 +252,11 @@ def main():
 
     town, terrain, world_size = build_world(client, args.env_size, args.seed)
     n_buildings = len(town.boxes)
+    n_humans = len(town.humans)
+    n_survivors = sum(1 for h in town.humans if h["survivor"])
     print(
-        f"[TOWN] Loaded {n_buildings} building/rubble/overpass boxes "
+        f"[TOWN] Loaded {n_buildings} building/rubble/overpass boxes, "
+        f"{n_humans} people ({n_survivors} marked survivors) "
         f"(city {args.env_size:.0f}m, world {world_size:.0f}m)."
     )
 
@@ -283,7 +286,11 @@ def main():
                 seed = int(seed) + 1
                 clear_world(client)
                 town, terrain, world_size = build_world(client, args.env_size, seed)
-                print(f"[TOWN] Loaded {len(town.boxes)} boxes (seed={seed}).")
+                n_surv = sum(1 for h in town.humans if h["survivor"])
+                print(
+                    f"[TOWN] Loaded {len(town.boxes)} boxes, "
+                    f"{len(town.humans)} people ({n_surv} survivors) (seed={seed})."
+                )
                 frame_town_camera(client, world_size)
                 yaw, pitch, dist, target, eye = read_debug_camera(client)
                 # Re-frame overview, then return to fly mode

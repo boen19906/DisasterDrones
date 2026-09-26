@@ -6,6 +6,10 @@ line-of-sight stay vectorized numpy — no PyBullet raycasts.
 
 Downtown buildings are street-aligned typed volumes (shop, row, mid-rise,
 tower, L-shape, setback) with cheap visual detail overlays.
+
+People are visual-only: a capsule body and a sphere head, standing on
+walkable ground. A small subset is flagged as survivors for later search
+logic; they do not move and they do not affect collision or line-of-sight.
 """
 
 from __future__ import annotations
@@ -32,6 +36,38 @@ ROAD_HALF_THICK = 0.035  # half-thickness → bottom ~0.085 m above peak in segm
 ROAD_SEG_LEN = 5.0  # short segments follow the heightmap
 
 BUILDING_TYPE_NAMES = ("shop", "row", "midrise", "tower", "lshape", "setback")
+
+# Standing people. Capsule total height is BODY_LENGTH + 2*BODY_RADIUS.
+# Head sinks slightly into the capsule so the figure reads as one body.
+# Feet-to-crown is about 1.35 m; body width is 0.22 m.
+HUMAN_COUNT = 70
+HUMAN_SURVIVOR_COUNT = 9
+HUMAN_BODY_RADIUS = 0.11
+HUMAN_BODY_LENGTH = 0.95
+HUMAN_HEAD_RADIUS = 0.105
+HUMAN_HEAD_OVERLAP = 0.04
+HUMAN_MIN_SEP = 1.5
+HUMAN_EDGE_MARGIN = 3.0
+
+# Muted clothing. Survivors wear a high-visibility vest so the subset is visible.
+HUMAN_SHIRT_COLORS = (
+    [0.22, 0.30, 0.45, 1.0],
+    [0.38, 0.39, 0.41, 1.0],
+    [0.34, 0.40, 0.30, 1.0],
+    [0.45, 0.26, 0.24, 1.0],
+    [0.48, 0.40, 0.30, 1.0],
+    [0.28, 0.38, 0.42, 1.0],
+)
+HUMAN_VEST_COLORS = (
+    [0.90, 0.48, 0.10, 1.0],
+    [0.90, 0.78, 0.12, 1.0],
+)
+HUMAN_SKIN_COLORS = (
+    [0.87, 0.72, 0.58, 1.0],
+    [0.74, 0.56, 0.42, 1.0],
+    [0.56, 0.40, 0.30, 1.0],
+    [0.42, 0.30, 0.22, 1.0],
+)
 
 
 def _scale_rgb(rgba, factor):
@@ -92,6 +128,12 @@ class TownLayout:
         # Visual-only detail AABBs: (xmin, ymin, zmin, xmax, ymax, zmax, rgba)
         self.detail_parts: list[tuple] = []
         self._ground_applied = False
+        # Visual people. Each dict: x, y, z (feet), shirt, skin, survivor.
+        # human_rng is independent of the building RNG so layout edits do not
+        # reshuffle the crowd for a given town seed.
+        self.humans: list[dict] = []
+        self._humans_placed = False
+        self.human_rng = np.random.default_rng(None if seed is None else int(seed) + 17011)
 
         self._build_street_grid(half)
         self._place_buildings(half)
@@ -904,6 +946,106 @@ class TownLayout:
         self.roads = self._build_road_segments(terrain)
         self._ground_applied = True
 
+    def _blocks_feet(self, x, y, pad):
+        """True if a pad around (x, y) overlaps a ground building or rubble."""
+        if self.boxes.size == 0:
+            return False
+        over = set(self.overpass_indices)
+        xmin, xmax = x - pad, x + pad
+        ymin, ymax = y - pad, y + pad
+        for i, b in enumerate(self.boxes):
+            if i in over:
+                continue
+            if xmax > b[0] and xmin < b[3] and ymax > b[1] and ymin < b[4]:
+                return True
+        return False
+
+    def _feet_z(self, terrain, x, y):
+        """
+        Ground the feet on pavement when (x, y) is on a street, otherwise
+        on the heightmap. Road slab center is `z`; the walking surface is
+        one half-thickness above that.
+        """
+        if self._on_street(x, y):
+            for cx, cy, hx, hy, z in self.roads:
+                if abs(x - cx) <= hx + 0.05 and abs(y - cy) <= hy + 0.05:
+                    return float(z + ROAD_HALF_THICK + 0.01)
+            gz = _sample_heightmap(terrain, x, y)
+            return gz + ROAD_LIFT + ROAD_HALF_THICK + 0.01
+        return _sample_heightmap(terrain, x, y) + 0.02
+
+    def place_humans(self, terrain, count=HUMAN_COUNT, survivor_count=HUMAN_SURVIVOR_COUNT):
+        """
+        Scatter static people on streets and open lots.
+
+        Call after apply_ground_heights so feet sit on pavement or terrain.
+        Idempotent. Does not add collision boxes.
+        """
+        if self._humans_placed:
+            return
+        if not self._ground_applied:
+            self.apply_ground_heights(terrain)
+
+        rng = self.human_rng
+        half = self.size / 2.0
+        margin = HUMAN_EDGE_MARGIN
+        pad = HUMAN_BODY_RADIUS + 0.2
+        placed = []
+        attempts = 0
+        max_attempts = max(count * 80, 1)
+        while len(placed) < count and attempts < max_attempts:
+            attempts += 1
+            x = float(rng.uniform(-half + margin, half - margin))
+            y = float(rng.uniform(-half + margin, half - margin))
+            if not self.is_walkable(x, y):
+                continue
+            if self._blocks_feet(x, y, pad):
+                continue
+            if placed:
+                xy = np.asarray(placed, dtype=np.float64)
+                d2 = (xy[:, 0] - x) ** 2 + (xy[:, 1] - y) ** 2
+                if np.any(d2 < HUMAN_MIN_SEP * HUMAN_MIN_SEP):
+                    continue
+            placed.append((x, y))
+
+        shirts = HUMAN_SHIRT_COLORS
+        skins = HUMAN_SKIN_COLORS
+        humans = []
+        for x, y in placed:
+            shirt = shirts[int(rng.integers(0, len(shirts)))]
+            skin = skins[int(rng.integers(0, len(skins)))]
+            humans.append(
+                {
+                    "x": float(x),
+                    "y": float(y),
+                    "z": float(self._feet_z(terrain, x, y)),
+                    "shirt": [float(c) for c in shirt],
+                    "skin": [float(c) for c in skin],
+                    "survivor": False,
+                }
+            )
+
+        n_surv = min(int(survivor_count), len(humans))
+        if n_surv:
+            pick = rng.choice(len(humans), size=n_surv, replace=False)
+            vests = HUMAN_VEST_COLORS
+            for i, idx in enumerate(np.atleast_1d(pick)):
+                vest = vests[int(i) % len(vests)]
+                humans[int(idx)]["survivor"] = True
+                humans[int(idx)]["shirt"] = [float(c) for c in vest]
+
+        self.humans = humans
+        self._humans_placed = True
+
+    def human_positions(self, survivors_only=False):
+        """Feet positions as (N, 3). Empty array if nobody has been placed."""
+        people = self.humans
+        if survivors_only:
+            people = [h for h in people if h["survivor"]]
+        if not people:
+            return np.zeros((0, 3), dtype=np.float64)
+        return np.array([[h["x"], h["y"], h["z"]] for h in people], dtype=np.float64)
+
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
@@ -1067,13 +1209,71 @@ def connect_pybullet(gui=True, shadows=False):
     return client
 
 
+def _spawn_human_visuals(client, town):
+    """
+    One capsule body and one sphere head per person. Visual only (mass 0,
+    no collision). Capsule length is the cylinder section; PyBullet aligns
+    that axis with Z, so the figure stands upright.
+    """
+    if not town.humans:
+        return []
+
+    shirt_shapes = {}
+    skin_shapes = {}
+    bodies = []
+    head_z = (
+        HUMAN_BODY_LENGTH / 2.0
+        + HUMAN_BODY_RADIUS
+        + HUMAN_HEAD_RADIUS
+        - HUMAN_HEAD_OVERLAP
+    )
+    body_center_z = HUMAN_BODY_LENGTH / 2.0 + HUMAN_BODY_RADIUS
+
+    for h in town.humans:
+        shirt_key = tuple(h["shirt"])
+        if shirt_key not in shirt_shapes:
+            shirt_shapes[shirt_key] = p.createVisualShape(
+                p.GEOM_CAPSULE,
+                radius=HUMAN_BODY_RADIUS,
+                length=HUMAN_BODY_LENGTH,
+                rgbaColor=h["shirt"],
+                physicsClientId=client,
+            )
+        skin_key = tuple(h["skin"])
+        if skin_key not in skin_shapes:
+            skin_shapes[skin_key] = p.createVisualShape(
+                p.GEOM_SPHERE,
+                radius=HUMAN_HEAD_RADIUS,
+                rgbaColor=h["skin"],
+                physicsClientId=client,
+            )
+        bid = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=shirt_shapes[shirt_key],
+            basePosition=[h["x"], h["y"], h["z"] + body_center_z],
+            physicsClientId=client,
+        )
+        hid = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=skin_shapes[skin_key],
+            basePosition=[h["x"], h["y"], h["z"] + body_center_z + head_z],
+            physicsClientId=client,
+        )
+        bodies.append(bid)
+        bodies.append(hid)
+    return bodies
+
+
 def spawn_town_in_pybullet(client, town, terrain, env_size):
     """
     Load one dusty heightfield plus elevated road segments and building visuals.
 
     The heightfield is the only full-map ground surface (collision + visual).
     Roads are short pavement slabs ~ROAD_LIFT above local ground — not a second
-    ground pad. No city-wide or rim color plates. Returns
+    ground pad. No city-wide or rim color plates. People are spawned as
+    visual-only figures and stored on town.human_body_ids. Returns
     (terrain_body, road_bodies, building_bodies).
 
     Mesh scale uses terrain.size_x / terrain.grid_x so a grass-belt world
@@ -1188,6 +1388,9 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
     for part in town.detail_parts:
         xmin, ymin, zmin, xmax, ymax, zmax, rgba = part
         _spawn_box(xmin, ymin, zmin, xmax, ymax, zmax, rgba)
+
+    town.place_humans(terrain)
+    town.human_body_ids = _spawn_human_visuals(client, town)
 
     return terrain_body, road_bodies, building_bodies
 
