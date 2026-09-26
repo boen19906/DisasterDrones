@@ -10,8 +10,8 @@ street-edge leftover lots near the center. Sidewalk trees, street cars,
 and one water tower sit in that square. copy_to can shift the same
 relative layout elsewhere, but the viewer only spawns this one district.
 
-A second ~140 m rubble town (RubbleTownLayout) sits ≥200 m outside that
-square: six reused ruin shells and broken road slabs only.
+A second ~240 m rubble town (RubbleTownLayout) sits ≥200 m outside that
+square: twelve reused ruin shells and a larger broken-street grid only.
 """
 
 from __future__ import annotations
@@ -92,23 +92,44 @@ _RUIN_CHUNK_RGB = (
     [0.33, 0.30, 0.26, 1.0],
 )
 
-RUBBLE_TOWN_SIZE = 140.0
+RUBBLE_TOWN_SIZE = 240.0
 RUBBLE_TOWN_GAP = 200.0
 RUBBLE_TOWN_SEED = 71
-_N_RUBBLE_SHELLS = 6
-_RUBBLE_H = (13.5, 14.6, 15.2, 16.1, 16.8, 17.6)
+_N_RUBBLE_SHELLS = 12
+_RUBBLE_H = (
+    13.5,
+    14.6,
+    15.2,
+    16.1,
+    16.8,
+    17.6,
+    14.1,
+    15.7,
+    16.4,
+    13.8,
+    17.2,
+    15.0,
+)
 _BROKEN_ROAD_TEX_NAME = "rubble_town_road.png"
 _BROKEN_ROAD_WIDTH = 6.4
 _BROKEN_ROAD_LIFT = 0.08
 _BROKEN_ROAD_HALF_THICK = 0.045
-# Relative lots: (dx, dy, sx, sy, open_side) along a NS + EW cross
+# Two NS streets at ± this offset, plus one EW street through the center
+_RUBBLE_NS_OFF = 38.0
+# Relative lots: (dx, dy, sx, sy, open_side) along the 3-street grid
 _RUBBLE_LOTS = (
-    (-13.5, -36.0, 16.0, 14.0, "e"),
-    (13.5, 6.0, 16.0, 14.0, "w"),
-    (-13.5, 36.0, 16.0, 14.0, "e"),
-    (-38.0, -13.5, 16.0, 14.0, "n"),
-    (38.0, 13.5, 16.0, 14.0, "s"),
-    (22.0, -13.5, 16.0, 14.0, "n"),
+    (-49.9, -72.0, 16.0, 14.0, "e"),
+    (-26.1, -28.0, 16.0, 14.0, "w"),
+    (-49.9, 28.0, 16.0, 14.0, "e"),
+    (-26.1, 72.0, 16.0, 14.0, "w"),
+    (26.1, -72.0, 16.0, 14.0, "e"),
+    (49.9, -28.0, 16.0, 14.0, "w"),
+    (26.1, 28.0, 16.0, 14.0, "e"),
+    (49.9, 72.0, 16.0, 14.0, "w"),
+    (-82.0, -10.9, 16.0, 14.0, "n"),
+    (8.0, -10.9, 16.0, 14.0, "n"),
+    (-8.0, 10.9, 16.0, 14.0, "s"),
+    (82.0, 10.9, 16.0, 14.0, "s"),
 )
 
 
@@ -1172,7 +1193,7 @@ def _square_hits_keepouts(cx, cy, half, keepouts):
 
 
 def rubble_town_keepouts(scenery):
-    """Keep the 140 m square off groves, camps, huts, and the archer."""
+    """Keep the rubble-town square off groves, camps, huts, and the archer."""
     out = []
     scenery = scenery or {}
     for gx, gy in scenery.get("groves") or []:
@@ -1307,21 +1328,24 @@ def _broken_road_texture_path(filename=_BROKEN_ROAD_TEX_NAME, tex_w=96, tex_h=25
 
 
 def _layout_broken_streets(terrain, center, size, seed=RUBBLE_TOWN_SEED):
-    """Two short crossed streets of gapped, slightly tilted cracked slabs."""
+    """Three short streets (2 NS + 1 EW) of longer gapped, tilted cracked slabs."""
     cx, cy = float(center[0]), float(center[1])
-    reach = 0.5 * size - 14.0
+    reach = 0.5 * size - 16.0
     rng = np.random.default_rng(int(seed) + 3)
     hw = 0.5 * _BROKEN_ROAD_WIDTH
     hz = _BROKEN_ROAD_HALF_THICK
+    gap_at = hw + 1.0
+    ns_w = cx - _RUBBLE_NS_OFF
+    ns_e = cx + _RUBBLE_NS_OFF
     slabs = []
 
     def add_run(along, coord, t0, t1):
         t = float(t0)
-        while t < t1 - 4.0:
-            length = float(rng.uniform(6.5, 12.5))
-            gap = float(rng.uniform(0.40, 1.05))
+        while t < t1 - 8.0:
+            length = float(rng.uniform(14.0, 24.0))
+            gap = float(rng.uniform(0.55, 1.35))
             t1s = min(t + length, float(t1))
-            if t1s - t < 4.0:
+            if t1s - t < 8.0:
                 break
             mid = 0.5 * (t + t1s)
             tilt = math.radians(float(rng.choice([-1.0, 1.0])) * rng.uniform(1.8, 5.5))
@@ -1352,15 +1376,18 @@ def _layout_broken_streets(terrain, center, size, seed=RUBBLE_TOWN_SEED):
             )
             t = t1s + gap
 
-    add_run("y", cx, cy - reach, cy - 3.2)
-    add_run("y", cx, cy + 3.2, cy + reach)
-    add_run("x", cy, cx - reach, cx - 3.2)
-    add_run("x", cy, cx + 3.2, cx + reach)
+    add_run("y", ns_w, cy - reach, cy - gap_at)
+    add_run("y", ns_w, cy + gap_at, cy + reach)
+    add_run("y", ns_e, cy - reach, cy - gap_at)
+    add_run("y", ns_e, cy + gap_at, cy + reach)
+    add_run("x", cy, cx - reach, ns_w - gap_at)
+    add_run("x", cy, ns_w + gap_at, ns_e - gap_at)
+    add_run("x", cy, ns_e + gap_at, cx + reach)
     return slabs
 
 
 def _layout_rubble_shells(terrain, center):
-    """Six charred shells along the crossed broken streets."""
+    """Twelve charred shells along the three-street broken grid."""
     cx, cy = float(center[0]), float(center[1])
     ruins = []
     for i, (dx, dy, sx, sy, open_side) in enumerate(_RUBBLE_LOTS):
@@ -1383,7 +1410,9 @@ def _layout_rubble_shells(terrain, center):
 
 def _print_rubble_town(town):
     cx, cy = town.center
-    print(f"[RUBBLE-TOWN] center=({cx:.3f}, {cy:.3f})")
+    print(
+        f"[RUBBLE-TOWN] center=({cx:.3f}, {cy:.3f})  size={town.size:.0f} m"
+    )
     for i, ruin in enumerate(town.ruins):
         print(
             f"[RUBBLE-TOWN] shell[{i}] x={ruin['cx']:.3f} y={ruin['cy']:.3f} "
@@ -1392,9 +1421,11 @@ def _print_rubble_town(town):
 
 
 def verify_rubble_town(town, district):
-    """Numeric checks: 6 shells, 140 m square, ≥200 m from the district AABB."""
+    """Numeric checks: 12 shells, 220–250 m square, ≥200 m from the district AABB."""
     if len(town.ruins) != _N_RUBBLE_SHELLS:
         raise RuntimeError(f"expected {_N_RUBBLE_SHELLS} rubble shells, got {len(town.ruins)}")
+    if not (220.0 <= town.size <= 250.0):
+        raise RuntimeError(f"rubble town size {town.size:.0f} m not in 220–250 m")
     half = 0.5 * town.size
     cx, cy = town.center
     dh = 0.5 * float(district.size)
@@ -1425,14 +1456,14 @@ def verify_rubble_town(town, district):
             if rgb[0] > 0.55 or rgb[1] > 0.50 or rgb[2] > 0.45:
                 raise RuntimeError(f"shell[{i}] piece is not charred gray: {rgb}")
     print(
-        f"[RUBBLE-TOWN] check ok: n={len(town.ruins)}  "
+        f"[RUBBLE-TOWN] check ok: n={len(town.ruins)}  size={town.size:.0f} m  "
         f"gap={gap:.1f} m  (center {cx:.1f}, {cy:.1f})"
     )
     return gap
 
 
 class RubbleTownLayout:
-    """~140 m collapsed town: six reused ruin shells and broken streets only."""
+    """~240 m collapsed town: twelve reused ruin shells and broken streets only."""
 
     def __init__(self, terrain, district, scenery=None, size=RUBBLE_TOWN_SIZE, seed=RUBBLE_TOWN_SEED):
         self.size = float(size)
@@ -1813,7 +1844,7 @@ def spawn_district_in_pybullet(client, district, window_tex=None, road_tex=None)
 
 
 def spawn_rubble_town_in_pybullet(client, town):
-    """Broken cracked-road slabs plus six reused ruin shells. No intact buildings."""
+    """Broken cracked-road slabs plus twelve reused ruin shells. No intact buildings."""
     road_path = _broken_road_texture_path()
     try:
         road_tex = p.loadTexture(road_path, physicsClientId=client)

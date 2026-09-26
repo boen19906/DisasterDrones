@@ -3,7 +3,7 @@ visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
 Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
 PyBullet heightfield (one USGS patch, no tiling), places one 300 m
-district, grouped Kenney scenery, then a second 140 m rubble-only town.
+district, grouped Kenney scenery, then a second ~240 m rubble-only town.
 --procedural restores the two-downtown metro.
 Camera-only loop (no drones).
 
@@ -351,7 +351,7 @@ def build_dem_world(client, dem_path):
     print(
         f"[RUBBLE-TOWN] place+spawn={time.perf_counter() - t0:.3f}s  "
         f"center=({rubble_town.center[0]:.3f}, {rubble_town.center[1]:.3f})  "
-        f"gap={rubble_town.gap_from_district:.1f} m"
+        f"size={rubble_town.size:.0f} m  gap={rubble_town.gap_from_district:.1f} m"
     )
     for i, ruin in enumerate(rubble_town.ruins):
         print(
