@@ -2,9 +2,9 @@
 visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
 Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
-PyBullet heightfield, then tiles that patch 2x2 in memory (terrain body
-only, no town, roads, or props). --procedural restores the two-downtown
-metro. Camera-only loop (no drones).
+PyBullet heightfield, tiles that patch 2x2 in memory, then adds one plain
+300 m district of colored boxes (no roads or props). --procedural restores
+the two-downtown metro. Camera-only loop (no drones).
 
 Usage:
   cd drone_mesh_rl && python3 visualize_env.py
@@ -27,6 +27,11 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 from envs.terrain import Terrain, find_dem_file, spawn_terrain_in_pybullet
+from envs.district import (
+    DistrictLayout,
+    frame_district_camera,
+    spawn_district_in_pybullet,
+)
 from envs.town import (
     MetroLayout,
     connect_pybullet,
@@ -291,13 +296,25 @@ def build_world(client, env_size, seed):
 
 
 def build_dem_world(client, dem_path):
-    """Load the elevation GeoTIFF and spawn it as the only body (no town)."""
+    """Load the tiled USGS DEM, then one plain district (no metro/roads)."""
     t0 = time.perf_counter()
     terrain = Terrain.from_dem(dem_path)
     t_load = time.perf_counter() - t0
     t0 = time.perf_counter()
     spawn_terrain_in_pybullet(client, terrain)
     t_spawn = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    district = DistrictLayout(terrain)
+    spawn_district_in_pybullet(client, district)
+    t_district = time.perf_counter() - t0
+    counts = district.counts()
+    print(
+        f"[DISTRICT] center=({district.center[0]:.1f}, {district.center[1]:.1f})  "
+        f"size={district.size:.0f} m  "
+        f"shops={counts['shop']}  midrises={counts['midrise']}  "
+        f"towers={counts['tower']}  total={len(district.buildings)}  "
+        f"place+spawn={t_district:.3f}s"
+    )
 
     info = terrain.dem_info
     rows, cols = info["raster_shape"]
@@ -333,7 +350,7 @@ def build_dem_world(client, dem_path):
         f"[DEM] orientation: world (+X,+Y) corner = raster row 0, col {cols - 1} "
         f"(NE corner, ~{ne_lon:.5f}, {ne_lat:.5f}); north = +Y, east = +X"
     )
-    return terrain
+    return terrain, district
 
 
 def dem_move_speed(terrain):
@@ -420,7 +437,7 @@ def main():
     if args.procedural:
         print(" [3D METRO VIEWER] Two-downtown spectator")
     else:
-        print(" [3D TERRAIN VIEWER] USGS elevation spectator (2x2 tiled, no city)")
+        print(" [3D TERRAIN VIEWER] USGS elevation + one plain district")
     if not gui:
         print(" --headless: timing/body-count check (p.DIRECT).")
     else:
@@ -447,7 +464,7 @@ def main():
     move_speed = _SPEC_MOVE_SPEED
     if use_dem:
         dem_path = args.dem or find_dem_file()
-        terrain = build_dem_world(client, dem_path)
+        terrain, district = build_dem_world(client, dem_path)
         move_speed = dem_move_speed(terrain)
         print(
             f"[SPECTATOR] move speed {move_speed:.2f} m/poll "
@@ -484,7 +501,7 @@ def main():
         the camera straight back can return the previous pose.
         """
         if use_dem:
-            return frame_dem_camera(client, terrain)
+            return frame_district_camera(client, district)
         # Overview near the west downtown
         frame_town_camera(client, args.env_size * 2.5)
         cam = (
@@ -525,8 +542,8 @@ def main():
             if _key_triggered(keys, ord("r")) or _key_triggered(keys, ord("R")):
                 clear_world(client)
                 if use_dem:
-                    print("[RESET] Reloading DEM and reframing...")
-                    terrain = build_dem_world(client, dem_path)
+                    print("[RESET] Reloading DEM, district, and reframing...")
+                    terrain, district = build_dem_world(client, dem_path)
                 else:
                     print("[RESET] Rebuilding metro...")
                     seed = int(seed) + 1
