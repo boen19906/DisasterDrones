@@ -458,6 +458,13 @@ def connect_pybullet(gui=True, shadows=False):
         p.configureDebugVisualizer(
             p.COV_ENABLE_SHADOWS, 1 if shadows else 0, physicsClientId=client
         )
+        # Disable built-in W/wireframe and other GUI hotkeys so app keys win.
+        p.configureDebugVisualizer(
+            p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=client
+        )
+        p.configureDebugVisualizer(
+            p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client
+        )
     p.setGravity(0, 0, -9.81, physicsClientId=client)
     return client
 
