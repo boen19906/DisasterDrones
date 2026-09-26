@@ -1,12 +1,14 @@
 """
-visualize_env.py — Lightweight 3D spectator for the damaged town.
+visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
-Loads the town (default 250 m) plus a 100 m grass belt (450 m world) once
-in PyBullet and runs a camera-only loop (no drones, RF mesh, survivors,
-weather, or multi-agent stepping).
+Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
+PyBullet heightfield (terrain body only, no town). --procedural restores the
+two-downtown metro. Camera-only loop (no drones).
 
 Usage:
   cd drone_mesh_rl && python3 visualize_env.py
+  cd drone_mesh_rl && python3 visualize_env.py --headless   # load/spawn check only
+  cd drone_mesh_rl && python3 visualize_env.py --procedural # old metro scene
 """
 
 
@@ -23,16 +25,25 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from envs.terrain import Terrain
+from envs.terrain import Terrain, find_dem_file, spawn_terrain_in_pybullet
 from envs.town import (
-    TownLayout,
+    MetroLayout,
     connect_pybullet,
     spawn_town_in_pybullet,
     frame_town_camera,
 )
 
+# World / downtown defaults
+_WORLD_SIZE = 3250.0
+_DOWNTOWN_SIZE = 250.0
+_HEIGHT_RES = 8.0
+# Opposite sides of center with a wide green gap (~1350 m between facing edges)
+_CITY_A = (-800.0, 0.0)
+_CITY_B = (800.0, 0.0)
+
 # Spectator fly defaults (meters / degrees per key-poll at target FPS)
-_SPEC_MOVE_SPEED = 3.0  # several meters per poll — usable on a 250 m map
+# Raised so the multi-km green gap is crossable without changing key bindings.
+_SPEC_MOVE_SPEED = 18.0
 _SPEC_FAST_MULT = 3.0  # Left Ctrl sprint only (Left Shift is descend)
 _SPEC_TURN_SPEED = 2.5
 _SPEC_FLY_DIST = 1.0  # short boom so look-around feels FPS-like
@@ -40,15 +51,31 @@ _PITCH_MIN, _PITCH_MAX = -89.0, 89.0
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Damaged-town spectator viewer")
+    parser = argparse.ArgumentParser(description="USGS terrain / metro spectator viewer")
     parser.add_argument(
         "--env_size",
         type=float,
-        default=250.0,
-        help="City/town size in meters (world is env_size + 200 for the grass belt)",
+        default=_DOWNTOWN_SIZE,
+        help="Each downtown footprint size in meters (world is fixed ~3250 m)",
     )
     parser.add_argument("--fps", type=float, default=30.0, help="Display FPS target")
-    parser.add_argument("--seed", type=int, default=42, help="World seed")
+    parser.add_argument("--seed", type=int, default=42, help="World seed (--procedural)")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Skip GUI: connect p.DIRECT, print timing/body counts, then exit",
+    )
+    parser.add_argument(
+        "--dem",
+        type=str,
+        default=None,
+        help="Elevation GeoTIFF (default: the single .tif in drone_mesh_rl/data/)",
+    )
+    parser.add_argument(
+        "--procedural",
+        action="store_true",
+        help="Load the procedural two-downtown metro instead of the DEM",
+    )
     return parser.parse_args()
 
 
@@ -145,9 +172,9 @@ def _key_triggered(keys, code):
     return bool(keys.get(code, 0) & p.KEY_WAS_TRIGGERED)
 
 
-def update_spectator_camera(client, keys, yaw, pitch, dist, eye):
+def update_spectator_camera(client, keys, yaw, pitch, dist, eye, move_speed=None):
     """Minecraft-style spectator: WASD look-relative, arrows look, Space/Shift vertical."""
-    speed = _SPEC_MOVE_SPEED
+    speed = _SPEC_MOVE_SPEED if move_speed is None else float(move_speed)
     # Sprint: Left Ctrl only — Left Shift is descend, not faster
     if _key_down(keys, p.B3G_CONTROL):
         speed *= _SPEC_FAST_MULT
@@ -195,29 +222,180 @@ def update_spectator_camera(client, keys, yaw, pitch, dist, eye):
 
 
 def build_world(client, env_size, seed):
-    """Generate town + terrain and spawn them once in the open PyBullet client.
+    """Generate two downtowns + terrain and spawn them once in PyBullet."""
+    downtown = float(env_size)
+    world_size = _WORLD_SIZE
+    city_centers = [_CITY_A, _CITY_B]
 
-    env_size is the city extent. World (terrain) is env_size + 200 m so a
-    100 m grass belt surrounds the town on every side.
-    """
-    city_size = float(env_size)
-    world_size = city_size + 200.0
-    town = TownLayout(size=city_size, seed=seed, altitude_cap=40.0)
+    t0 = time.perf_counter()
+    metro = MetroLayout(
+        downtown_size=downtown,
+        seed=seed,
+        altitude_cap=40.0,
+        city_a_center=_CITY_A,
+        city_b_center=_CITY_B,
+    )
+    t_metro = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
     terrain = Terrain(
         size_x=world_size,
         size_y=world_size,
-        resolution=1.0,
+        resolution=_HEIGHT_RES,
         seed=seed,
-        city_size=city_size,
-        blend_width=30.0,
-        color_blend_width=40.0,
-        grass_cell=28.0,
-        grass_amp=1.8,
-        obstacle_boxes=town.boxes,
+        city_size=downtown,
+        city_centers=city_centers,
+        blend_width=40.0,
+        color_blend_width=55.0,
+        meadow_amp=0.30,
+        grass_cell=120.0,
+        grass_amp=2.2,
+        region_cell=220.0,
+        hill_amp_min=5.0,
+        hill_amp_max=11.0,
+        n_hill_clusters=(5, 10),
+        hill_sigma_min=90.0,
+        hill_sigma_max=160.0,
+        hill_fade=55.0,
+        max_slope=0.12,
+        obstacle_boxes=metro.boxes,
     )
-    spawn_town_in_pybullet(client, town, terrain, city_size)
-    return town, terrain, world_size
+    t_terrain = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
+    metro.apply_ground_heights(terrain)
+    t_apply = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    spawn_town_in_pybullet(client, metro, terrain, downtown)
+    t_spawn = time.perf_counter() - t0
+
+    n_roads = len(metro.roads)
+    n_dash_bodies = 0  # dashes are baked into the ground texture
+    n_bodies = p.getNumBodies(physicsClientId=client)
+    hf_bytes = int(terrain.grid_x) * int(terrain.grid_y) * 4
+    print(
+        f"[TIMING] MetroLayout={t_metro:.3f}s  Terrain={t_terrain:.3f}s  "
+        f"apply_ground_heights={t_apply:.3f}s  spawn={t_spawn:.3f}s"
+    )
+    print(
+        f"[BODIES] roads={n_roads}  dash_bodies={n_dash_bodies}  "
+        f"total={n_bodies}  "
+        f"height_grid={terrain.grid_x}x{terrain.grid_y}  "
+        f"hf_bytes={hf_bytes}  "
+        f"(buildings={len(metro.boxes)}, details={len(metro.detail_parts)}, "
+        f"texture_dashes={len(metro.road_marks)})"
+    )
+    return metro, terrain, world_size
+
+
+def build_dem_world(client, dem_path):
+    """Load the elevation GeoTIFF and spawn it as the only body (no town)."""
+    t0 = time.perf_counter()
+    terrain = Terrain.from_dem(dem_path)
+    t_load = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    spawn_terrain_in_pybullet(client, terrain)
+    t_spawn = time.perf_counter() - t0
+
+    info = terrain.dem_info
+    rows, cols = info["raster_shape"]
+    px_x, px_y = info["native_pixel"]
+    ncx, ncy = info["native_cell_m"]
+    unit = "deg" if info["crs_is_geographic"] else "CRS units"
+    hf_bytes = int(terrain.grid_x) * int(terrain.grid_y) * 4
+    zmin = terrain.z_offset
+    zmax = terrain.z_offset + float(terrain.heightmap.max())
+    ne_lon, ne_lat = info["transform"] * (cols, 0)
+    print(f"[DEM] source={info['name']}  CRS={info['crs']}  load={t_load:.3f}s  spawn={t_spawn:.3f}s")
+    print(
+        f"[DEM] raster shape={rows}x{cols} (rows x cols)  native pixel="
+        f"{px_x:.6g} x {px_y:.6g} {unit} (~{ncx:.2f} m E-W x {ncy:.2f} m N-S)"
+    )
+    print(f"[DEM] nodata filled={info['nodata_filled']} (nodata value {info['nodata_value']})")
+    print(
+        f"[DEM] grid={terrain.grid_x}x{terrain.grid_y} (x cols x y rows, "
+        f"downsample x{info['downsample']})  cell={terrain.resolution_x:.2f} x "
+        f"{terrain.resolution_y:.2f} m  world={terrain.size_x:.1f} x {terrain.size_y:.1f} m"
+    )
+    print(
+        f"[DEM] elevation min={zmin:.2f} m  max={zmax:.2f} m  relief={zmax - zmin:.2f} m  "
+        f"(world z = elevation - {zmin:.2f})"
+    )
+    print(
+        f"[DEM] heightfield bytes={hf_bytes} (< 1_000_000)  "
+        f"bodies={p.getNumBodies(physicsClientId=client)}"
+    )
+    print(
+        f"[DEM] orientation: world (+X,+Y) corner = raster row 0, col {cols - 1} "
+        f"(NE corner, ~{ne_lon:.5f}, {ne_lat:.5f}); north = +Y, east = +X"
+    )
+    return terrain
+
+
+def dem_move_speed(terrain):
+    """Meters per key poll: long side in ~13 s at 30 FPS, ~4 s with Left Ctrl."""
+    return max(1.0, max(terrain.size_x, terrain.size_y) / 400.0)
+
+
+def frame_dem_camera(client, terrain):
+    """Overview looking north from south of center that fits the whole DEM.
+
+    The GUI's far clip plane is fixed (~1000 m), so the pitch steepens from
+    -60 toward top-down until every footprint corner is inside the frustum.
+    """
+    proj = None
+    try:
+        proj = p.getDebugVisualizerCamera(physicsClientId=client)[3]
+    except Exception:
+        pass
+    if not proj or proj[0] <= 0:
+        proj = p.computeProjectionMatrixFOV(90.0, 4.0 / 3.0, 0.01, 1000.0)
+    P = np.array(proj, dtype=np.float64).reshape(4, 4).T
+    far = P[2, 3] / (P[2, 2] + 1.0)
+    top = float(terrain.heightmap.max())
+    target = [0.0, 0.0, 0.5 * top]
+    yaw = 0.0
+    xs, ys = terrain.vertex_axes()
+    corners = np.array(
+        [[x, y, z, 1.0] for x in (xs[0], xs[-1]) for y in (ys[0], ys[-1]) for z in (0.0, top)]
+    )
+
+    def fit(pitch):
+        """Smallest distance with all corners inside 90% of the view; max depth."""
+        dist = 0.1 * max(terrain.size_x, terrain.size_y)
+        for _ in range(400):
+            V = np.array(
+                p.computeViewMatrixFromYawPitchRoll(target, dist, yaw, pitch, 0.0, 2),
+                dtype=np.float64,
+            ).reshape(4, 4).T
+            clip = corners @ (P @ V).T
+            if np.all(clip[:, 3] > 0):
+                ndc = clip[:, :2] / clip[:, 3:4]
+                if np.max(np.abs(ndc)) <= 0.9:
+                    return dist, float(np.max(clip[:, 3]))
+            dist *= 1.03
+        return dist, float("inf")
+
+    for pitch in (-60.0, -65.0, -70.0, -75.0, -80.0, -85.0, -89.0):
+        dist, depth = fit(pitch)
+        if depth < 0.95 * far:
+            break
+    else:
+        print(
+            f"[CAMERA] DEM too large for the GUI far plane ({far:.0f} m); "
+            f"distant edges will clip at start"
+        )
+    p.resetDebugVisualizerCamera(
+        cameraDistance=dist,
+        cameraYaw=yaw,
+        cameraPitch=pitch,
+        cameraTargetPosition=target,
+        physicsClientId=client,
+    )
+    eye = eye_from_camera(yaw, pitch, dist, target)
+    assert eye[2] > top, "spectator must start above the highest terrain"
+    return yaw, pitch, dist, np.asarray(target, dtype=np.float64)
 
 
 def clear_world(client):
@@ -233,33 +411,96 @@ def clear_world(client):
 
 def main():
     args = parse_args()
+    # macOS has no DISPLAY (X11); only --headless opts out of the GUI.
+    gui = not args.headless
     print("=" * 65)
-    print(" [3D TOWN VIEWER] Damaged town spectator")
-    print(" Click the 3D viewport first so keys reach PyBullet.")
-    print(" Keys:")
-    print("   W/A/S/D  = fly forward/left/back/right (look-relative)")
-    print("   Arrows   = look (right/left/up/down)")
-    print("   Space    = up | Left Shift = down | Left Ctrl = sprint")
-    print("   C        = toggle spectator | P = pause | R = reset overview")
-    print("   Q / ESC  = quit")
+    if args.procedural:
+        print(" [3D METRO VIEWER] Two-downtown spectator")
+    else:
+        print(" [3D TERRAIN VIEWER] USGS elevation spectator")
+    if not gui:
+        print(" --headless: timing/body-count check (p.DIRECT).")
+    else:
+        print(" Click the 3D viewport first so keys reach PyBullet.")
+        print(" Keys:")
+        print("   W/A/S/D  = fly forward/left/back/right (look-relative)")
+        print("   Arrows   = look (right/left/up/down)")
+        print("   Space    = up | Left Shift = down | Left Ctrl = sprint")
+        print("   C        = toggle spectator | P = pause | R = reset overview")
+        print("   Q / ESC  = quit")
     print("=" * 65)
 
-    client = connect_pybullet(gui=True, shadows=False)
-    # Belt-and-suspenders: force our GUI flags again right after connect.
-    p.configureDebugVisualizer(p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=client)
-    p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client)
-    p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=client)
+    client = connect_pybullet(gui=gui, shadows=False)
+    if gui:
+        # Belt-and-suspenders: force our GUI flags again right after connect.
+        p.configureDebugVisualizer(
+            p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=client
+        )
+        p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client)
+        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=client)
 
-    town, terrain, world_size = build_world(client, args.env_size, args.seed)
-    n_buildings = len(town.boxes)
-    print(
-        f"[TOWN] Loaded {n_buildings} building/rubble/overpass boxes "
-        f"(city {args.env_size:.0f}m, world {world_size:.0f}m)."
-    )
+    use_dem = not args.procedural
+    dem_path = None
+    move_speed = _SPEC_MOVE_SPEED
+    if use_dem:
+        dem_path = args.dem or find_dem_file()
+        terrain = build_dem_world(client, dem_path)
+        move_speed = dem_move_speed(terrain)
+        print(
+            f"[SPECTATOR] move speed {move_speed:.2f} m/poll "
+            f"(x{_SPEC_FAST_MULT:g} with Left Ctrl) at {args.fps:g} FPS"
+        )
+    else:
+        town, terrain, world_size = build_world(client, args.env_size, args.seed)
+        n_buildings = len(town.boxes)
+        print(
+            f"[METRO] Loaded {n_buildings} building/rubble/overpass boxes "
+            f"(downtown {args.env_size:.0f}m x2, world {world_size:.0f}m, "
+            f"grid {terrain.grid_x}x{terrain.grid_y})."
+        )
+        if getattr(town, "gas_station", None):
+            g = town.gas_station
+            print(
+                f"[METRO] Gas station beside connector near "
+                f"({g['lot'][0]:.0f}, {g['lot'][1]:.0f}); "
+                f"{len(town.road_marks)} center dashes in ground texture."
+            )
 
-    frame_town_camera(client, world_size)
+    if not gui:
+        print("[VISUALIZER] Headless check done (GUI not opened).")
+        try:
+            p.disconnect(physicsClientId=client)
+        except Exception:
+            pass
+        return
+
+    def frame_overview():
+        """Reset the overview camera; returns (yaw, pitch, dist, target).
+
+        The GUI applies resetDebugVisualizerCamera asynchronously, so reading
+        the camera straight back can return the previous pose.
+        """
+        if use_dem:
+            return frame_dem_camera(client, terrain)
+        # Overview near the west downtown
+        frame_town_camera(client, args.env_size * 2.5)
+        cam = (
+            45.0,
+            -35.0,
+            max(220.0, args.env_size * 1.2),
+            np.array([_CITY_A[0], _CITY_A[1], 8.0]),
+        )
+        p.resetDebugVisualizerCamera(
+            cameraDistance=cam[2],
+            cameraYaw=cam[0],
+            cameraPitch=cam[1],
+            cameraTargetPosition=cam[3].tolist(),
+            physicsClientId=client,
+        )
+        return cam
+
     spectator = True
-    yaw, pitch, dist, target, eye = read_debug_camera(client)
+    yaw, pitch, dist, target = frame_overview()
     yaw, pitch, dist, eye = enter_spectator_fly(client, yaw, pitch, dist, target)
     print("[SPECTATOR] ON — click the 3D viewport, then fly with WASD / Space+Shift / arrows.")
 
@@ -279,14 +520,16 @@ def main():
                 paused = not paused
                 print(f"[{'PAUSED' if paused else 'RESUMED'}]")
             if _key_triggered(keys, ord("r")) or _key_triggered(keys, ord("R")):
-                print("[RESET] Rebuilding town...")
-                seed = int(seed) + 1
                 clear_world(client)
-                town, terrain, world_size = build_world(client, args.env_size, seed)
-                print(f"[TOWN] Loaded {len(town.boxes)} boxes (seed={seed}).")
-                frame_town_camera(client, world_size)
-                yaw, pitch, dist, target, eye = read_debug_camera(client)
-                # Re-frame overview, then return to fly mode
+                if use_dem:
+                    print("[RESET] Reloading DEM and reframing...")
+                    terrain = build_dem_world(client, dem_path)
+                else:
+                    print("[RESET] Rebuilding metro...")
+                    seed = int(seed) + 1
+                    town, terrain, world_size = build_world(client, args.env_size, seed)
+                    print(f"[METRO] Loaded {len(town.boxes)} boxes (seed={seed}).")
+                yaw, pitch, dist, target = frame_overview()
                 spectator = True
                 yaw, pitch, dist, eye = enter_spectator_fly(
                     client, yaw, pitch, dist, target
@@ -305,7 +548,7 @@ def main():
 
             if not paused and spectator:
                 yaw, pitch, dist, eye = update_spectator_camera(
-                    client, keys, yaw, pitch, dist, eye
+                    client, keys, yaw, pitch, dist, eye, move_speed=move_speed
                 )
 
             # Idle: no physics stepping, no drone/network updates

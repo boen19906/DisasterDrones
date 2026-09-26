@@ -29,7 +29,22 @@ ROAD_COLOR = [0.18, 0.18, 0.20, 1.0]
 # Pavement sits clearly above the heightfield so the two never share a plane.
 ROAD_LIFT = 0.12  # meters above local (max) ground to slab center
 ROAD_HALF_THICK = 0.035  # half-thickness → bottom ~0.085 m above peak in segment
-ROAD_SEG_LEN = 5.0  # short segments follow the heightmap
+ROAD_SEG_LEN = 40.0  # long slabs; streets are flattened before paving
+
+# Center-line dashes (above pavement, never coplanar with ground)
+DASH_COLOR = [0.92, 0.86, 0.28, 1.0]
+DASH_HALF_THICK = 0.02
+DASH_LEN = 2.4
+DASH_WIDTH = 0.16
+DASH_GAP = 3.6
+# Dash center sits above pavement top
+DASH_ABOVE_PAVEMENT = ROAD_HALF_THICK + DASH_HALF_THICK + 0.015
+
+SIGN_POST_COLOR = [0.35, 0.35, 0.32, 1.0]
+SIGN_BOARD_COLOR = [0.75, 0.22, 0.18, 1.0]
+GAS_CANOPY_COLOR = [0.85, 0.75, 0.20, 1.0]
+GAS_SHOP_COLOR = [0.62, 0.62, 0.58, 1.0]
+GAS_PUMP_COLOR = [0.25, 0.25, 0.28, 1.0]
 
 BUILDING_TYPE_NAMES = ("shop", "row", "midrise", "tower", "lshape", "setback")
 
@@ -47,8 +62,8 @@ def _sample_heightmap(terrain, x, y):
     """Nearest heightmap sample; works without Terrain helpers."""
     half_x = terrain.size_x / 2.0
     half_y = terrain.size_y / 2.0
-    j = int((x + half_x) / terrain.resolution)
-    i = int((y + half_y) / terrain.resolution)
+    j = int((x + half_x) / getattr(terrain, "resolution_x", terrain.resolution))
+    i = int((y + half_y) / getattr(terrain, "resolution_y", terrain.resolution))
     j = int(np.clip(j, 0, terrain.grid_x - 1))
     i = int(np.clip(i, 0, terrain.grid_y - 1))
     return float(terrain.heightmap[i, j])
@@ -72,9 +87,10 @@ class TownLayout:
         Meters per walkable cell.
     """
 
-    def __init__(self, size=250.0, seed=None, altitude_cap=40.0):
+    def __init__(self, size=250.0, seed=None, altitude_cap=40.0, origin=(0.0, 0.0)):
         self.size = float(size)
         self.altitude_cap = float(altitude_cap)
+        self.origin = (float(origin[0]), float(origin[1]))
         self.rng = np.random.default_rng(seed)
 
         half = self.size / 2.0
@@ -91,6 +107,8 @@ class TownLayout:
         self.buildings: list[dict] = []
         # Visual-only detail AABBs: (xmin, ymin, zmin, xmax, ymax, zmax, rgba)
         self.detail_parts: list[tuple] = []
+        # Center-line dashes: (cx, cy, hx, hy, z, rgba)
+        self.road_marks: list[tuple] = []
         self._ground_applied = False
 
         self._build_street_grid(half)
@@ -98,6 +116,31 @@ class TownLayout:
         self._place_rubble(half)
         self._place_overpasses(half)
         self._finalize_walkable(half)
+        self._apply_origin_offset()
+
+    def _apply_origin_offset(self):
+        """Shift local (-half..half) layout into world coordinates."""
+        ox, oy = self.origin
+        if abs(ox) < 1e-12 and abs(oy) < 1e-12:
+            return
+        if self.boxes.size:
+            self.boxes[:, 0] += ox
+            self.boxes[:, 1] += oy
+            self.boxes[:, 3] += ox
+            self.boxes[:, 4] += oy
+        lifted = []
+        for xmin, ymin, zmin, xmax, ymax, zmax, rgba in self.detail_parts:
+            lifted.append(
+                (xmin + ox, ymin + oy, zmin, xmax + ox, ymax + oy, zmax, rgba)
+            )
+        self.detail_parts = lifted
+        for b in self.buildings:
+            b["footprints"] = [
+                (fx0 + ox, fx1 + ox, fy0 + oy, fy1 + oy)
+                for fx0, fx1, fy0, fy1 in b["footprints"]
+            ]
+        self.street_centers_x = [c + ox for c in self.street_centers_x]
+        self.street_centers_y = [c + oy for c in self.street_centers_y]
 
     # ------------------------------------------------------------------
     # Layout generation
@@ -757,15 +800,18 @@ class TownLayout:
 
     def _build_road_segments(self, terrain):
         """
-        Short elevated pavement segments that follow the heightmap.
+        Elevated pavement segments that follow the (flattened) heightmap.
 
         Full-map slabs at one Z pierce rolling ground and z-fight; X/Y streets
         also stacked two slabs at every intersection. Here each segment uses
         the max local ground along its span, sits ROAD_LIFT above that, and
-        Y-streets skip X-street bands so only one face exists at each paved
-        (x, y).
+        east–west runs skip north–south street bands so only one face exists
+        at each paved (x, y).
         """
         half = self.size / 2.0
+        ox, oy = self.origin
+        y_lo, y_hi = oy - half, oy + half
+        x_lo, x_hi = ox - half, ox + half
         half_w = self.street_width / 2.0
         seg = ROAD_SEG_LEN
         roads = []
@@ -791,9 +837,9 @@ class TownLayout:
 
         # North–south streets (constant x): cover full run, including crossings.
         for cx in self.street_centers_x:
-            y0 = -half
-            while y0 < half - 1e-6:
-                y1 = min(y0 + seg, half)
+            y0 = y_lo
+            while y0 < y_hi - 1e-6:
+                y1 = min(y0 + seg, y_hi)
                 hy = 0.5 * (y1 - y0)
                 if hy < 0.05:
                     break
@@ -802,21 +848,32 @@ class TownLayout:
                 roads.append((float(cx), float(cy), float(half_w), float(hy), z))
                 y0 = y1
 
-        # East–west streets (constant y): skip cells already paved by N–S streets.
+        # East–west streets (constant y): carve out N–S bands, then long slabs.
         for cy in self.street_centers_y:
-            x0 = -half
-            while x0 < half - 1e-6:
-                x1 = min(x0 + seg, half)
-                hx = 0.5 * (x1 - x0)
-                if hx < 0.05:
-                    break
-                cx = 0.5 * (x0 + x1)
-                if any(abs(cx - sx) <= half_w for sx in self.street_centers_x):
+            intervals = [(x_lo, x_hi)]
+            for sx in self.street_centers_x:
+                band_lo, band_hi = sx - half_w, sx + half_w
+                next_intervals = []
+                for a, b in intervals:
+                    if b <= band_lo or a >= band_hi:
+                        next_intervals.append((a, b))
+                        continue
+                    if a < band_lo:
+                        next_intervals.append((a, band_lo))
+                    if band_hi < b:
+                        next_intervals.append((band_hi, b))
+                intervals = next_intervals
+            for a, b in intervals:
+                x0 = a
+                while x0 < b - 1e-6:
+                    x1 = min(x0 + seg, b)
+                    hx = 0.5 * (x1 - x0)
+                    if hx < 0.05:
+                        break
+                    cx = 0.5 * (x0 + x1)
+                    z = elev(sample_grid(x0, x1, cy, half_w, along_is_y=False))
+                    roads.append((float(cx), float(cy), float(hx), float(half_w), z))
                     x0 = x1
-                    continue
-                z = elev(sample_grid(x0, x1, cy, half_w, along_is_y=False))
-                roads.append((float(cx), float(cy), float(hx), float(half_w), z))
-                x0 = x1
 
         return roads
 
@@ -826,6 +883,7 @@ class TownLayout:
         ribbon. Does not change wilderness outside the city footprint.
         """
         half_city = self.size / 2.0
+        ox, oy = self.origin
         half_w = self.street_width / 2.0 + 0.75
         Z = terrain.heightmap
         gy, gx = Z.shape
@@ -840,7 +898,9 @@ class TownLayout:
             mask |= np.abs(XX - sx) <= half_w
         for sy in self.street_centers_y:
             mask |= np.abs(YY - sy) <= half_w
-        mask &= (np.abs(XX) <= half_city + 1.0) & (np.abs(YY) <= half_city + 1.0)
+        mask &= (np.abs(XX - ox) <= half_city + 1.0) & (
+            np.abs(YY - oy) <= half_city + 1.0
+        )
         if not mask.any():
             return
         # Mild blur, then write only into street cells (lots / rim stay put).
@@ -902,6 +962,7 @@ class TownLayout:
             self.detail_parts = lifted_details
 
         self.roads = self._build_road_segments(terrain)
+        self.road_marks = []
         self._ground_applied = True
 
     # ------------------------------------------------------------------
@@ -910,10 +971,11 @@ class TownLayout:
 
     def is_walkable(self, x, y):
         """Return True if (x, y) is on a street or open lot (not in a building)."""
+        ox, oy = self.origin
         half = self.size / 2.0
         res = self.walkable_resolution
-        gx = int((x + half) / res)
-        gy = int((y + half) / res)
+        gx = int((x - ox + half) / res)
+        gy = int((y - oy + half) / res)
         if gx < 0 or gy < 0 or gx >= self.walkable.shape[1] or gy >= self.walkable.shape[0]:
             return False
         return bool(self.walkable[gy, gx])
@@ -931,11 +993,12 @@ class TownLayout:
             return np.zeros((n, 2))
         idx = rng.choice(len(xs), size=n, replace=True)
         half = self.size / 2.0
+        ox, oy = self.origin
         res = self.walkable_resolution
         pts = np.column_stack(
             [
-                xs[idx] * res - half + res * 0.5,
-                ys[idx] * res - half + res * 0.5,
+                xs[idx] * res - half + res * 0.5 + ox,
+                ys[idx] * res - half + res * 0.5 + oy,
             ]
         )
         return pts
@@ -1048,6 +1111,512 @@ class TownLayout:
         return not TownLayout.segment_hits_boxes(point_a, point_b, boxes)
 
 
+def _elev_points(terrain, points):
+    return max(_sample_heightmap(terrain, x, y) for x, y in points) + ROAD_LIFT
+
+
+def _sample_rect_points(u0, u1, v_center, half_cross, along_is_y):
+    n_along = max(3, int(np.ceil(abs(u1 - u0) / 1.0)) + 1)
+    n_cross = max(3, int(np.ceil((2.0 * half_cross) / 1.5)) + 1)
+    along = np.linspace(u0, u1, n_along)
+    cross = np.linspace(v_center - half_cross, v_center + half_cross, n_cross)
+    pts = []
+    for a in along:
+        for c in cross:
+            if along_is_y:
+                pts.append((float(c), float(a)))
+            else:
+                pts.append((float(a), float(c)))
+    return pts
+
+
+def _dashes_along_line(terrain, x0, y0, x1, y1, marks_out):
+    """Append raised center-line dashes along a straight segment."""
+    dx = x1 - x0
+    dy = y1 - y0
+    length = float(np.hypot(dx, dy))
+    if length < DASH_LEN:
+        return
+    ux, uy = dx / length, dy / length
+    # Perpendicular half-width axis: dash extent across the road
+    px, py = -uy, ux
+    step = DASH_LEN + DASH_GAP
+    s = DASH_GAP * 0.5
+    hx = 0.5 * DASH_LEN
+    hy = 0.5 * DASH_WIDTH
+    while s + DASH_LEN <= length + 1e-6:
+        mid = s + 0.5 * DASH_LEN
+        cx = x0 + ux * mid
+        cy = y0 + uy * mid
+        # Axis-aligned dash box oriented to the road (approx via extents)
+        if abs(ux) >= abs(uy):
+            # Mostly east–west: length along x
+            half_x, half_y = hx, hy
+        else:
+            half_x, half_y = hy, hx
+        gz = _sample_heightmap(terrain, cx, cy)
+        z = gz + ROAD_LIFT + DASH_ABOVE_PAVEMENT
+        marks_out.append(
+            (float(cx), float(cy), float(half_x), float(half_y), float(z), list(DASH_COLOR))
+        )
+        s += step
+
+
+def _add_sign(detail_parts, terrain, x, y, facing_x=True):
+    """Post + board a bit above ground, clear of the roadway."""
+    gz = _sample_heightmap(terrain, x, y)
+    post_w = 0.08
+    post_h = 2.4
+    board_w = 1.1
+    board_d = 0.06
+    board_h = 0.7
+    board_z0 = gz + 1.5
+    detail_parts.append(
+        (
+            x - post_w,
+            y - post_w,
+            gz + 0.02,
+            x + post_w,
+            y + post_w,
+            gz + post_h,
+            list(SIGN_POST_COLOR),
+        )
+    )
+    if facing_x:
+        detail_parts.append(
+            (
+                x - board_d * 0.5,
+                y - board_w * 0.5,
+                board_z0,
+                x + board_d * 0.5,
+                y + board_w * 0.5,
+                board_z0 + board_h,
+                list(SIGN_BOARD_COLOR),
+            )
+        )
+    else:
+        detail_parts.append(
+            (
+                x - board_w * 0.5,
+                y - board_d * 0.5,
+                board_z0,
+                x + board_w * 0.5,
+                y + board_d * 0.5,
+                board_z0 + board_h,
+                list(SIGN_BOARD_COLOR),
+            )
+        )
+
+
+class MetroLayout:
+    """
+    Two street-aligned downtowns on opposite sides of the map center, joined
+    by one connector road with a midpoint gas station, center dashes, and
+    scattered roadside signs.
+
+    Presents the same box/road/detail API as TownLayout for spawning.
+    """
+
+    def __init__(
+        self,
+        downtown_size=250.0,
+        seed=None,
+        altitude_cap=40.0,
+        city_a_center=(-800.0, 0.0),
+        city_b_center=(800.0, 0.0),
+    ):
+        self.downtown_size = float(downtown_size)
+        self.altitude_cap = float(altitude_cap)
+        self.city_a_center = (float(city_a_center[0]), float(city_a_center[1]))
+        self.city_b_center = (float(city_b_center[0]), float(city_b_center[1]))
+        self.rng = np.random.default_rng(seed)
+        seed0 = None if seed is None else int(seed)
+        seed1 = None if seed is None else int(seed) + 101
+
+        self.town_a = TownLayout(
+            size=self.downtown_size,
+            seed=seed0,
+            altitude_cap=altitude_cap,
+            origin=self.city_a_center,
+        )
+        self.town_b = TownLayout(
+            size=self.downtown_size,
+            seed=seed1,
+            altitude_cap=altitude_cap,
+            origin=self.city_b_center,
+        )
+
+        # Pick an E–W street near each downtown center and join them
+        self.connector_y = self._pick_connector_y()
+        half = self.downtown_size / 2.0
+        ax, ay = self.city_a_center
+        bx, by = self.city_b_center
+        # West downtown is town_a when ax < bx
+        if ax <= bx:
+            self.connector_x0 = ax + half
+            self.connector_x1 = bx - half
+            self.west_town = self.town_a
+            self.east_town = self.town_b
+        else:
+            self.connector_x0 = bx + half
+            self.connector_x1 = ax - half
+            self.west_town = self.town_b
+            self.east_town = self.town_a
+
+        self.street_width = float(self.town_a.street_width)
+        self.size = float(
+            max(
+                abs(self.city_a_center[0]) + half,
+                abs(self.city_b_center[0]) + half,
+                abs(self.city_a_center[1]) + half,
+                abs(self.city_b_center[1]) + half,
+            )
+            * 2.0
+        )
+        self.origin = (0.0, 0.0)
+
+        self.boxes = np.zeros((0, 6), dtype=np.float64)
+        self.styles: list[str] = []
+        self.detail_parts: list[tuple] = []
+        self.buildings: list[dict] = []
+        self.building_types: list[str] = []
+        self.overpass_indices: list[int] = []
+        self.roads: list[tuple] = []
+        self.road_marks: list[tuple] = []
+        self.gas_station = None  # filled in apply_ground_heights
+        self._ground_applied = False
+
+        self._merge_towns()
+
+    def _pick_connector_y(self):
+        """Use the west downtown's near-center E–W street so the join is flush."""
+        west = self.town_a if self.city_a_center[0] <= self.city_b_center[0] else self.town_b
+        east = self.town_b if west is self.town_a else self.town_a
+        oy = west.origin[1]
+        y = min(west.street_centers_y, key=lambda v: abs(v - oy))
+        # Ensure the east downtown also paves this corridor into its streets
+        if not any(abs(sy - y) < 0.5 for sy in east.street_centers_y):
+            east.street_centers_y.append(float(y))
+            east.street_centers_y.sort()
+        return float(y)
+
+    def _merge_towns(self):
+        """Concatenate building geometry from both downtowns."""
+        parts = []
+        styles = []
+        details = []
+        buildings = []
+        btypes = []
+        overpass = []
+        offset = 0
+        for town in (self.town_a, self.town_b):
+            if town.boxes.size:
+                parts.append(town.boxes.copy())
+            styles.extend(town.styles)
+            details.extend(list(town.detail_parts))
+            for b in town.buildings:
+                nb = dict(b)
+                nb["box_indices"] = [i + offset for i in b["box_indices"]]
+                buildings.append(nb)
+            btypes.extend(town.building_types)
+            overpass.extend(i + offset for i in town.overpass_indices)
+            offset += len(town.styles)
+
+        if parts:
+            self.boxes = np.vstack(parts)
+        else:
+            self.boxes = np.zeros((0, 6), dtype=np.float64)
+        self.styles = styles
+        self.detail_parts = details
+        self.buildings = buildings
+        self.building_types = btypes
+        self.overpass_indices = overpass
+
+    def _flatten_connector(self, terrain):
+        half_w = self.street_width / 2.0 + 0.75
+        Z = terrain.heightmap
+        gy, gx = Z.shape
+        res = float(terrain.resolution)
+        half_x = terrain.size_x / 2.0
+        half_y = terrain.size_y / 2.0
+        xs = (np.arange(gx) + 0.5) * res - half_x
+        ys = (np.arange(gy) + 0.5) * res - half_y
+        XX, YY = np.meshgrid(xs, ys)
+        mask = (
+            (XX >= self.connector_x0 - 1.0)
+            & (XX <= self.connector_x1 + 1.0)
+            & (np.abs(YY - self.connector_y) <= half_w)
+        )
+        if not mask.any():
+            return
+        try:
+            from .terrain import _box_blur
+        except Exception:
+            return
+        radius = max(1, int(round(2.0 / res)))
+        smooth = _box_blur(Z, radius=radius, passes=3)
+        Z[mask] = smooth[mask]
+
+    def _build_connector_roads(self, terrain):
+        half_w = self.street_width / 2.0
+        seg = ROAD_SEG_LEN
+        cy = self.connector_y
+        roads = []
+        x0 = self.connector_x0
+        while x0 < self.connector_x1 - 1e-6:
+            x1 = min(x0 + seg, self.connector_x1)
+            hx = 0.5 * (x1 - x0)
+            if hx < 0.05:
+                break
+            cx = 0.5 * (x0 + x1)
+            z = _elev_points(
+                terrain, _sample_rect_points(x0, x1, cy, half_w, along_is_y=False)
+            )
+            roads.append((float(cx), float(cy), float(hx), float(half_w), z))
+            x0 = x1
+        return roads
+
+    def _place_gas_station(self, terrain):
+        """Canopy + shop + pumps beside the connector midpoint (not in roadway)."""
+        mx = 0.5 * (self.connector_x0 + self.connector_x1)
+        my = self.connector_y
+        half_w = self.street_width / 2.0
+        # Sit north of the road
+        side = 1.0 if self.rng.random() < 0.5 else -1.0
+        lot_y = my + side * (half_w + 14.0)
+        gz = _sample_heightmap(terrain, mx, lot_y)
+
+        # Shop box (colliding)
+        shop_w, shop_d, shop_h = 8.0, 6.0, 3.5
+        sx0 = mx - shop_w * 0.5
+        sx1 = mx + shop_w * 0.5
+        # Shop farther from road than pumps
+        sy_shop = lot_y + side * 6.0
+        sy0 = sy_shop - shop_d * 0.5
+        sy1 = sy_shop + shop_d * 0.5
+        self._add_box(sx0, sy0, gz, sx1, sy1, gz + shop_h, "concrete")
+
+        # Canopy (visual)
+        canopy_w, canopy_d, canopy_h = 12.0, 8.0, 0.35
+        canopy_z = gz + 4.2
+        cy_can = lot_y - side * 1.5
+        self.detail_parts.append(
+            (
+                mx - canopy_w * 0.5,
+                cy_can - canopy_d * 0.5,
+                canopy_z,
+                mx + canopy_w * 0.5,
+                cy_can + canopy_d * 0.5,
+                canopy_z + canopy_h,
+                list(GAS_CANOPY_COLOR),
+            )
+        )
+        # Canopy posts
+        for px in (mx - 4.5, mx + 4.5):
+            for py in (cy_can - 3.0, cy_can + 3.0):
+                self.detail_parts.append(
+                    (
+                        px - 0.12,
+                        py - 0.12,
+                        gz + 0.02,
+                        px + 0.12,
+                        py + 0.12,
+                        canopy_z,
+                        list(SIGN_POST_COLOR),
+                    )
+                )
+
+        # Pump boxes under canopy
+        pump_w, pump_d, pump_h = 1.0, 0.7, 1.4
+        for i, ox in enumerate((-3.0, 3.0)):
+            px = mx + ox
+            py = cy_can
+            self.detail_parts.append(
+                (
+                    px - pump_w * 0.5,
+                    py - pump_d * 0.5,
+                    gz + 0.02,
+                    px + pump_w * 0.5,
+                    py + pump_d * 0.5,
+                    gz + pump_h,
+                    list(GAS_PUMP_COLOR),
+                )
+            )
+
+        self.gas_station = {
+            "midpoint": (float(mx), float(my)),
+            "lot": (float(mx), float(lot_y)),
+            "side": float(side),
+        }
+
+    def _add_box(self, xmin, ymin, zmin, xmax, ymax, zmax, style):
+        row = np.array([[xmin, ymin, zmin, xmax, ymax, zmax]], dtype=np.float64)
+        self.boxes = row if self.boxes.size == 0 else np.vstack([self.boxes, row])
+        self.styles.append(style)
+        return len(self.styles) - 1
+
+    def _build_dashes_and_signs(self, terrain):
+        marks = []
+        # Connector center line
+        _dashes_along_line(
+            terrain,
+            self.connector_x0,
+            self.connector_y,
+            self.connector_x1,
+            self.connector_y,
+            marks,
+        )
+
+        # Main downtown streets: near-center N–S and E–W per town
+        for town in (self.town_a, self.town_b):
+            ox, oy = town.origin
+            half = town.size / 2.0
+            # Primary E–W (connector-aligned) and primary N–S (through origin)
+            main_ey = min(town.street_centers_y, key=lambda y: abs(y - oy))
+            main_sx = min(town.street_centers_x, key=lambda x: abs(x - ox))
+            _dashes_along_line(
+                terrain, ox - half, main_ey, ox + half, main_ey, marks
+            )
+            _dashes_along_line(
+                terrain, main_sx, oy - half, main_sx, oy + half, marks
+            )
+
+        self.road_marks = marks
+
+        # Modest roadside signs along connector + main streets
+        sign_spacing = 140.0
+        rng = self.rng
+        half_w = self.street_width / 2.0
+
+        def scatter_signs(x0, y0, x1, y1, along_x):
+            length = float(np.hypot(x1 - x0, y1 - y0))
+            if length < 40.0:
+                return
+            n = max(1, int(length / sign_spacing))
+            for i in range(n):
+                if rng.random() < 0.25:
+                    continue  # skip some so it is not regular
+                t = (i + 0.5) / n
+                t += float(rng.uniform(-0.08, 0.08))
+                t = float(np.clip(t, 0.05, 0.95))
+                x = x0 + (x1 - x0) * t
+                y = y0 + (y1 - y0) * t
+                side = 1.0 if rng.random() < 0.5 else -1.0
+                if along_x:
+                    sx, sy = x, y + side * (half_w + 2.2)
+                    facing_x = True
+                else:
+                    sx, sy = x + side * (half_w + 2.2), y
+                    facing_x = False
+                _add_sign(self.detail_parts, terrain, sx, sy, facing_x=facing_x)
+
+        scatter_signs(
+            self.connector_x0,
+            self.connector_y,
+            self.connector_x1,
+            self.connector_y,
+            along_x=True,
+        )
+        for town in (self.town_a, self.town_b):
+            ox, oy = town.origin
+            half = town.size / 2.0
+            main_ey = min(town.street_centers_y, key=lambda y: abs(y - oy))
+            main_sx = min(town.street_centers_x, key=lambda x: abs(x - ox))
+            scatter_signs(ox - half, main_ey, ox + half, main_ey, along_x=True)
+            scatter_signs(main_sx, oy - half, main_sx, oy + half, along_x=False)
+
+    def apply_ground_heights(self, terrain):
+        """Lift both downtowns, pave the connector, place gas / dashes / signs."""
+        if self._ground_applied:
+            return
+
+        # Flatten street ribbons in each downtown + connector corridor
+        self.town_a._flatten_street_heightmap(terrain)
+        self.town_b._flatten_street_heightmap(terrain)
+        self._flatten_connector(terrain)
+
+        # Re-merge boxes/details from towns (still at z relative / local base)
+        # Towns have not applied ground yet — lift unified lists ourselves.
+        self._merge_towns()
+
+        def lift_box_row(box, style):
+            xmin, ymin, zmin, xmax, ymax, zmax = box
+            cx = 0.5 * (xmin + xmax)
+            cy = 0.5 * (ymin + ymax)
+            gz = _sample_heightmap(terrain, cx, cy)
+            if style == "overpass":
+                clearance = zmin
+                thickness = zmax - zmin
+                return (
+                    xmin,
+                    ymin,
+                    gz + clearance,
+                    xmax,
+                    ymax,
+                    gz + clearance + thickness,
+                )
+            return (xmin, ymin, gz + zmin, xmax, ymax, gz + zmin + (zmax - zmin))
+
+        if self.boxes.size:
+            new_boxes = self.boxes.copy()
+            for i, box in enumerate(self.boxes):
+                style = self.styles[i] if i < len(self.styles) else "concrete"
+                new_boxes[i] = lift_box_row(box, style)
+            self.boxes = new_boxes
+
+        if self.detail_parts:
+            lifted_details = []
+            for xmin, ymin, zmin, xmax, ymax, zmax, rgba in self.detail_parts:
+                cx = 0.5 * (xmin + xmax)
+                cy = 0.5 * (ymin + ymax)
+                gz = _sample_heightmap(terrain, cx, cy)
+                z0 = zmin if zmin > 1e-6 else 0.02
+                lifted_details.append(
+                    (xmin, ymin, gz + z0, xmax, ymax, gz + zmax, rgba)
+                )
+            self.detail_parts = lifted_details
+
+        # Mark towns applied so they are not double-lifted if reused
+        self.town_a._ground_applied = True
+        self.town_b._ground_applied = True
+        self.town_a.roads = self.town_a._build_road_segments(terrain)
+        self.town_b.roads = self.town_b._build_road_segments(terrain)
+
+        self.roads = list(self.town_a.roads) + list(self.town_b.roads)
+        self.roads.extend(self._build_connector_roads(terrain))
+
+        self._place_gas_station(terrain)
+        self._build_dashes_and_signs(terrain)
+        self._ground_applied = True
+
+    def is_walkable(self, x, y):
+        return self.town_a.is_walkable(x, y) or self.town_b.is_walkable(x, y)
+
+    def sample_walkable(self, rng, n=1, prefer_street=True):
+        n_a = n // 2
+        n_b = n - n_a
+        pts_a = self.town_a.sample_walkable(rng, n=max(n_a, 1), prefer_street=prefer_street)
+        pts_b = self.town_b.sample_walkable(rng, n=max(n_b, 1), prefer_street=prefer_street)
+        pts = np.vstack([pts_a[:n_a], pts_b[:n_b]]) if n > 1 else pts_a
+        return pts[:n]
+
+    def footprints_2d(self):
+        out = []
+        for i, b in enumerate(self.boxes):
+            out.append(
+                {
+                    "xmin": round(float(b[0]), 2),
+                    "ymin": round(float(b[1]), 2),
+                    "xmax": round(float(b[3]), 2),
+                    "ymax": round(float(b[4]), 2),
+                    "style": self.styles[i],
+                    "zmin": round(float(b[2]), 2),
+                    "zmax": round(float(b[5]), 2),
+                }
+            )
+        return out
+
+
 def connect_pybullet(gui=True, shadows=False):
     """Open a PyBullet client. Shadows default off for a lighter GUI."""
     client = p.connect(p.GUI if gui else p.DIRECT)
@@ -1072,8 +1641,9 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
     Load one dusty heightfield plus elevated road segments and building visuals.
 
     The heightfield is the only full-map ground surface (collision + visual).
-    Roads are short pavement slabs ~ROAD_LIFT above local ground — not a second
-    ground pad. No city-wide or rim color plates. Returns
+    Roads are pavement slabs ~ROAD_LIFT above local ground — not a second
+    ground pad. Center dashes are baked into the ground texture (not bodies).
+    No city-wide or rim color plates. Returns
     (terrain_body, road_bodies, building_bodies).
 
     Mesh scale uses terrain.size_x / terrain.grid_x so a grass-belt world
@@ -1087,6 +1657,15 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
     town.apply_ground_heights(terrain)
     if hasattr(terrain, "set_obstacle_boxes"):
         terrain.set_obstacle_boxes(town.boxes)
+
+    # PyBullet GUI shared-memory upload refuses float buffers > 1 MiB.
+    hf_bytes = int(terrain.grid_x) * int(terrain.grid_y) * 4
+    if hf_bytes >= 1_000_000:
+        raise ValueError(
+            f"heightfield upload {hf_bytes} bytes "
+            f"({terrain.grid_x}x{terrain.grid_y}) exceeds safe 1 MB limit; "
+            f"coarsen resolution (got {terrain.resolution} m)"
+        )
 
     # One image covers the heightfield once (PyBullet convention).
     tex_scale = (grid - 1) / 2.0
@@ -1111,12 +1690,14 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
         physicsClientId=client,
     )
 
-    # Ground texture: dusty city feathers to grass. White tint so rgba does
-    # not multiply brown on top of the texture colors.
+    # Ground texture: dusty city feathers to grass, plus yellow center dashes
+    # baked in (no per-dash MultiBody). White tint so rgba does not multiply
+    # brown on top of the texture colors.
     texture_id = -1
     if hasattr(terrain, "get_ground_texture_path"):
         try:
-            tex_path = terrain.get_ground_texture_path()
+            marks = getattr(town, "road_marks", None) or None
+            tex_path = terrain.get_ground_texture_path(road_marks=marks)
             texture_id = p.loadTexture(tex_path, physicsClientId=client)
         except Exception:
             texture_id = -1
@@ -1153,6 +1734,8 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
             physicsClientId=client,
         )
         road_bodies.append(bid)
+
+    # Center-line dashes are drawn into the ground texture (not spawned).
 
     building_bodies = []
 
