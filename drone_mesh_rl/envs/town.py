@@ -26,6 +26,10 @@ BUILDING_COLORS = {
 }
 
 ROAD_COLOR = [0.18, 0.18, 0.20, 1.0]
+# Pavement sits clearly above the heightfield so the two never share a plane.
+ROAD_LIFT = 0.12  # meters above local (max) ground to slab center
+ROAD_HALF_THICK = 0.035  # half-thickness → bottom ~0.085 m above peak in segment
+ROAD_SEG_LEN = 5.0  # short segments follow the heightmap
 
 BUILDING_TYPE_NAMES = ("shop", "row", "midrise", "tower", "lshape", "setback")
 
@@ -117,13 +121,8 @@ class TownLayout:
         self.street_centers_x = centers
         self.street_centers_y = list(centers)
         self.street_width = street_width
-
-        # Road visual slabs (no collision)
-        z_road = 0.05
-        for cx in self.street_centers_x:
-            self.roads.append((cx, 0.0, street_width / 2, half, z_road))
-        for cy in self.street_centers_y:
-            self.roads.append((0.0, cy, half, street_width / 2, z_road))
+        # Road visual segments are built in apply_ground_heights once terrain exists.
+        self.roads = []
 
     def _block_rects(self, half):
         """Yield (xmin, xmax, ymin, ymax) for building blocks between streets."""
@@ -756,14 +755,116 @@ class TownLayout:
 
         self.street_mask = street
 
+    def _build_road_segments(self, terrain):
+        """
+        Short elevated pavement segments that follow the heightmap.
+
+        Full-map slabs at one Z pierce rolling ground and z-fight; X/Y streets
+        also stacked two slabs at every intersection. Here each segment uses
+        the max local ground along its span, sits ROAD_LIFT above that, and
+        Y-streets skip X-street bands so only one face exists at each paved
+        (x, y).
+        """
+        half = self.size / 2.0
+        half_w = self.street_width / 2.0
+        seg = ROAD_SEG_LEN
+        roads = []
+
+        def elev(points):
+            gz = max(_sample_heightmap(terrain, x, y) for x, y in points)
+            return gz + ROAD_LIFT
+
+        def sample_grid(u0, u1, v_center, half_cross, along_is_y):
+            """Dense samples over a pavement rectangle for max-height elev."""
+            n_along = max(3, int(np.ceil((u1 - u0) / 1.0)) + 1)
+            n_cross = max(3, int(np.ceil((2.0 * half_cross) / 1.5)) + 1)
+            along = np.linspace(u0, u1, n_along)
+            cross = np.linspace(v_center - half_cross, v_center + half_cross, n_cross)
+            pts = []
+            for a in along:
+                for c in cross:
+                    if along_is_y:
+                        pts.append((float(c), float(a)))  # x=cross, y=along
+                    else:
+                        pts.append((float(a), float(c)))  # x=along, y=cross
+            return pts
+
+        # North–south streets (constant x): cover full run, including crossings.
+        for cx in self.street_centers_x:
+            y0 = -half
+            while y0 < half - 1e-6:
+                y1 = min(y0 + seg, half)
+                hy = 0.5 * (y1 - y0)
+                if hy < 0.05:
+                    break
+                cy = 0.5 * (y0 + y1)
+                z = elev(sample_grid(y0, y1, cx, half_w, along_is_y=True))
+                roads.append((float(cx), float(cy), float(half_w), float(hy), z))
+                y0 = y1
+
+        # East–west streets (constant y): skip cells already paved by N–S streets.
+        for cy in self.street_centers_y:
+            x0 = -half
+            while x0 < half - 1e-6:
+                x1 = min(x0 + seg, half)
+                hx = 0.5 * (x1 - x0)
+                if hx < 0.05:
+                    break
+                cx = 0.5 * (x0 + x1)
+                if any(abs(cx - sx) <= half_w for sx in self.street_centers_x):
+                    x0 = x1
+                    continue
+                z = elev(sample_grid(x0, x1, cy, half_w, along_is_y=False))
+                roads.append((float(cx), float(cy), float(hx), float(half_w), z))
+                x0 = x1
+
+        return roads
+
+    def _flatten_street_heightmap(self, terrain):
+        """
+        Soften heightmap noise on street corridors so pavement rides a smooth
+        ribbon. Does not change wilderness outside the city footprint.
+        """
+        half_city = self.size / 2.0
+        half_w = self.street_width / 2.0 + 0.75
+        Z = terrain.heightmap
+        gy, gx = Z.shape
+        res = float(terrain.resolution)
+        half_x = terrain.size_x / 2.0
+        half_y = terrain.size_y / 2.0
+        xs = (np.arange(gx) + 0.5) * res - half_x
+        ys = (np.arange(gy) + 0.5) * res - half_y
+        XX, YY = np.meshgrid(xs, ys)
+        mask = np.zeros_like(Z, dtype=bool)
+        for sx in self.street_centers_x:
+            mask |= np.abs(XX - sx) <= half_w
+        for sy in self.street_centers_y:
+            mask |= np.abs(YY - sy) <= half_w
+        mask &= (np.abs(XX) <= half_city + 1.0) & (np.abs(YY) <= half_city + 1.0)
+        if not mask.any():
+            return
+        # Mild blur, then write only into street cells (lots / rim stay put).
+        try:
+            from .terrain import _box_blur
+        except Exception:
+            return
+        radius = max(1, int(round(2.0 / res)))
+        smooth = _box_blur(Z, radius=radius, passes=3)
+        Z[mask] = smooth[mask]
+
     def apply_ground_heights(self, terrain):
         """
         Shift building / overpass / detail AABB z so bases follow the heightmap.
 
         Call after Terrain is built. Relative heights are preserved. Idempotent.
+        Also rebuilds road segments so pavement tracks local ground without
+        stacking a second full-ground mesh on the heightfield.
         """
         if self._ground_applied:
             return
+
+        # Smooth street ribbons before sampling so roads and bases agree.
+        self._flatten_street_heightmap(terrain)
 
         def lift_box_row(box, style):
             xmin, ymin, zmin, xmax, ymax, zmax = box
@@ -792,16 +893,15 @@ class TownLayout:
                 cx = 0.5 * (xmin + xmax)
                 cy = 0.5 * (ymin + ymax)
                 gz = _sample_heightmap(terrain, cx, cy)
+                # Keep ground-floor detail bottoms a hair above the heightfield
+                # so the building skirt does not share a plane with terrain.
+                z0 = zmin if zmin > 1e-6 else 0.02
                 lifted_details.append(
-                    (xmin, ymin, gz + zmin, xmax, ymax, gz + zmax, rgba)
+                    (xmin, ymin, gz + z0, xmax, ymax, gz + zmax, rgba)
                 )
             self.detail_parts = lifted_details
 
-        lifted_roads = []
-        for cx, cy, hx, hy, _z in self.roads:
-            gz = _sample_heightmap(terrain, cx, cy)
-            lifted_roads.append((cx, cy, hx, hy, gz + 0.06))
-        self.roads = lifted_roads
+        self.roads = self._build_road_segments(terrain)
         self._ground_applied = True
 
     # ------------------------------------------------------------------
@@ -969,24 +1069,34 @@ def connect_pybullet(gui=True, shadows=False):
 
 def spawn_town_in_pybullet(client, town, terrain, env_size):
     """
-    Load dusty heightfield + road slabs + building/overpass visuals once.
+    Load one dusty heightfield plus elevated road segments and building visuals.
 
-    Collision for buildings stays in numpy (AABB); the heightfield is the
-    only PyBullet collision mesh. Returns (terrain_body, road_bodies, building_bodies).
+    The heightfield is the only full-map ground surface (collision + visual).
+    Roads are short pavement slabs ~ROAD_LIFT above local ground — not a second
+    ground pad. No city-wide or rim color plates. Returns
+    (terrain_body, road_bodies, building_bodies).
+
+    Mesh scale uses terrain.size_x / terrain.grid_x so a grass-belt world
+    larger than the city still matches height samples. env_size is the city
+    extent (call-site clarity; not used for mesh scale).
     """
+    del env_size  # city size; mesh scale uses the full terrain world
     grid = terrain.grid_x
-    size = float(env_size)
+    mesh_xy = float(terrain.size_x) / float(grid)
 
     town.apply_ground_heights(terrain)
     if hasattr(terrain, "set_obstacle_boxes"):
         terrain.set_obstacle_boxes(town.boxes)
 
+    # One image covers the heightfield once (PyBullet convention).
+    tex_scale = (grid - 1) / 2.0
     terrain_shape = p.createCollisionShape(
         p.GEOM_HEIGHTFIELD,
-        meshScale=[size / grid, size / grid, 1.0],
+        meshScale=[mesh_xy, mesh_xy, 1.0],
         heightfieldData=terrain.heightmap.flatten().tolist(),
         numHeightfieldRows=grid,
         numHeightfieldColumns=grid,
+        heightfieldTextureScaling=tex_scale,
         physicsClientId=client,
     )
     # PyBullet centers the heightfield AABB at the body origin; lift so
@@ -1000,19 +1110,38 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
         basePosition=[0.0, 0.0, mid],
         physicsClientId=client,
     )
-    # Gray-brown dusty ground (not forest green)
-    p.changeVisualShape(
-        terrain_body,
-        -1,
-        rgbaColor=[0.45, 0.38, 0.28, 1],
-        physicsClientId=client,
-    )
+
+    # Ground texture: dusty city feathers to grass. White tint so rgba does
+    # not multiply brown on top of the texture colors.
+    texture_id = -1
+    if hasattr(terrain, "get_ground_texture_path"):
+        try:
+            tex_path = terrain.get_ground_texture_path()
+            texture_id = p.loadTexture(tex_path, physicsClientId=client)
+        except Exception:
+            texture_id = -1
+
+    if texture_id >= 0:
+        p.changeVisualShape(
+            terrain_body,
+            -1,
+            rgbaColor=[1.0, 1.0, 1.0, 1.0],
+            textureUniqueId=texture_id,
+            physicsClientId=client,
+        )
+    else:
+        p.changeVisualShape(
+            terrain_body,
+            -1,
+            rgbaColor=[0.45, 0.38, 0.28, 1],
+            physicsClientId=client,
+        )
 
     road_bodies = []
     for cx, cy, hx, hy, z in town.roads:
         vis = p.createVisualShape(
             p.GEOM_BOX,
-            halfExtents=[hx, hy, 0.04],
+            halfExtents=[hx, hy, ROAD_HALF_THICK],
             rgbaColor=ROAD_COLOR,
             physicsClientId=client,
         )

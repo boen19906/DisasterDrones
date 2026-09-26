@@ -1,12 +1,14 @@
 """
 visualize_env.py — Lightweight 3D spectator for the damaged town.
 
-Loads the 250 m town once in PyBullet and runs a camera-only loop
-(no drones, RF mesh, survivors, weather, or multi-agent stepping).
+Loads the town (default 250 m) plus a 100 m grass belt (450 m world) once
+in PyBullet and runs a camera-only loop (no drones, RF mesh, survivors,
+weather, or multi-agent stepping).
 
 Usage:
   cd drone_mesh_rl && python3 visualize_env.py
 """
+
 
 import math
 import sys
@@ -39,10 +41,16 @@ _PITCH_MIN, _PITCH_MAX = -89.0, 89.0
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Damaged-town spectator viewer")
-    parser.add_argument("--env_size", type=float, default=250.0, help="Town size in meters")
+    parser.add_argument(
+        "--env_size",
+        type=float,
+        default=250.0,
+        help="City/town size in meters (world is env_size + 200 for the grass belt)",
+    )
     parser.add_argument("--fps", type=float, default=30.0, help="Display FPS target")
     parser.add_argument("--seed", type=int, default=42, help="World seed")
     return parser.parse_args()
+
 
 
 def camera_basis_from_yaw_pitch(yaw_deg, pitch_deg):
@@ -187,17 +195,29 @@ def update_spectator_camera(client, keys, yaw, pitch, dist, eye):
 
 
 def build_world(client, env_size, seed):
-    """Generate town + terrain and spawn them once in the open PyBullet client."""
-    town = TownLayout(size=env_size, seed=seed, altitude_cap=40.0)
+    """Generate town + terrain and spawn them once in the open PyBullet client.
+
+    env_size is the city extent. World (terrain) is env_size + 200 m so a
+    100 m grass belt surrounds the town on every side.
+    """
+    city_size = float(env_size)
+    world_size = city_size + 200.0
+    town = TownLayout(size=city_size, seed=seed, altitude_cap=40.0)
     terrain = Terrain(
-        size_x=env_size,
-        size_y=env_size,
-        resolution=2.0,
+        size_x=world_size,
+        size_y=world_size,
+        resolution=1.0,
         seed=seed,
+        city_size=city_size,
+        blend_width=30.0,
+        color_blend_width=40.0,
+        grass_cell=28.0,
+        grass_amp=1.8,
         obstacle_boxes=town.boxes,
     )
-    spawn_town_in_pybullet(client, town, terrain, env_size)
-    return town, terrain
+    spawn_town_in_pybullet(client, town, terrain, city_size)
+    return town, terrain, world_size
+
 
 
 def clear_world(client):
@@ -230,11 +250,14 @@ def main():
     p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client)
     p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=client)
 
-    town, terrain = build_world(client, args.env_size, args.seed)
+    town, terrain, world_size = build_world(client, args.env_size, args.seed)
     n_buildings = len(town.boxes)
-    print(f"[TOWN] Loaded {n_buildings} building/rubble/overpass boxes on {args.env_size:.0f}m map.")
+    print(
+        f"[TOWN] Loaded {n_buildings} building/rubble/overpass boxes "
+        f"(city {args.env_size:.0f}m, world {world_size:.0f}m)."
+    )
 
-    frame_town_camera(client, args.env_size)
+    frame_town_camera(client, world_size)
     spectator = True
     yaw, pitch, dist, target, eye = read_debug_camera(client)
     yaw, pitch, dist, eye = enter_spectator_fly(client, yaw, pitch, dist, target)
@@ -259,9 +282,9 @@ def main():
                 print("[RESET] Rebuilding town...")
                 seed = int(seed) + 1
                 clear_world(client)
-                town, terrain = build_world(client, args.env_size, seed)
+                town, terrain, world_size = build_world(client, args.env_size, seed)
                 print(f"[TOWN] Loaded {len(town.boxes)} boxes (seed={seed}).")
-                frame_town_camera(client, args.env_size)
+                frame_town_camera(client, world_size)
                 yaw, pitch, dist, target, eye = read_debug_camera(client)
                 # Re-frame overview, then return to fly mode
                 spectator = True

@@ -23,6 +23,11 @@ ENV/
 *.keras
 *.onnx
 
+# Generated terrain assets
+drone_mesh_rl/envs/ground_texture.png
+drone_mesh_rl/envs/terrain.obj
+drone_mesh_rl/envs/terrain.urdf
+
 # Logs
 *.log
 
