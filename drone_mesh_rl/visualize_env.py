@@ -9,6 +9,7 @@ Features:
   - Satellite orbital sweep indicator and uplink beam (yellow line)
   - Ground survivor cluster markers (GREEN = Discovered, RED = Undiscovered)
   - Interactive HUD: battery %, connected survivors, wind vector, satellite elevation
+  - Spectator (noclip) free-fly camera through the damaged town
   - Optional model inference or manual control mode
 
 Usage:
@@ -16,6 +17,7 @@ Usage:
   python visualize_env.py --model_path models/test_model.pt # Playback trained model
 """
 
+import math
 import os
 import sys
 import time
@@ -33,6 +35,13 @@ if hasattr(sys.stdout, "reconfigure"):
 from envs.disaster_env import DisasterMeshEnv
 from models.actor_critic import MAPPOModel
 
+# Spectator fly defaults (meters / degrees per frame at target FPS)
+_SPEC_MOVE_SPEED = 2.5
+_SPEC_FAST_MULT = 3.0
+_SPEC_TURN_SPEED = 2.0
+_SPEC_FLY_DIST = 1.0  # short boom so look-around feels FPS-like
+_PITCH_MIN, _PITCH_MAX = -89.0, 89.0
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="3D Visualizer for Drone Swarm Mesh")
@@ -47,11 +56,154 @@ def parse_args():
     return parser.parse_args()
 
 
+def camera_basis_from_yaw_pitch(yaw_deg, pitch_deg):
+    """Return (forward, right, world_up) unit vectors matching PyBullet debug-camera spherical coords.
+
+    PyBullet places the eye at:
+      eye = target + dist * (sin(yaw)*cos(pitch), cos(yaw)*cos(pitch), sin(pitch))
+    so forward (eye -> target) is the negation of that radial offset.
+    """
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+
+    forward = np.array([-sy * cp, -cy * cp, -sp], dtype=np.float64)
+    # Horizontal right (viewer RHS): cross(world_up, forward); fall back near gimbal lock
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    right = np.cross(world_up, forward)
+    rn = np.linalg.norm(right)
+    if rn < 1e-8:
+        right = np.array([cy, -sy, 0.0], dtype=np.float64)
+        rn = np.linalg.norm(right)
+    right /= rn
+    return forward, right, world_up
+
+
+def eye_from_camera(yaw_deg, pitch_deg, dist, target):
+    """Eye position for PyBullet resetDebugVisualizerCamera parameters."""
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    target = np.asarray(target, dtype=np.float64)
+    offset = dist * np.array(
+        [
+            math.sin(yaw) * math.cos(pitch),
+            math.cos(yaw) * math.cos(pitch),
+            math.sin(pitch),
+        ],
+        dtype=np.float64,
+    )
+    return target + offset
+
+
+def apply_spectator_look(yaw, pitch, dist, target, dyaw, dpitch):
+    """Rotate view around the current eye (FPS look), keeping eye fixed."""
+    eye = eye_from_camera(yaw, pitch, dist, target)
+    yaw = (yaw + dyaw) % 360.0
+    pitch = float(np.clip(pitch + dpitch, _PITCH_MIN, _PITCH_MAX))
+    forward, _, _ = camera_basis_from_yaw_pitch(yaw, pitch)
+    new_target = eye + forward * dist
+    return yaw, pitch, dist, new_target
+
+
+def apply_spectator_move(yaw, pitch, dist, target, move_fwd, move_right, move_up):
+    """Translate target (and thus eye) along look / strafe / world-up."""
+    forward, right, world_up = camera_basis_from_yaw_pitch(yaw, pitch)
+    target = np.asarray(target, dtype=np.float64).copy()
+    target += forward * move_fwd + right * move_right + world_up * move_up
+    return target
+
+
+def read_debug_camera(client):
+    """Return yaw, pitch, dist, target from the active PyBullet debug camera."""
+    info = p.getDebugVisualizerCamera(physicsClientId=client)
+    yaw = float(info[8])
+    pitch = float(info[9])
+    dist = float(info[10])
+    target = np.array(info[11], dtype=np.float64)
+    return yaw, pitch, dist, target
+
+
+def enter_spectator_fly(client, yaw, pitch, dist, target):
+    """Collapse the orbit boom to a short fly distance while preserving the eye pose."""
+    eye = eye_from_camera(yaw, pitch, dist, target)
+    forward, _, _ = camera_basis_from_yaw_pitch(yaw, pitch)
+    new_dist = _SPEC_FLY_DIST
+    new_target = eye + forward * new_dist
+    p.resetDebugVisualizerCamera(
+        cameraDistance=new_dist,
+        cameraYaw=yaw,
+        cameraPitch=pitch,
+        cameraTargetPosition=new_target.tolist(),
+        physicsClientId=client,
+    )
+    return yaw, pitch, new_dist, new_target
+
+
+def _key_down(keys, code):
+    return bool(keys.get(code, 0) & p.KEY_IS_DOWN)
+
+
+def _key_triggered(keys, code):
+    return bool(keys.get(code, 0) & p.KEY_WAS_TRIGGERED)
+
+
+def update_spectator_camera(client, keys, yaw, pitch, dist, target):
+    """Apply WASD/EF/arrows/Shift to spectator state and push to PyBullet."""
+    speed = _SPEC_MOVE_SPEED
+    if _key_down(keys, p.B3G_SHIFT):
+        speed *= _SPEC_FAST_MULT
+
+    move_fwd = 0.0
+    move_right = 0.0
+    move_up = 0.0
+    if _key_down(keys, ord("w")) or _key_down(keys, ord("W")):
+        move_fwd += speed
+    if _key_down(keys, ord("s")) or _key_down(keys, ord("S")):
+        move_fwd -= speed
+    if _key_down(keys, ord("d")) or _key_down(keys, ord("D")):
+        move_right += speed
+    if _key_down(keys, ord("a")) or _key_down(keys, ord("A")):
+        move_right -= speed
+    if _key_down(keys, ord("e")) or _key_down(keys, ord("E")):
+        move_up += speed
+    if _key_down(keys, ord("f")) or _key_down(keys, ord("F")):
+        move_up -= speed
+
+    dyaw = 0.0
+    dpitch = 0.0
+    if _key_down(keys, p.B3G_LEFT_ARROW):
+        dyaw -= _SPEC_TURN_SPEED
+    if _key_down(keys, p.B3G_RIGHT_ARROW):
+        dyaw += _SPEC_TURN_SPEED
+    if _key_down(keys, p.B3G_UP_ARROW):
+        dpitch += _SPEC_TURN_SPEED
+    if _key_down(keys, p.B3G_DOWN_ARROW):
+        dpitch -= _SPEC_TURN_SPEED
+
+    if dyaw != 0.0 or dpitch != 0.0:
+        yaw, pitch, dist, target = apply_spectator_look(yaw, pitch, dist, target, dyaw, dpitch)
+    if move_fwd != 0.0 or move_right != 0.0 or move_up != 0.0:
+        target = apply_spectator_move(yaw, pitch, dist, target, move_fwd, move_right, move_up)
+
+    p.resetDebugVisualizerCamera(
+        cameraDistance=dist,
+        cameraYaw=yaw,
+        cameraPitch=pitch,
+        cameraTargetPosition=np.asarray(target, dtype=np.float64).tolist(),
+        physicsClientId=client,
+    )
+    return yaw, pitch, dist, target
+
+
 def main():
     args = parse_args()
     print("=" * 65)
     print(" [3D VISUALIZER] Autonomous LEO-Integrated Drone Mesh Network")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")
+    print(" Spectator (default ON, toggle C):")
+    print("   W/S = Forward/Back | A/D = Strafe | E = Up | F = Down")
+    print("   Arrows = Look (yaw/pitch) | Left Shift = Faster | Mouse orbit still works when OFF")
     print("=" * 65)
 
     env = DisasterMeshEnv(
@@ -84,6 +236,13 @@ def main():
     paused = False
     step_num = 0
 
+    # Default into spectator noclip; disable env camera snap on reset so keys don't fight it.
+    spectator = True
+    env.auto_camera = False
+    yaw, pitch, dist, target = read_debug_camera(env.client)
+    yaw, pitch, dist, target = enter_spectator_fly(env.client, yaw, pitch, dist, target)
+    print("[SPECTATOR] ON — click the 3D viewport, then fly with WASD / E F / arrows.")
+
     try:
         while True:
             loop_start = time.time()
@@ -93,14 +252,49 @@ def main():
             if ord("q") in keys or ord("Q") in keys or 27 in keys:  # 27 = ESC
                 print("[EXIT] User requested exit.")
                 break
-            if ord(" ") in keys and (keys[ord(" ")] & p.KEY_WAS_TRIGGERED):
+            if _key_triggered(keys, ord(" ")):
                 paused = not paused
                 print(f"[{'PAUSED' if paused else 'RESUMED'}]")
-            if ord("r") in keys and (keys[ord("r")] & p.KEY_WAS_TRIGGERED):
+            if _key_triggered(keys, ord("r")) or _key_triggered(keys, ord("R")):
                 print("[RESET] Resetting environment...")
                 obs_dict, info_dict = env.reset()
                 step_num = 0
+                # Re-frame overview once, then restore spectator fly boom if still spectating.
+                env.auto_camera = True
+                # Spawn already ran with previous auto_camera=False; force overview now.
+                cam_dist = max(180.0, args.env_size * 0.85)
+                p.resetDebugVisualizerCamera(
+                    cameraDistance=cam_dist,
+                    cameraYaw=45,
+                    cameraPitch=-40,
+                    cameraTargetPosition=[0, 0, 8.0],
+                    physicsClientId=env.client,
+                )
+                yaw, pitch, dist, target = read_debug_camera(env.client)
+                if spectator:
+                    env.auto_camera = False
+                    yaw, pitch, dist, target = enter_spectator_fly(
+                        env.client, yaw, pitch, dist, target
+                    )
+                else:
+                    env.auto_camera = True
                 continue
+            if _key_triggered(keys, ord("c")) or _key_triggered(keys, ord("C")):
+                spectator = not spectator
+                env.auto_camera = not spectator
+                if spectator:
+                    yaw, pitch, dist, target = read_debug_camera(env.client)
+                    yaw, pitch, dist, target = enter_spectator_fly(
+                        env.client, yaw, pitch, dist, target
+                    )
+                    print("[SPECTATOR] ON")
+                else:
+                    print("[SPECTATOR] OFF — mouse orbit available")
+
+            if spectator:
+                yaw, pitch, dist, target = update_spectator_camera(
+                    env.client, keys, yaw, pitch, dist, target
+                )
 
             if not paused:
                 step_num += 1
@@ -150,8 +344,8 @@ def main():
                             if i < j:
                                 pos_i = env.drone_positions[i]
                                 pos_j = env.drone_positions[j]
-                                dist = np.linalg.norm(pos_i - pos_j)
-                                if dist < 35.0 and env.terrain.check_los(pos_i, pos_j):
+                                dist_link = np.linalg.norm(pos_i - pos_j)
+                                if dist_link < 35.0 and env.terrain.check_los(pos_i, pos_j):
                                     p.addUserDebugLine(
                                         pos_i.tolist(),
                                         pos_j.tolist(),
@@ -240,6 +434,7 @@ def main():
                         f"[EPISODE END] Discovered: {stats['discovered_survivors']}/{stats['total_survivors']} | "
                         f"Connected: {env.connected_survivors}"
                     )
+                    # Keep spectator pose across auto-reset (auto_camera already False while spectating).
                     obs_dict, info_dict = env.reset()
                     step_num = 0
 

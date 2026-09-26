@@ -152,6 +152,8 @@ class DisasterMeshEnv(ParallelEnv):
         self.building_bodies = []
         self.road_bodies = []
         self._drone_radius = 0.4
+        # When False, skip resetDebugVisualizerCamera on spawn (spectator / free-cam).
+        self.auto_camera = True
 
         # Observation & action spaces
         obs_dim = 25
@@ -328,8 +330,8 @@ class DisasterMeshEnv(ParallelEnv):
 
             self.drone_ids.append(did)
 
-        # Camera framed for the full 250m town
-        if self.render_mode == "human":
+        # Camera framed for the full 250m town (skipped while spectator owns the view)
+        if self.render_mode == "human" and self.auto_camera:
             cam_dist = max(180.0, self.env_size * 0.85)
             p.resetDebugVisualizerCamera(
                 cameraDistance=cam_dist,
