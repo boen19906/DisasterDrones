@@ -27,6 +27,7 @@ Rewards:
 import functools
 import math
 import os
+import tempfile
 import time
 from heapq import heappop, heappush
 
@@ -63,6 +64,7 @@ PERSON_TARGET_H = 1.7
 DRONE_TARGET_LONG = 3.6
 _PERSON_LETTERS = tuple(chr(c) for c in range(ord("a"), ord("r") + 1))
 _MESH_RGBA = [1.0, 1.0, 1.0, 1.0]
+_FOUND_RGBA = [0.15, 1.0, 0.25, 1.0]
 _CRASH_RGBA = [0.45, 0.06, 0.06, 1.0]
 CRASH_RANGE = 3.5
 BUILDING_RADIUS = 0.55  # lethal airframe radius
@@ -158,6 +160,17 @@ def _mesh_yaw_orn(yaw):
     q_fix = p.getQuaternionFromEuler([math.pi / 2.0, 0.0, 0.0])
     q_yaw = p.getQuaternionFromEuler([0.0, 0.0, float(yaw)])
     return p.multiplyTransforms([0, 0, 0], q_yaw, [0, 0, 0], q_fix)[1]
+
+
+def _write_textureless_obj(src_path):
+    """Copy an OBJ without mtllib/usemtl so rgbaColor is a solid mesh tint."""
+    fd, dst = tempfile.mkstemp(prefix="dd_person_green_", suffix=".obj")
+    with os.fdopen(fd, "w") as out, open(src_path) as src:
+        for line in src:
+            if line.startswith("mtllib ") or line.startswith("usemtl "):
+                continue
+            out.write(line)
+    return dst
 
 
 class SurvivorSearchEnv(ParallelEnv):
@@ -265,6 +278,11 @@ class SurvivorSearchEnv(ParallelEnv):
         self._person_vis = []
         self._person_ymin = []
         self._person_scale = []
+        self._person_paths = []
+        self._person_models = []
+        self._person_tinted = []
+        self._person_green_vis = []
+        self._person_green_obj_files = []
         self._drone_vis = -1
         self._drone_yaw = np.zeros(num_drones, dtype=np.float64)
         self._drone_crash_tinted = np.zeros(num_drones, dtype=bool)
@@ -1261,12 +1279,25 @@ class SurvivorSearchEnv(ParallelEnv):
     def _uses_search_meshes(self):
         return self.render_mode == "human" and self.client is not None
 
+    def _clear_person_green_cache(self):
+        """Drop cached found-person visuals and their temp mesh files."""
+        self._person_green_vis = []
+        files = getattr(self, "_person_green_obj_files", None) or []
+        self._person_green_obj_files = []
+        for path in files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
     def _load_search_visuals(self):
         """Load character and drone meshes once per GUI client. Headless skips files."""
         self._person_vis = []
         self._person_ymin = []
         self._person_scale = []
+        self._person_paths = []
         self._drone_vis = -1
+        self._clear_person_green_cache()
         if not self._uses_search_meshes():
             return
         prefabs = _search_prefabs_dir()
@@ -1286,6 +1317,7 @@ class SurvivorSearchEnv(ParallelEnv):
             self._person_vis.append(vis)
             self._person_ymin.append(bounds["ymin"])
             self._person_scale.append(scale)
+            self._person_paths.append(path)
 
         drone_path = os.path.join(prefabs, "Drone.obj")
         bounds = _obj_bounds(drone_path)
@@ -1352,6 +1384,8 @@ class SurvivorSearchEnv(ParallelEnv):
     def _spawn_person_meshes(self, rng):
         """One textured character per survivor. Pose is set once; no per-step updates."""
         self.person_ids = []
+        self._person_models = []
+        self._person_tinted = []
         if not self._uses_search_meshes() or self.survivors is None or not self._person_vis:
             return
         positions = self.survivors.get_positions()
@@ -1372,6 +1406,8 @@ class SurvivorSearchEnv(ParallelEnv):
                 physicsClientId=self.client,
             )
             self.person_ids.append(bid)
+            self._person_models.append(model)
+            self._person_tinted.append(False)
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -1396,6 +1432,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.forest_trees = 0
         self.person_ids = []
         self._person_vis = []
+        self._person_paths = []
+        self._person_models = []
+        self._person_tinted = []
         self._drone_vis = -1
         if hasattr(self, "_lanes"):
             del self._lanes
@@ -1580,6 +1619,7 @@ class SurvivorSearchEnv(ParallelEnv):
         ]
         prev_discovered = np.asarray(self.survivors.discovered, dtype=bool).copy()
         self.newly_discovered, _ = self.survivors.update_discovery(alive_pos, self.terrain)
+        self._tint_found_people(prev_discovered)
         self._credit_drone_finds(prev_discovered)
 
         rewards = self._compute_rewards(collisions, building_kills, rubble_blocks)
@@ -1590,6 +1630,71 @@ class SurvivorSearchEnv(ParallelEnv):
         truncations = {a: ((all_found and mapped) or maxed or all_dead) for a in self.possible_agents}
         terminations = {a: False for a in self.possible_agents}
         return self._get_observations(), rewards, terminations, truncations, self._infos()
+
+    def _ensure_found_person_vis(self, model):
+        """One shared solid-green visual per character model. Found people reuse it."""
+        while len(self._person_green_vis) <= model:
+            self._person_green_vis.append(-1)
+        if self._person_green_vis[model] >= 0:
+            return self._person_green_vis[model]
+        path = self._person_paths[model]
+        scale = self._person_scale[model]
+        stripped = _write_textureless_obj(path)
+        self._person_green_obj_files.append(stripped)
+        vis = p.createVisualShape(
+            p.GEOM_MESH,
+            fileName=stripped,
+            meshScale=[scale, scale, scale],
+            rgbaColor=_FOUND_RGBA,
+            physicsClientId=self.client,
+        )
+        self._person_green_vis[model] = vis
+        return vis
+
+    def _replace_person_with_green(self, i):
+        """Give this body its own green visual so siblings keep their texture."""
+        bid = int(self.person_ids[i])
+        if bid < 0:
+            return
+        pos, orn = p.getBasePositionAndOrientation(bid, physicsClientId=self.client)
+        model = int(self._person_models[i]) if i < len(self._person_models) else 0
+        green_vis = self._ensure_found_person_vis(model)
+        p.removeBody(bid, physicsClientId=self.client)
+        new_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=green_vis,
+            basePosition=pos,
+            baseOrientation=orn,
+            physicsClientId=self.client,
+        )
+        p.changeVisualShape(
+            new_id,
+            -1,
+            rgbaColor=_FOUND_RGBA,
+            textureUniqueId=-1,
+            physicsClientId=self.client,
+        )
+        self.person_ids[i] = new_id
+
+    def _tint_found_people(self, prev_discovered):
+        """On false→true discovery, recolor that one person. GUI meshes only."""
+        if self.client is None or not self.person_ids:
+            return
+        if self.survivors is None:
+            return
+        discovered = np.asarray(self.survivors.discovered, dtype=bool)
+        prev = np.asarray(prev_discovered, dtype=bool)
+        if discovered.shape != prev.shape:
+            return
+        for si in np.flatnonzero(discovered & ~prev):
+            i = int(si)
+            if i >= len(self.person_ids) or i >= len(self._person_tinted):
+                continue
+            if self._person_tinted[i]:
+                continue
+            self._replace_person_with_green(i)
+            self._person_tinted[i] = True
 
     def _credit_drone_finds(self, prev_discovered):
         """When a discovered flag flips, credit the closest alive drone in sensor range."""
@@ -1721,3 +1826,4 @@ class SurvivorSearchEnv(ParallelEnv):
             except Exception:
                 pass
             self.client = None
+        self._clear_person_green_cache()
