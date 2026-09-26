@@ -2,7 +2,8 @@
 train.py — MAPPO (Multi-Agent PPO) training for Autonomous Drone Swarm Mesh Network.
 
 Usage:
-  python train.py --total_timesteps 50000 --num_drones 5
+  python train.py --task search --total_timesteps 50000 --num_drones 3
+  python train.py --task mesh --total_timesteps 50000 --num_drones 5
 """
 
 import os
@@ -14,6 +15,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from envs.disaster_env import DisasterMeshEnv
+from envs.search_env import SurvivorSearchEnv
 from models.actor_critic import MAPPOModel
 from models.buffer import MultiAgentRolloutBuffer
 
@@ -27,7 +29,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train MAPPO on Disaster Drone Mesh")
-    parser.add_argument("--num_drones", type=int, default=5, help="Number of drones in swarm")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
+    parser.add_argument("--task", type=str, default="search", choices=["search", "mesh"], help="search = find survivors; mesh = full LEO mesh env")
+    parser.add_argument("--num_drones", type=int, default=3, help="Number of drones in swarm")
     parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
     parser.add_argument("--env_size", type=float, default=100.0, help="Terrain size in meters")
     parser.add_argument("--max_steps", type=int, default=1000, help="Max steps per episode")
@@ -45,7 +49,6 @@ def parse_args():
     parser.add_argument("--save_path", type=str, default="models/mappo_drone_mesh.pt", help="Checkpoint save path")
     parser.add_argument("--save_freq", type=int, default=10, help="Save frequency in iterations")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     return parser.parse_args()
 
 
@@ -61,22 +64,34 @@ def main():
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
 
     print("=" * 65)
-    print(" [MAPPO Training] Autonomous LEO-Integrated Drone Mesh Network")
+    print(f" [MAPPO Training] task={args.task}")
     print(f" Swarm Size: {args.num_drones} Drones | Device: {args.device} | Total Steps: {args.total_timesteps}")
     print("=" * 65)
 
-    # Initialize environment
-    env = DisasterMeshEnv(
-        num_drones=args.num_drones,
-        num_clusters=args.num_clusters,
-        env_size=args.env_size,
-        max_steps=args.max_steps,
-        render_mode=None, # Headless for maximum speed
-        seed=args.seed,
-    )
-
-    obs_dim = 25
-    act_dim = 5
+    if args.task == "search":
+        env = SurvivorSearchEnv(
+            num_drones=args.num_drones,
+            num_clusters=args.num_clusters,
+            env_size=args.env_size,
+            max_steps=args.max_steps,
+            render_mode=None,
+            seed=args.seed,
+        )
+        if args.save_path == "models/mappo_drone_mesh.pt":
+            args.save_path = "models/mappo_search.pt"
+        obs_dim = env.obs_dim
+        act_dim = env.act_dim
+    else:
+        env = DisasterMeshEnv(
+            num_drones=args.num_drones,
+            num_clusters=args.num_clusters,
+            env_size=args.env_size,
+            max_steps=args.max_steps,
+            render_mode=None,
+            seed=args.seed,
+        )
+        obs_dim = 25
+        act_dim = 5
     state_dim = args.num_drones * obs_dim
     agent_names = env.possible_agents
 
@@ -134,7 +149,7 @@ def main():
             dones_array = np.array([term_dict[a] or trunc_dict[a] for a in agent_names], dtype=np.float32)
 
             current_ep_rewards += rews_array
-            step_connected = infos[agent_names[0]]["connected_survivors"]
+            step_connected = infos[agent_names[0]].get("connected_survivors", 0)
             step_disc = infos[agent_names[0]]["discovery_rate"]
 
             # Store in buffer
@@ -218,12 +233,19 @@ def main():
         mean_rew = np.mean(episode_rewards[-10:]) if episode_rewards else current_ep_rewards.mean()
         mean_conn = np.mean(ep_connected[-10:]) if ep_connected else step_connected
         mean_disc = np.mean(ep_discovery[-10:]) if ep_discovery else step_disc
-        avg_battery = env.battery_levels.mean()
+        extra = ""
+        if args.task == "search":
+            found = infos[agent_names[0]].get("discovered_survivors", 0)
+            total = infos[agent_names[0]].get("total_survivors", 0)
+            extra = f" | Found: {found}/{total} | Cover: {infos[agent_names[0]].get('coverage_frac', 0)*100:4.1f}%"
+            avg_battery = 100.0
+        else:
+            avg_battery = env.battery_levels.mean()
 
         print(
             f"Iter [{iteration:03d}/{num_iterations}] | Steps: {global_step:6d} | "
             f"Rew: {mean_rew:7.1f} | Conn Surv: {mean_conn:3.1f} | "
-            f"Disc: {mean_disc * 100:4.1f}% | Bat: {avg_battery:4.1f}% | "
+            f"Disc: {mean_disc * 100:4.1f}% | Bat: {avg_battery:4.1f}%{extra} | "
             f"Ploss: {np.mean(pg_losses):6.3f} | Vloss: {np.mean(v_losses):6.2f} | "
             f"FPS: {fps:4d}"
         )

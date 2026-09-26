@@ -1,14 +1,20 @@
 import numpy as np
 import os
 
+from .structures import generate_earthquake_layout, segment_blocked_by_structures
+
+
 class Terrain:
-    def __init__(self, size_x=100, size_y=100, resolution=1.0):
+    def __init__(self, size_x=100, size_y=100, resolution=1.0, seed=42, flat=False, with_structures=True):
         self.size_x = size_x
         self.size_y = size_y
         self.resolution = resolution
+        self.seed = seed
+        self.flat = flat
         self.grid_x = int(size_x / resolution)
         self.grid_y = int(size_y / resolution)
         self.heightmap = self._generate_heightmap()
+        self.structures = generate_earthquake_layout(self, seed=seed) if with_structures else []
         
     def _generate_heightmap(self):
         """Generate a 2D numpy array using overlapping 2D Gaussians."""
@@ -17,6 +23,8 @@ class Terrain:
         X, Y = np.meshgrid(x, y)
         
         Z = np.zeros_like(X)
+        if self.flat:
+            return Z
         np.random.seed(42)
         for _ in range(15):
             cx = np.random.uniform(-self.size_x/2, self.size_x/2)
@@ -93,4 +101,6 @@ class Terrain:
             if 0 <= grid_x_idx < self.grid_x and 0 <= grid_y_idx < self.grid_y:
                 if self.heightmap[grid_y_idx, grid_x_idx] > z:
                     return False
+        if segment_blocked_by_structures(point_A, point_B, self.structures):
+            return False
         return True

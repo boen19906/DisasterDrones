@@ -252,6 +252,9 @@ class SwarmSimulationManager:
             "weather": weather_data,
             "stats": stats_data,
             "env_size": self.env_size,
+            "structures": [
+                box.to_dict() for box in getattr(env.terrain, "structures", [])
+            ],
         }
 
 
@@ -924,6 +927,25 @@ CONTROL_CENTER_HTML = """
       ctx.strokeStyle = 'rgba(0, 242, 254, 0.35)';
       ctx.lineWidth = 2;
       ctx.strokeRect(bTopLeft[0], bTopLeft[1], bBottomRight[0] - bTopLeft[0], bBottomRight[1] - bTopLeft[1]);
+
+      // Earthquake structures (footprints)
+      (lastData.structures || []).forEach(s => {
+        const p1 = toScreen(s.xmin, s.ymax);
+        const p2 = toScreen(s.xmax, s.ymin);
+        const wRect = p2[0] - p1[0];
+        const hRect = p2[1] - p1[1];
+        if (s.kind === 'rubble' || s.kind === 'fallen_wall' || s.kind === 'fallen_mast') {
+          ctx.fillStyle = 'rgba(90, 70, 52, 0.55)';
+        } else if (s.kind === 'school_wall' || s.kind === 'roof_slab') {
+          ctx.fillStyle = 'rgba(210, 185, 120, 0.55)';
+        } else {
+          ctx.fillStyle = 'rgba(130, 125, 118, 0.55)';
+        }
+        ctx.fillRect(p1[0], p1[1], wRect, hRect);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(p1[0], p1[1], wRect, hRect);
+      });
 
       // 2. Draw Survivors
       lastData.survivors.forEach(s => {

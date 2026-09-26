@@ -5,11 +5,13 @@ Survivors spawn in clusters (Gaussian blobs) and drift over time via:
   - Biased random walk toward lower terrain (valleys)
   - Optional SAR patrol mode (hidden waypoint path)
 
-Each survivor tracks a `discovered` flag — only set True when a drone is
-within communication range AND has line-of-sight.
+Each survivor tracks a `discovered` flag. Mesh mode requires range AND LoS;
+search v1 uses fly-over range only.
 """
 
 import numpy as np
+
+from .structures import push_xy_out_of_structures
 
 
 class SurvivorCluster:
@@ -25,6 +27,8 @@ class SurvivorCluster:
         discovery_range=15.0,
         cluster_spread=8.0,
         drift_strength=0.3,
+        require_los=True,
+        frozen=False,
         seed=None,
     ):
         """
@@ -55,6 +59,8 @@ class SurvivorCluster:
         self.discovery_range = discovery_range
         self.cluster_spread = cluster_spread
         self.drift_strength = drift_strength
+        self.require_los = require_los
+        self.frozen = frozen
 
         self.rng = np.random.default_rng(seed)
 
@@ -99,6 +105,33 @@ class SurvivorCluster:
         self.patrol_indices = {}    # cluster_id -> current waypoint index
         self.patrol_speed = 0.5     # m/s for patrol movement
 
+        self._snap_to_ground()
+        if self.terrain is not None and getattr(self.terrain, "structures", None):
+            self.keep_clear_of_structures(self.terrain.structures)
+
+    def keep_clear_of_structures(self, boxes):
+        """Push survivors out of solid building / rubble footprints."""
+        if not boxes:
+            return
+        for i in range(self.num_survivors):
+            x, y = push_xy_out_of_structures(
+                self.positions[i, 0], self.positions[i, 1], boxes
+            )
+            self.positions[i, 0] = x
+            self.positions[i, 1] = y
+        self._snap_to_ground()
+
+    def place_cluster_near(self, cluster_id, xy, spread=3.0):
+        """Move one cluster (e.g. into the school courtyard after a quake)."""
+        cx, cy = xy
+        mask = self.cluster_ids == cluster_id
+        n = int(mask.sum())
+        if n == 0:
+            return
+        offsets = self.rng.normal(0.0, spread, size=(n, 2))
+        self.positions[mask, 0] = cx + offsets[:, 0]
+        self.positions[mask, 1] = cy + offsets[:, 1]
+        self.cluster_centers[cluster_id] = np.array([cx, cy], dtype=float)
         self._snap_to_ground()
 
     def _snap_to_ground(self):
@@ -165,6 +198,10 @@ class SurvivorCluster:
           2. Downhill drift bias (survivors tend toward valleys)
           3. SAR patrol following (if waypoints set for the cluster)
         """
+        if self.frozen:
+            self._snap_to_ground()
+            return
+
         for i in range(self.num_survivors):
             cluster_id = self.cluster_ids[i]
             x, y = self.positions[i, 0], self.positions[i, 1]
@@ -203,6 +240,8 @@ class SurvivorCluster:
         )
 
         self._snap_to_ground()
+        if self.terrain is not None and getattr(self.terrain, "structures", None):
+            self.keep_clear_of_structures(self.terrain.structures)
 
     def update_discovery(self, drone_positions, terrain):
         """
@@ -232,16 +271,15 @@ class SurvivorCluster:
             for drone_pos in drone_positions:
                 dist = np.linalg.norm(surv_pos[:2] - np.array(drone_pos[:2]))
                 if dist <= self.discovery_range:
-                    # Check LoS
-                    if terrain is not None and terrain.check_los(drone_pos, surv_pos):
+                    los_ok = True
+                    if self.require_los and terrain is not None:
+                        los_ok = terrain.check_los(drone_pos, surv_pos)
+                    if los_ok:
                         self.discovered[i] = True
                         newly_discovered += 1
 
-                        # Check if entire cluster is newly discovered
                         cid = self.cluster_ids[i]
                         if not self.discovered_clusters[cid]:
-                            cluster_mask = self.cluster_ids == cid
-                            # Mark cluster as discovered if at least one survivor found
                             self.discovered_clusters[cid] = True
                             newly_discovered_clusters.append(cid)
                         break
