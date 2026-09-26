@@ -46,27 +46,34 @@ def parse_args():
 
 
 def camera_basis_from_yaw_pitch(yaw_deg, pitch_deg):
-    """Return (forward, right, world_up) unit vectors matching PyBullet debug-camera spherical coords.
+    """Return (forward, right, world_up) matching PyBullet's Z-up debug camera.
 
-    PyBullet places the eye at:
-      eye = target + dist * (sin(yaw)*cos(pitch), cos(yaw)*cos(pitch), sin(pitch))
-    so forward (eye -> target) is the negation of that radial offset.
+    Verified against pybullet.computeViewMatrixFromYawPitchRoll and Bullet
+    SimpleCamera (upAxis=2): the eye orbits the target as
+      eye = target + dist * (sin(yaw)*cos(pitch), -cos(yaw)*cos(pitch), -sin(pitch))
+    so forward = normalize(target - eye) is
+      (-sin(yaw)*cos(pitch), cos(yaw)*cos(pitch), sin(pitch)).
 
-    Yaw: decreasing yaw turns the look toward the viewer's right.
-    Pitch: decreasing pitch tilts the look upward (forward.z > 0).
+    Yaw: decreasing yaw rotates look toward viewer-right.
+    Pitch: increasing pitch tilts look upward (forward.z increases).
+    Right: cross(forward, world_up) — same as Bullet's look-at side vector.
     """
     yaw = math.radians(yaw_deg)
     pitch = math.radians(pitch_deg)
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
 
-    forward = np.array([-sy * cp, -cy * cp, -sp], dtype=np.float64)
-    # Horizontal right (viewer RHS): cross(world_up, forward); fall back near gimbal lock
+    forward = np.array([-sy * cp, cy * cp, sp], dtype=np.float64)
+    fn = np.linalg.norm(forward)
+    if fn > 1e-12:
+        forward /= fn
+
     world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    right = np.cross(world_up, forward)
+    right = np.cross(forward, world_up)
     rn = np.linalg.norm(right)
     if rn < 1e-8:
-        right = np.array([cy, -sy, 0.0], dtype=np.float64)
+        # Near gimbal lock: horizontal right from yaw alone
+        right = np.array([cy, sy, 0.0], dtype=np.float64)
         rn = np.linalg.norm(right)
     right /= rn
     return forward, right, world_up
@@ -80,8 +87,8 @@ def eye_from_camera(yaw_deg, pitch_deg, dist, target):
     offset = dist * np.array(
         [
             math.sin(yaw) * math.cos(pitch),
-            math.cos(yaw) * math.cos(pitch),
-            math.sin(pitch),
+            -math.cos(yaw) * math.cos(pitch),
+            -math.sin(pitch),
         ],
         dtype=np.float64,
     )
@@ -89,7 +96,7 @@ def eye_from_camera(yaw_deg, pitch_deg, dist, target):
 
 
 def apply_spectator_camera(client, eye, yaw, pitch, dist):
-    """Push explicit eye + yaw/pitch to PyBullet every frame."""
+    """Place the camera from eye + yaw/pitch using the shared basis."""
     eye = np.asarray(eye, dtype=np.float64)
     forward, _, _ = camera_basis_from_yaw_pitch(yaw, pitch)
     target = eye + forward * dist
@@ -153,7 +160,7 @@ def update_spectator_camera(client, keys, yaw, pitch, dist, eye):
     if _key_down(keys, p.B3G_SHIFT):
         move_up -= speed
 
-    # Signs match camera_basis: -yaw = turn right, -pitch = look up
+    # Signs match camera_basis: -yaw = look right, +pitch = look up
     dyaw = 0.0
     dpitch = 0.0
     if _key_down(keys, p.B3G_RIGHT_ARROW):
@@ -161,9 +168,9 @@ def update_spectator_camera(client, keys, yaw, pitch, dist, eye):
     if _key_down(keys, p.B3G_LEFT_ARROW):
         dyaw += _SPEC_TURN_SPEED
     if _key_down(keys, p.B3G_UP_ARROW):
-        dpitch -= _SPEC_TURN_SPEED
-    if _key_down(keys, p.B3G_DOWN_ARROW):
         dpitch += _SPEC_TURN_SPEED
+    if _key_down(keys, p.B3G_DOWN_ARROW):
+        dpitch -= _SPEC_TURN_SPEED
 
     if dyaw != 0.0 or dpitch != 0.0:
         yaw = (yaw + dyaw) % 360.0
@@ -172,6 +179,7 @@ def update_spectator_camera(client, keys, yaw, pitch, dist, eye):
     if move_fwd != 0.0 or move_right != 0.0 or move_up != 0.0:
         forward, right, world_up = camera_basis_from_yaw_pitch(yaw, pitch)
         eye = np.asarray(eye, dtype=np.float64).copy()
+        # Translate eye (and thus target) without changing yaw/pitch
         eye += forward * move_fwd + right * move_right + world_up * move_up
 
     apply_spectator_camera(client, eye, yaw, pitch, dist)
