@@ -1,5 +1,6 @@
 """
-town.py — Seeded damaged-town layout: streets, buildings, rubble, overpasses.
+town.py — Seeded damaged-town layout: streets, buildings, rubble, overpasses,
+plus a green wilderness ring (trees, cabins, rocks) outside the city core.
 
 Buildings and overpasses are axis-aligned boxes (AABB) so collision and
 line-of-sight stay vectorized numpy — no PyBullet raycasts.
@@ -20,6 +21,25 @@ BUILDING_COLORS = {
 }
 
 ROAD_COLOR = [0.18, 0.18, 0.20, 1.0]
+CITY_GROUND_COLOR = [0.45, 0.38, 0.28, 1.0]
+WILD_GROUND_COLOR = [0.28, 0.48, 0.22, 1.0]
+
+# Tree canopy / trunk palettes (several "species")
+TREE_SPECIES = [
+    {"canopy": [0.15, 0.42, 0.18, 1.0], "trunk": [0.40, 0.26, 0.14, 1.0], "bare": False},
+    {"canopy": [0.22, 0.50, 0.20, 1.0], "trunk": [0.38, 0.24, 0.12, 1.0], "bare": False},
+    {"canopy": [0.45, 0.55, 0.18, 1.0], "trunk": [0.42, 0.28, 0.15, 1.0], "bare": False},  # yellow-green
+    {"canopy": [0.12, 0.32, 0.14, 1.0], "trunk": [0.35, 0.22, 0.12, 1.0], "bare": False},  # dark green
+    {"canopy": [0.45, 0.32, 0.18, 1.0], "trunk": [0.32, 0.22, 0.14, 1.0], "bare": True},   # bare/brown
+]
+
+CABIN_WOOD = [0.48, 0.32, 0.18, 1.0]
+CABIN_ROOF = [0.35, 0.22, 0.12, 1.0]
+ROCK_COLOR = [0.50, 0.48, 0.44, 1.0]
+LOG_COLOR = [0.38, 0.26, 0.14, 1.0]
+
+# Default inner city half-extent on a 250 m map → ~170 m city, wilderness rim beyond.
+DEFAULT_CITY_HALF = 85.0
 
 
 class TownLayout:
@@ -38,14 +58,23 @@ class TownLayout:
         True where survivors may spawn / drift (streets and open lots).
     walkable_resolution : float
         Meters per walkable cell.
+    city_half : float
+        Half-extent of the built-up city core (wilderness outside).
+    trees, cabins, rocks : list[dict]
+        Wilderness decoration descriptors (visual props).
     """
 
-    def __init__(self, size=250.0, seed=None, altitude_cap=40.0):
+    def __init__(self, size=250.0, seed=None, altitude_cap=40.0, city_half=None):
         self.size = float(size)
         self.altitude_cap = float(altitude_cap)
         self.rng = np.random.default_rng(seed)
 
         half = self.size / 2.0
+        # Inner city ~150–170 m across; outer band to map edge is wilderness.
+        if city_half is None:
+            city_half = min(DEFAULT_CITY_HALF, half * 0.68)
+        self.city_half = float(min(city_half, half - 15.0))
+
         self.walkable_resolution = 2.0
         grid = int(self.size / self.walkable_resolution)
         self.walkable = np.ones((grid, grid), dtype=bool)
@@ -54,11 +83,16 @@ class TownLayout:
         self.styles: list[str] = []
         self.roads: list[tuple] = []
         self.overpass_indices: list[int] = []
+        self.trees: list[dict] = []
+        self.cabins: list[dict] = []
+        self.rocks: list[dict] = []
+        self._ground_applied = False
 
         self._build_street_grid(half)
         self._place_buildings(half)
         self._place_rubble(half)
         self._place_overpasses(half)
+        self._place_wilderness(half)
         self._finalize_walkable(half)
 
     # ------------------------------------------------------------------
@@ -66,16 +100,16 @@ class TownLayout:
     # ------------------------------------------------------------------
 
     def _build_street_grid(self, half):
-        """Rough orthogonal street lattice ~10m wide across the map."""
+        """Orthogonal street lattice inside the city core only."""
         street_width = 10.0
-        # Street centerlines from near -half to +half
-        spacing = 45.0
+        # ~40 m centers → ~30 m lots; enough room for several footprints per block.
+        spacing = 40.0
         centers = []
-        c = -half + street_width / 2 + 5.0
-        while c < half - street_width / 2 - 5.0:
+        ch = self.city_half
+        c = -ch + street_width / 2 + 5.0
+        while c < ch - street_width / 2 - 5.0:
             centers.append(c)
             c += spacing
-        # Always include a near-center corridor
         if not any(abs(x) < 8.0 for x in centers):
             centers.append(0.0)
             centers.sort()
@@ -84,19 +118,20 @@ class TownLayout:
         self.street_centers_y = list(centers)
         self.street_width = street_width
 
-        # Road visual slabs (no collision)
+        # Road visual slabs span the city core only (not the wilderness rim)
         z_road = 0.05
         for cx in self.street_centers_x:
-            self.roads.append((cx, 0.0, street_width / 2, half, z_road))
+            self.roads.append((cx, 0.0, street_width / 2, ch, z_road))
         for cy in self.street_centers_y:
-            self.roads.append((0.0, cy, half, street_width / 2, z_road))
+            self.roads.append((0.0, cy, ch, street_width / 2, z_road))
 
     def _block_rects(self, half):
         """Yield (xmin, xmax, ymin, ymax) for building blocks between streets."""
-        xs = [-half] + [c + self.street_width / 2 for c in self.street_centers_x]
-        xs_end = [c - self.street_width / 2 for c in self.street_centers_x] + [half]
-        ys = [-half] + [c + self.street_width / 2 for c in self.street_centers_y]
-        ys_end = [c - self.street_width / 2 for c in self.street_centers_y] + [half]
+        ch = self.city_half
+        xs = [-ch] + [c + self.street_width / 2 for c in self.street_centers_x]
+        xs_end = [c - self.street_width / 2 for c in self.street_centers_x] + [ch]
+        ys = [-ch] + [c + self.street_width / 2 for c in self.street_centers_y]
+        ys_end = [c - self.street_width / 2 for c in self.street_centers_y] + [ch]
 
         for i in range(len(xs)):
             for j in range(len(ys)):
@@ -113,7 +148,7 @@ class TownLayout:
         return len(self.styles) - 1
 
     def _place_buildings(self, half):
-        """2–4 buildings per block; footprints 8–18m; mix of heights/styles."""
+        """3–5 buildings per block; footprints 6–14m; mix of heights/styles."""
         style_weights = ["concrete", "concrete", "brick", "charred", "concrete"]
         target_min, target_max = 80, 120
         blocks = list(self._block_rects(half))
@@ -122,19 +157,21 @@ class TownLayout:
         for x0, x1, y0, y1 in blocks:
             if len(self.styles) >= target_max:
                 break
-            n = int(self.rng.integers(2, 5))
-            margin = 1.5
+            n = int(self.rng.integers(3, 6))
+            margin = 1.0
             usable_w = (x1 - x0) - 2 * margin
             usable_d = (y1 - y0) - 2 * margin
-            if usable_w < 8.0 or usable_d < 8.0:
+            if usable_w < 6.0 or usable_d < 6.0:
                 continue
 
             placed = []
-            for _ in range(n):
+            tries = 0
+            while len(placed) < n and tries < n * 8:
+                tries += 1
                 if len(self.styles) >= target_max:
                     break
-                fw = float(self.rng.uniform(8.0, min(18.0, usable_w)))
-                fd = float(self.rng.uniform(8.0, min(18.0, usable_d)))
+                fw = float(self.rng.uniform(6.0, min(14.0, usable_w)))
+                fd = float(self.rng.uniform(6.0, min(14.0, usable_d)))
                 cx = float(self.rng.uniform(x0 + margin + fw / 2, x1 - margin - fw / 2))
                 cy = float(self.rng.uniform(y0 + margin + fd / 2, y1 - margin - fd / 2))
 
@@ -166,26 +203,30 @@ class TownLayout:
                 self._add_box(xmin, ymin, 0.0, xmax, ymax, height, style)
                 placed.append((xmin, xmax, ymin, ymax))
 
-        # If under target, sprinkle extra mid-block fillers
+        # If under target, sprinkle extra mid-block fillers inside the city
+        ch = self.city_half
         attempts = 0
-        while len(self.styles) < target_min and attempts < 400:
+        while len(self.styles) < target_min and attempts < 1200:
             attempts += 1
-            fw = float(self.rng.uniform(8.0, 14.0))
-            fd = float(self.rng.uniform(8.0, 14.0))
-            cx = float(self.rng.uniform(-half + 15, half - 15))
-            cy = float(self.rng.uniform(-half + 15, half - 15))
-            if self._on_street(cx, cy):
+            fw = float(self.rng.uniform(5.5, 11.0))
+            fd = float(self.rng.uniform(5.5, 11.0))
+            cx = float(self.rng.uniform(-ch + 6, ch - 6))
+            cy = float(self.rng.uniform(-ch + 6, ch - 6))
+            if self._on_street(cx, cy, pad=0.5):
                 continue
             xmin, xmax = cx - fw / 2, cx + fw / 2
             ymin, ymax = cy - fd / 2, cy + fd / 2
-            if self._footprint_overlaps(xmin, xmax, ymin, ymax):
+            if max(abs(xmin), abs(xmax), abs(ymin), abs(ymax)) > ch - 0.5:
+                continue
+            if self._footprint_overlaps(xmin, xmax, ymin, ymax, pad=0.4):
                 continue
             height = float(self.rng.uniform(4.0, 18.0))
             style = style_weights[int(self.rng.integers(0, len(style_weights)))]
             self._add_box(xmin, ymin, 0.0, xmax, ymax, height, style)
 
     def _place_rubble(self, half):
-        """Low rubble piles as short AABBs near streets / lots."""
+        """Low rubble piles as short AABBs near streets / lots (city only)."""
+        ch = self.city_half
         n_rubble = int(self.rng.integers(12, 25))
         for _ in range(n_rubble):
             if len(self.styles) >= 120:
@@ -198,16 +239,18 @@ class TownLayout:
                     cx = float(self.rng.choice(self.street_centers_x)) + float(
                         self.rng.choice([-1, 1])
                     ) * (self.street_width / 2 + fw / 2 + 1.0)
-                    cy = float(self.rng.uniform(-half + 10, half - 10))
+                    cy = float(self.rng.uniform(-ch + 8, ch - 8))
                 else:
                     cy = float(self.rng.choice(self.street_centers_y)) + float(
                         self.rng.choice([-1, 1])
                     ) * (self.street_width / 2 + fd / 2 + 1.0)
-                    cx = float(self.rng.uniform(-half + 10, half - 10))
+                    cx = float(self.rng.uniform(-ch + 8, ch - 8))
             else:
-                cx = float(self.rng.uniform(-half + 10, half - 10))
-                cy = float(self.rng.uniform(-half + 10, half - 10))
+                cx = float(self.rng.uniform(-ch + 8, ch - 8))
+                cy = float(self.rng.uniform(-ch + 8, ch - 8))
 
+            if max(abs(cx), abs(cy)) > ch - 2.0:
+                continue
             xmin, xmax = cx - fw / 2, cx + fw / 2
             ymin, ymax = cy - fd / 2, cy + fd / 2
             if self._footprint_overlaps(xmin, xmax, ymin, ymax, pad=0.5):
@@ -217,6 +260,7 @@ class TownLayout:
 
     def _place_overpasses(self, half):
         """Elevated slabs spanning streets — fly under low, hit high."""
+        ch = self.city_half
         n_over = int(self.rng.integers(3, 6))
         placed = 0
         attempts = 0
@@ -226,7 +270,7 @@ class TownLayout:
             if self.rng.random() < 0.5:
                 # Span in Y across an X-aligned street
                 sx = float(self.rng.choice(self.street_centers_x))
-                cy = float(self.rng.uniform(-half + 30, half - 30))
+                cy = float(self.rng.uniform(-ch + 20, ch - 20))
                 span = float(self.rng.uniform(14.0, 22.0))
                 width = float(self.rng.uniform(8.0, 14.0))
                 xmin = sx - span / 2
@@ -235,7 +279,7 @@ class TownLayout:
                 ymax = cy + width / 2
             else:
                 sy = float(self.rng.choice(self.street_centers_y))
-                cx = float(self.rng.uniform(-half + 30, half - 30))
+                cx = float(self.rng.uniform(-ch + 20, ch - 20))
                 span = float(self.rng.uniform(14.0, 22.0))
                 width = float(self.rng.uniform(8.0, 14.0))
                 xmin = cx - width / 2
@@ -250,6 +294,218 @@ class TownLayout:
             idx = self._add_box(xmin, ymin, zmin, xmax, ymax, zmax, "overpass")
             self.overpass_indices.append(idx)
             placed += 1
+
+    def _in_wilderness(self, x, y, margin=6.0):
+        """True if (x, y) is outside the city core (with margin)."""
+        return max(abs(x), abs(y)) >= self.city_half + margin
+
+    def _wilderness_footprint_clear(self, xmin, xmax, ymin, ymax, pad=2.0):
+        """Avoid overlapping other wilderness props (cabins / rocks / tree trunks)."""
+        for c in self.cabins:
+            if not (
+                xmax + pad < c["xmin"]
+                or xmin - pad > c["xmax"]
+                or ymax + pad < c["ymin"]
+                or ymin - pad > c["ymax"]
+            ):
+                return False
+        for r in self.rocks:
+            if not (
+                xmax + pad < r["xmin"]
+                or xmin - pad > r["xmax"]
+                or ymax + pad < r["ymin"]
+                or ymin - pad > r["ymax"]
+            ):
+                return False
+        for t in self.trees:
+            tx, ty = t["x"], t["y"]
+            tr = t.get("clear_r", 2.5)
+            if xmin - pad <= tx <= xmax + pad and ymin - pad <= ty <= ymax + pad:
+                # crude: center inside expanded footprint
+                return False
+            # also keep tree centers away from cabin rect
+            if (xmin - tr <= tx <= xmax + tr) and (ymin - tr <= ty <= ymax + tr):
+                return False
+        return True
+
+    def _sample_wilderness_xy(self, half, margin=8.0):
+        """Sample a point in the outer ring (not in the city square)."""
+        ch = self.city_half + margin
+        for _ in range(40):
+            # Sample in the map square then reject city interior
+            x = float(self.rng.uniform(-half + 4.0, half - 4.0))
+            y = float(self.rng.uniform(-half + 4.0, half - 4.0))
+            if max(abs(x), abs(y)) >= ch:
+                return x, y
+        # Fallback: push to a random edge
+        edge = int(self.rng.integers(0, 4))
+        t = float(self.rng.uniform(-half + 6.0, half - 6.0))
+        d = float(self.rng.uniform(ch + 2.0, half - 5.0))
+        if edge == 0:
+            return d, t
+        if edge == 1:
+            return -d, t
+        if edge == 2:
+            return t, d
+        return t, -d
+
+    def _place_wilderness(self, half):
+        """Scatter trees, cabins, and a few rocks/logs in the outer ring only."""
+        # --- Cabins first (clearings) ---
+        n_cabins = int(self.rng.integers(6, 13))
+        attempts = 0
+        while len(self.cabins) < n_cabins and attempts < 300:
+            attempts += 1
+            cx, cy = self._sample_wilderness_xy(half, margin=10.0)
+            fw = float(self.rng.uniform(4.0, 7.5))
+            fd = float(self.rng.uniform(3.5, 6.5))
+            xmin, xmax = cx - fw / 2, cx + fw / 2
+            ymin, ymax = cy - fd / 2, cy + fd / 2
+            if not self._in_wilderness(cx, cy, margin=8.0):
+                continue
+            if not self._wilderness_footprint_clear(xmin, xmax, ymin, ymax, pad=6.0):
+                continue
+            wall_h = float(self.rng.uniform(2.2, 3.2))
+            roof_h = float(self.rng.uniform(1.2, 2.0))
+            pitched = bool(self.rng.random() < 0.65)
+            self.cabins.append(
+                {
+                    "x": cx,
+                    "y": cy,
+                    "xmin": xmin,
+                    "xmax": xmax,
+                    "ymin": ymin,
+                    "ymax": ymax,
+                    "fw": fw,
+                    "fd": fd,
+                    "wall_h": wall_h,
+                    "roof_h": roof_h,
+                    "pitched": pitched,
+                }
+            )
+
+        # --- Trees (50–90), jittered scatter ---
+        n_trees = int(self.rng.integers(50, 91))
+        attempts = 0
+        while len(self.trees) < n_trees and attempts < 1200:
+            attempts += 1
+            x, y = self._sample_wilderness_xy(half, margin=7.0)
+            if not self._in_wilderness(x, y, margin=5.0):
+                continue
+            # Keep off cabin footprints
+            too_close = False
+            for c in self.cabins:
+                if (c["xmin"] - 3.0 <= x <= c["xmax"] + 3.0) and (
+                    c["ymin"] - 3.0 <= y <= c["ymax"] + 3.0
+                ):
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            # Soft min-distance between trees (not a grid)
+            for t in self.trees:
+                if (x - t["x"]) ** 2 + (y - t["y"]) ** 2 < 4.5**2:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+
+            species = TREE_SPECIES[int(self.rng.integers(0, len(TREE_SPECIES)))]
+            # Bias: fewer bare trees
+            if species["bare"] and self.rng.random() < 0.55:
+                species = TREE_SPECIES[int(self.rng.integers(0, 4))]
+
+            scale = float(self.rng.uniform(0.7, 1.55))
+            trunk_r = 0.18 * scale
+            trunk_h = float(self.rng.uniform(1.8, 4.5)) * scale
+            canopy_kind = "cone" if self.rng.random() < 0.55 else "box"
+            canopy_r = float(self.rng.uniform(1.2, 2.8)) * scale
+            canopy_h = float(self.rng.uniform(2.0, 4.5)) * scale
+            self.trees.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "trunk_r": trunk_r,
+                    "trunk_h": trunk_h,
+                    "canopy_kind": canopy_kind,
+                    "canopy_r": canopy_r,
+                    "canopy_h": canopy_h,
+                    "canopy_rgba": list(species["canopy"]),
+                    "trunk_rgba": list(species["trunk"]),
+                    "bare": bool(species["bare"]),
+                    "clear_r": max(2.0, canopy_r * 0.7),
+                }
+            )
+
+        # --- A few rock outcrops / fallen logs ---
+        n_rocks = int(self.rng.integers(5, 11))
+        attempts = 0
+        while len(self.rocks) < n_rocks and attempts < 200:
+            attempts += 1
+            cx, cy = self._sample_wilderness_xy(half, margin=8.0)
+            kind = "rock" if self.rng.random() < 0.6 else "log"
+            if kind == "rock":
+                fw = float(self.rng.uniform(1.5, 4.0))
+                fd = float(self.rng.uniform(1.2, 3.5))
+                hz = float(self.rng.uniform(0.8, 2.4))
+            else:
+                fw = float(self.rng.uniform(3.0, 6.0))
+                fd = float(self.rng.uniform(0.35, 0.7))
+                hz = float(self.rng.uniform(0.35, 0.7))
+            xmin, xmax = cx - fw / 2, cx + fw / 2
+            ymin, ymax = cy - fd / 2, cy + fd / 2
+            if not self._wilderness_footprint_clear(xmin, xmax, ymin, ymax, pad=2.5):
+                continue
+            self.rocks.append(
+                {
+                    "kind": kind,
+                    "x": cx,
+                    "y": cy,
+                    "xmin": xmin,
+                    "xmax": xmax,
+                    "ymin": ymin,
+                    "ymax": ymax,
+                    "fw": fw,
+                    "fd": fd,
+                    "hz": hz,
+                    "yaw": float(self.rng.uniform(0.0, 6.28)),
+                }
+            )
+
+    def apply_ground_heights(self, terrain):
+        """
+        Shift building / overpass AABB z so bases follow the heightmap.
+
+        Call after Terrain is built. Relative heights (building tallness,
+        overpass clearance) are preserved. Idempotent.
+        """
+        if self._ground_applied or self.boxes.size == 0:
+            return
+        new_boxes = self.boxes.copy()
+        for i, box in enumerate(self.boxes):
+            xmin, ymin, zmin, xmax, ymax, zmax = box
+            cx = 0.5 * (xmin + xmax)
+            cy = 0.5 * (ymin + ymax)
+            gz = terrain.height_at(cx, cy)
+            # Overpasses: zmin is clearance above local ground
+            if self.styles[i] == "overpass":
+                clearance = zmin  # original clearance
+                thickness = zmax - zmin
+                new_boxes[i, 2] = gz + clearance
+                new_boxes[i, 5] = gz + clearance + thickness
+            else:
+                height = zmax - zmin
+                new_boxes[i, 2] = gz
+                new_boxes[i, 5] = gz + height
+        self.boxes = new_boxes
+
+        # Roads: store ground-relative z; spawn will sample per slab center
+        lifted = []
+        for cx, cy, hx, hy, _z in self.roads:
+            gz = terrain.height_at(cx, cy)
+            lifted.append((cx, cy, hx, hy, gz + 0.06))
+        self.roads = lifted
+        self._ground_applied = True
 
     def _on_street(self, x, y, pad=0.0):
         half_w = self.street_width / 2 + pad
@@ -304,6 +560,7 @@ class TownLayout:
                 mask = (XX >= xmin) & (XX <= xmax) & (YY >= ymin) & (YY <= ymax)
                 self.walkable[mask] = False
 
+        # Wilderness is not city walkable street grid — keep True for open terrain
         self.street_mask = street
 
     # ------------------------------------------------------------------
@@ -359,6 +616,10 @@ class TownLayout:
                 }
             )
         return out
+
+    def building_count(self):
+        """Count concrete/brick/charred buildings (excludes rubble + overpass)."""
+        return sum(1 for s in self.styles if s in ("concrete", "brick", "charred"))
 
     # ------------------------------------------------------------------
     # Vectorized collision / LoS (no PyBullet)
@@ -447,7 +708,7 @@ class TownLayout:
     @staticmethod
     def segment_clear(point_a, point_b, boxes):
         """True if segment does not hit any box."""
-        return not TownLayout.segment_hits_boxes(point_a, point_b, boxes)
+        return not TownLayout.segment_hits_boxes(point_a, point_b)
 
 
 def connect_pybullet(gui=True, shadows=False):
@@ -469,15 +730,237 @@ def connect_pybullet(gui=True, shadows=False):
     return client
 
 
+def _spawn_wilderness_ground(client, town, terrain, env_size):
+    """
+    Green visual patches over the wilderness rim.
+
+    Heightfield stays dusty-brown (city lots). Coarse green pads follow
+    terrain height so the outer band reads as grass without recoloring downtown.
+    """
+    half = float(env_size) / 2.0
+    ch = town.city_half
+    tile = 18.0
+    bodies = []
+    # Start just outside the city edge
+    xs = np.arange(-half + tile / 2, half, tile)
+    ys = np.arange(-half + tile / 2, half, tile)
+    for cx in xs:
+        for cy in ys:
+            if max(abs(cx), abs(cy)) < ch + 2.0:
+                continue
+            # Skip tiles that are mostly inside the city square
+            if max(abs(cx), abs(cy)) + tile / 2 < ch:
+                continue
+            gz = terrain.height_at(cx, cy)
+            hx = hy = tile / 2 - 0.15
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[hx, hy, 0.04],
+                rgbaColor=WILD_GROUND_COLOR,
+                physicsClientId=client,
+            )
+            bid = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=vis,
+                basePosition=[float(cx), float(cy), gz + 0.03],
+                physicsClientId=client,
+            )
+            bodies.append(bid)
+    return bodies
+
+
+def _spawn_trees(client, town, terrain):
+    bodies = []
+    for t in town.trees:
+        gz = terrain.height_at(t["x"], t["y"])
+        # Trunk
+        trunk_vis = p.createVisualShape(
+            p.GEOM_CYLINDER,
+            radius=t["trunk_r"],
+            length=t["trunk_h"],
+            rgbaColor=t["trunk_rgba"],
+            physicsClientId=client,
+        )
+        trunk_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=trunk_vis,
+            basePosition=[t["x"], t["y"], gz + t["trunk_h"] / 2.0],
+            physicsClientId=client,
+        )
+        bodies.append(trunk_id)
+
+        if t["bare"]:
+            # Sparse brown canopy stub
+            canopy_h = t["canopy_h"] * 0.35
+            canopy_r = t["canopy_r"] * 0.45
+        else:
+            canopy_h = t["canopy_h"]
+            canopy_r = t["canopy_r"]
+
+        canopy_z = gz + t["trunk_h"] + canopy_h * 0.35
+        if t["canopy_kind"] == "cone" and not t["bare"]:
+            # Approximate cone with a cylinder taper stand-in (box pyramid look via cylinder)
+            canopy_vis = p.createVisualShape(
+                p.GEOM_CYLINDER,
+                radius=canopy_r,
+                length=canopy_h,
+                rgbaColor=t["canopy_rgba"],
+                physicsClientId=client,
+            )
+        else:
+            canopy_vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[canopy_r, canopy_r, canopy_h / 2.0],
+                rgbaColor=t["canopy_rgba"],
+                physicsClientId=client,
+            )
+            canopy_z = gz + t["trunk_h"] + canopy_h / 2.0
+
+        canopy_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=canopy_vis,
+            basePosition=[t["x"], t["y"], canopy_z],
+            physicsClientId=client,
+        )
+        bodies.append(canopy_id)
+    return bodies
+
+
+def _spawn_cabins(client, town, terrain):
+    bodies = []
+    for c in town.cabins:
+        gz = terrain.height_at(c["x"], c["y"])
+        hx, hy = c["fw"] / 2.0, c["fd"] / 2.0
+        wall_h = c["wall_h"]
+        # Walls
+        wall_vis = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[hx, hy, wall_h / 2.0],
+            rgbaColor=CABIN_WOOD,
+            physicsClientId=client,
+        )
+        wall_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=wall_vis,
+            basePosition=[c["x"], c["y"], gz + wall_h / 2.0],
+            physicsClientId=client,
+        )
+        bodies.append(wall_id)
+
+        # Roof: pitched wedge ≈ two slanted boxes, or a simple roof slab
+        roof_h = c["roof_h"]
+        if c["pitched"]:
+            # Ridge along the longer footprint axis
+            if c["fw"] >= c["fd"]:
+                # Two halves along Y
+                half_y = hy * 0.55
+                for sign in (-1.0, 1.0):
+                    roof_vis = p.createVisualShape(
+                        p.GEOM_BOX,
+                        halfExtents=[hx * 1.05, half_y, roof_h / 2.0],
+                        rgbaColor=CABIN_ROOF,
+                        physicsClientId=client,
+                    )
+                    rid = p.createMultiBody(
+                        baseMass=0,
+                        baseCollisionShapeIndex=-1,
+                        baseVisualShapeIndex=roof_vis,
+                        basePosition=[
+                            c["x"],
+                            c["y"] + sign * hy * 0.45,
+                            gz + wall_h + roof_h * 0.35,
+                        ],
+                        baseOrientation=p.getQuaternionFromEuler(
+                            [sign * 0.45, 0.0, 0.0]
+                        ),
+                        physicsClientId=client,
+                    )
+                    bodies.append(rid)
+            else:
+                half_x = hx * 0.55
+                for sign in (-1.0, 1.0):
+                    roof_vis = p.createVisualShape(
+                        p.GEOM_BOX,
+                        halfExtents=[half_x, hy * 1.05, roof_h / 2.0],
+                        rgbaColor=CABIN_ROOF,
+                        physicsClientId=client,
+                    )
+                    rid = p.createMultiBody(
+                        baseMass=0,
+                        baseCollisionShapeIndex=-1,
+                        baseVisualShapeIndex=roof_vis,
+                        basePosition=[
+                            c["x"] + sign * hx * 0.45,
+                            c["y"],
+                            gz + wall_h + roof_h * 0.35,
+                        ],
+                        baseOrientation=p.getQuaternionFromEuler(
+                            [0.0, -sign * 0.45, 0.0]
+                        ),
+                        physicsClientId=client,
+                    )
+                    bodies.append(rid)
+        else:
+            roof_vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[hx * 1.08, hy * 1.08, roof_h / 2.0],
+                rgbaColor=CABIN_ROOF,
+                physicsClientId=client,
+            )
+            rid = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=roof_vis,
+                basePosition=[c["x"], c["y"], gz + wall_h + roof_h / 2.0],
+                physicsClientId=client,
+            )
+            bodies.append(rid)
+    return bodies
+
+
+def _spawn_rocks(client, town, terrain):
+    bodies = []
+    for r in town.rocks:
+        gz = terrain.height_at(r["x"], r["y"])
+        color = ROCK_COLOR if r["kind"] == "rock" else LOG_COLOR
+        vis = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[r["fw"] / 2.0, r["fd"] / 2.0, r["hz"] / 2.0],
+            rgbaColor=color,
+            physicsClientId=client,
+        )
+        orn = p.getQuaternionFromEuler([0.0, 0.0, r["yaw"]])
+        bid = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=vis,
+            basePosition=[r["x"], r["y"], gz + r["hz"] / 2.0],
+            baseOrientation=orn,
+            physicsClientId=client,
+        )
+        bodies.append(bid)
+    return bodies
+
+
 def spawn_town_in_pybullet(client, town, terrain, env_size):
     """
-    Load dusty heightfield + road slabs + building/overpass visuals once.
+    Load dusty heightfield + green wilderness pads + roads + buildings + props.
 
     Collision for buildings stays in numpy (AABB); the heightfield is the
-    only PyBullet collision mesh. Returns (terrain_body, road_bodies, building_bodies).
+    only PyBullet collision mesh. Returns
+    (terrain_body, road_bodies, building_bodies, prop_bodies).
     """
     grid = terrain.grid_x
     size = float(env_size)
+
+    # Ensure AABBs / roads follow the heightmap before spawning visuals
+    town.apply_ground_heights(terrain)
+    if hasattr(terrain, "set_obstacle_boxes"):
+        terrain.set_obstacle_boxes(town.boxes)
 
     terrain_shape = p.createCollisionShape(
         p.GEOM_HEIGHTFIELD,
@@ -487,18 +970,43 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
         numHeightfieldColumns=grid,
         physicsClientId=client,
     )
+    # PyBullet centers the heightfield AABB at the body origin; lift so
+    # world Z matches heightmap values used by buildings / props.
+    mid = terrain.heightfield_mid()
     terrain_body = p.createMultiBody(
         baseMass=0,
         baseCollisionShapeIndex=terrain_shape,
+        basePosition=[0.0, 0.0, mid],
         physicsClientId=client,
     )
-    # Gray-brown dusty ground (not forest green)
+    # Gray-brown dusty ground for the city (wilderness green is separate pads)
     p.changeVisualShape(
         terrain_body,
         -1,
-        rgbaColor=[0.45, 0.38, 0.28, 1],
+        rgbaColor=CITY_GROUND_COLOR,
         physicsClientId=client,
     )
+
+    prop_bodies = []
+    prop_bodies.extend(_spawn_wilderness_ground(client, town, terrain, env_size))
+
+    # Dusty city overlay plate so downtown lots stay gray-brown above any bleed
+    ch = town.city_half
+    city_z = terrain.height_at(0.0, 0.0) + 0.02
+    city_vis = p.createVisualShape(
+        p.GEOM_BOX,
+        halfExtents=[ch, ch, 0.03],
+        rgbaColor=CITY_GROUND_COLOR,
+        physicsClientId=client,
+    )
+    city_pad = p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=city_vis,
+        basePosition=[0.0, 0.0, city_z],
+        physicsClientId=client,
+    )
+    prop_bodies.append(city_pad)
 
     road_bodies = []
     for cx, cy, hx, hy, z in town.roads:
@@ -543,16 +1051,20 @@ def spawn_town_in_pybullet(client, town, terrain, env_size):
         )
         building_bodies.append(bid)
 
-    return terrain_body, road_bodies, building_bodies
+    prop_bodies.extend(_spawn_trees(client, town, terrain))
+    prop_bodies.extend(_spawn_cabins(client, town, terrain))
+    prop_bodies.extend(_spawn_rocks(client, town, terrain))
+
+    return terrain_body, road_bodies, building_bodies, prop_bodies
 
 
 def frame_town_camera(client, env_size):
-    """Overview framing for the full map."""
-    cam_dist = max(180.0, float(env_size) * 0.85)
+    """Overview framing for the full map (slightly high to show the wilderness rim)."""
+    cam_dist = max(200.0, float(env_size) * 0.95)
     p.resetDebugVisualizerCamera(
         cameraDistance=cam_dist,
         cameraYaw=45,
-        cameraPitch=-40,
-        cameraTargetPosition=[0, 0, 8.0],
+        cameraPitch=-42,
+        cameraTargetPosition=[0, 0, 12.0],
         physicsClientId=client,
     )

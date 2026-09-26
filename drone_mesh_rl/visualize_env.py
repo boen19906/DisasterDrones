@@ -195,6 +195,7 @@ def build_world(client, env_size, seed):
         resolution=2.0,
         seed=seed,
         obstacle_boxes=town.boxes,
+        city_half=town.city_half,
     )
     spawn_town_in_pybullet(client, town, terrain, env_size)
     return town, terrain
@@ -231,8 +232,12 @@ def main():
     p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=client)
 
     town, terrain = build_world(client, args.env_size, args.seed)
-    n_buildings = len(town.boxes)
-    print(f"[TOWN] Loaded {n_buildings} building/rubble/overpass boxes on {args.env_size:.0f}m map.")
+    n_buildings = town.building_count()
+    print(
+        f"[TOWN] {n_buildings} buildings (+ rubble/overpass), "
+        f"{len(town.trees)} trees, {len(town.cabins)} cabins on "
+        f"{args.env_size:.0f}m map (city ~{town.city_half * 2:.0f}m)."
+    )
 
     frame_town_camera(client, args.env_size)
     spectator = True
@@ -260,7 +265,10 @@ def main():
                 seed = int(seed) + 1
                 clear_world(client)
                 town, terrain = build_world(client, args.env_size, seed)
-                print(f"[TOWN] Loaded {len(town.boxes)} boxes (seed={seed}).")
+                print(
+                    f"[TOWN] {town.building_count()} buildings, "
+                    f"{len(town.trees)} trees, {len(town.cabins)} cabins (seed={seed})."
+                )
                 frame_town_camera(client, args.env_size)
                 yaw, pitch, dist, target, eye = read_debug_camera(client)
                 # Re-frame overview, then return to fly mode
