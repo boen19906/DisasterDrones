@@ -427,10 +427,22 @@ class DisasterMeshEnv(ParallelEnv):
             terrain_z = self._get_terrain_height(new_pos[0], new_pos[1])
             new_pos[2] = np.clip(new_pos[2], terrain_z + 0.5, self.drone_max_altitude)
 
-            # Boundary clamping
-            new_pos[0] = np.clip(new_pos[0], -self.env_size / 2, self.env_size / 2)
-            new_pos[1] = np.clip(new_pos[1], -self.env_size / 2, self.env_size / 2)
-
+            # Stay inset on the map (do not allow sitting on / past the rim)
+            xy_lim = max(5.0, self.env_size / 2.0 - 8.0)
+            vel = self.drone_velocities[i].copy()
+            if new_pos[0] > xy_lim:
+                new_pos[0] = xy_lim
+                vel[0] = -abs(self.drone_max_speed) * 0.4
+            elif new_pos[0] < -xy_lim:
+                new_pos[0] = -xy_lim
+                vel[0] = abs(self.drone_max_speed) * 0.4
+            if new_pos[1] > xy_lim:
+                new_pos[1] = xy_lim
+                vel[1] = -abs(self.drone_max_speed) * 0.4
+            elif new_pos[1] < -xy_lim:
+                new_pos[1] = -xy_lim
+                vel[1] = abs(self.drone_max_speed) * 0.4
+            self.drone_velocities[i] = vel
             self.drone_positions[i] = new_pos
 
             # Update PyBullet body
@@ -438,6 +450,9 @@ class DisasterMeshEnv(ParallelEnv):
             p.resetBasePositionAndOrientation(
                 self.drone_ids[i], new_pos.tolist(), orn,
                 physicsClientId=self.client,
+            )
+            p.resetBaseVelocity(
+                self.drone_ids[i], [0, 0, 0], [0, 0, 0], physicsClientId=self.client
             )
 
             # Battery drain

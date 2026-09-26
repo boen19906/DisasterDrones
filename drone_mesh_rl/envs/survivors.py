@@ -30,6 +30,9 @@ class SurvivorCluster:
         require_los=True,
         frozen=False,
         seed=None,
+        num_loners=0,
+        spawn_frac=0.42,
+        clip_xy=None,
     ):
         """
         Parameters
@@ -61,6 +64,8 @@ class SurvivorCluster:
         self.drift_strength = drift_strength
         self.require_los = require_los
         self.frozen = frozen
+        self.num_loners = int(max(0, num_loners))
+        self.spawn_frac = float(spawn_frac)
 
         self.rng = np.random.default_rng(seed)
 
@@ -69,9 +74,16 @@ class SurvivorCluster:
         self.cluster_ids = []  # which cluster each survivor belongs to
         positions_list = []
 
-        # Spawn clusters within 70% of map width to keep well clear of boundary drop-offs
-        spawn_bound_x = env_size_x * 0.35
-        spawn_bound_y = env_size_y * 0.35
+        spawn_bound_x = env_size_x * self.spawn_frac
+        spawn_bound_y = env_size_y * self.spawn_frac
+        max_reach_x = env_size_x * 0.45
+        max_reach_y = env_size_y * 0.45
+        if clip_xy is not None:
+            max_reach_x = min(max_reach_x, float(clip_xy[0]))
+            max_reach_y = min(max_reach_y, float(clip_xy[1]))
+            spawn_bound_x = min(spawn_bound_x, max_reach_x)
+            spawn_bound_y = min(spawn_bound_y, max_reach_y)
+        spread = max(2.0, float(cluster_spread))
 
         for c in range(num_clusters):
             cx = self.rng.uniform(-spawn_bound_x, spawn_bound_x)
@@ -82,15 +94,20 @@ class SurvivorCluster:
                 survivors_per_cluster[0], survivors_per_cluster[1] + 1
             )
             for _ in range(n_surv):
-                sx = cx + self.rng.normal(0, min(cluster_spread, 4.0))
-                sy = cy + self.rng.normal(0, min(cluster_spread, 4.0))
-                # Clamp strictly within terrain bounds with a 10m safety margin
-                max_reach_x = env_size_x * 0.42
-                max_reach_y = env_size_y * 0.42
+                sx = cx + self.rng.normal(0, spread)
+                sy = cy + self.rng.normal(0, spread)
                 sx = np.clip(sx, -max_reach_x, max_reach_x)
                 sy = np.clip(sy, -max_reach_y, max_reach_y)
                 positions_list.append([sx, sy, 0.0])
                 self.cluster_ids.append(c)
+
+        loner_id0 = num_clusters
+        for k in range(self.num_loners):
+            sx = self.rng.uniform(-max_reach_x, max_reach_x)
+            sy = self.rng.uniform(-max_reach_y, max_reach_y)
+            positions_list.append([sx, sy, 0.0])
+            self.cluster_ids.append(loner_id0 + k)
+        self.num_clusters = num_clusters + self.num_loners
 
         self.num_survivors = len(positions_list)
         self.positions = np.array(positions_list, dtype=np.float64)

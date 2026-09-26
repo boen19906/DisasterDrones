@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
     parser.add_argument("--task", type=str, default="search", choices=["search", "mesh"], help="search = find survivors; mesh = full LEO mesh env")
     parser.add_argument("--num_drones", type=int, default=3, help="Number of drones in swarm")
-    parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
+    parser.add_argument("--num_clusters", type=int, default=9, help="Number of survivor clusters")
     parser.add_argument("--env_size", type=float, default=100.0, help="Terrain size in meters")
     parser.add_argument("--max_steps", type=int, default=1000, help="Max steps per episode")
     parser.add_argument("--total_timesteps", type=int, default=50000, help="Total environment steps")
@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--vf_coef", type=float, default=0.5, help="Value loss coefficient")
     parser.add_argument("--max_grad_norm", type=float, default=0.5, help="Max gradient norm")
     parser.add_argument("--save_path", type=str, default="models/mappo_drone_mesh.pt", help="Checkpoint save path")
+    parser.add_argument("--resume", action="store_true", help="Continue from save_path instead of random weights")
     parser.add_argument("--save_freq", type=int, default=10, help="Save frequency in iterations")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
@@ -72,7 +73,6 @@ def main():
         env = SurvivorSearchEnv(
             num_drones=args.num_drones,
             num_clusters=args.num_clusters,
-            env_size=args.env_size,
             max_steps=args.max_steps,
             render_mode=None,
             seed=args.seed,
@@ -97,6 +97,11 @@ def main():
 
     # Model and optimizer
     model = MAPPOModel(num_drones=args.num_drones, obs_dim=obs_dim, act_dim=act_dim).to(args.device)
+    if args.resume and os.path.exists(args.save_path):
+        model.load(args.save_path, map_location=args.device)
+        print(f"[RESUME] Loaded weights from {args.save_path}")
+    elif args.resume:
+        print(f"[RESUME] No checkpoint at {args.save_path}, starting random.")
     optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     # Rollout buffer
@@ -145,7 +150,11 @@ def main():
             act_dict = {agent_names[i]: actions_np[i] for i in range(args.num_drones)}
             next_obs_dict, rew_dict, term_dict, trunc_dict, infos = env.step(act_dict)
 
-            rews_array = np.array([rew_dict[a] for a in agent_names], dtype=np.float32)
+            rews_array = np.clip(
+                np.array([rew_dict[a] for a in agent_names], dtype=np.float32),
+                -40.0,
+                80.0,
+            )
             dones_array = np.array([term_dict[a] or trunc_dict[a] for a in agent_names], dtype=np.float32)
 
             current_ep_rewards += rews_array
