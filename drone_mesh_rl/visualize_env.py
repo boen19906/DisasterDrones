@@ -21,6 +21,8 @@ import sys
 import time
 import argparse
 import numpy as np
+import torch
+import pybullet as p
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -28,101 +30,42 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+from envs.disaster_env import DisasterMeshEnv
 from envs.search_env import SurvivorSearchEnv
 
-MAPPOModel = None
-
-
-def _load_mappo():
-    global MAPPOModel
-    if MAPPOModel is not None:
-        return MAPPOModel
-    try:
-        from models.actor_critic import MAPPOModel as _M
-        MAPPOModel = _M
-    except ModuleNotFoundError:
-        MAPPOModel = None
-    return MAPPOModel
+try:
+    from models.actor_critic import MAPPOModel
+except ModuleNotFoundError:
+    MAPPOModel = None
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="3D Visualizer for Drone Swarm Mesh")
     parser.add_argument("--model_path", type=str, default="", help="Optional model checkpoint path")
     parser.add_argument("--num_drones", type=int, default=3, help="Number of drones")
-    parser.add_argument("--num_clusters", type=int, default=9, help="Number of survivor clusters")
-    parser.add_argument("--env_size", type=float, default=100.0, help="Square terrain size (mesh task)")
-    parser.add_argument("--env_size_x", type=float, default=250.0, help="Search map width in meters")
-    parser.add_argument("--env_size_y", type=float, default=160.0, help="Search map height in meters")
+    parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
+    parser.add_argument("--env_size", type=float, default=None, help="Terrain size in meters")
     parser.add_argument("--fps", type=float, default=30.0, help="Display FPS target")
     parser.add_argument("--seed", type=int, default=42, help="World seed")
     parser.add_argument("--task", type=str, default="search", choices=["search", "mesh"], help="search = find people; mesh = LEO demo")
-    parser.add_argument("--headless", action="store_true", help="No GUI; run episodes as fast as the CPU allows")
-    parser.add_argument("--episodes", type=int, default=3, help="Headless episode count")
-    return parser.parse_args()
-
-
-def _search_actions(env, agent_names, num_drones):
-    actions = {}
-    for i in range(num_drones):
-        agent = agent_names[i]
-        pos = env.drone_positions[i]
-        udir = env._unexplored_dir(pos[:2], i)
-        actions[agent] = np.array([float(udir[0]), float(udir[1]), 0.0], dtype=np.float32)
-    return actions
-
-
-def run_headless(args):
-    print("=" * 65)
-    print(f" [HEADLESS SEARCH] {args.episodes} episode(s), no GUI")
-    print("=" * 65)
-    env = SurvivorSearchEnv(
-        num_drones=args.num_drones,
-        num_clusters=args.num_clusters,
-        env_size_x=args.env_size_x,
-        env_size_y=args.env_size_y,
-        max_steps=5000,
-        render_mode=None,
-        seed=args.seed,
+    parser.add_argument(
+        "--policy",
+        type=str,
+        default="model",
+        choices=["sweep", "model"],
+        help="search: sweep = scripted lawnmower. model = learned MAPPO (default)",
     )
-    print(f" Map: {env.size_x:.0f} m × {env.size_y:.0f} m")
-    agent_names = env.possible_agents
-    t0 = time.time()
-    for ep in range(1, args.episodes + 1):
-        obs_dict, info_dict = env.reset()
-        total = env.survivors.num_survivors
-        print(f"[EP {ep}] {total} survivors")
-        step_num = 0
-        while True:
-            step_num += 1
-            actions = _search_actions(env, agent_names, args.num_drones)
-            obs_dict, rews, terms, truncs, infos = env.step(actions)
-            if step_num % 200 == 0:
-                stats = env.survivors.get_discovery_stats()
-                print(
-                    f"  step {step_num}: found {stats['discovered_survivors']}/{stats['total_survivors']} "
-                    f"cover {env._interior_coverage()*100:.0f}%"
-                )
-            if all(terms.values()) or all(truncs.values()):
-                stats = env.survivors.get_discovery_stats()
-                print(
-                    f"[EP {ep} END] steps={step_num} found="
-                    f"{stats['discovered_survivors']}/{stats['total_survivors']} "
-                    f"cover={env._interior_coverage()*100:.0f}%"
-                )
-                break
-    env.close()
-    print(f"[HEADLESS] Done in {time.time() - t0:.1f}s")
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.headless:
-        run_headless(args)
-        return
-
-    import pybullet as p
+    if args.env_size is None:
+        args.env_size = 200.0 if args.task == "search" else 100.0
     print("=" * 65)
     print(f" [3D VISUALIZER] task={args.task}")
+    if args.task == "search" and args.policy == "sweep":
+        print(" Coverage: lawnmower lanes across the full 100 m map")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")
     print("=" * 65)
 
@@ -130,58 +73,52 @@ def main():
         env = SurvivorSearchEnv(
             num_drones=args.num_drones,
             num_clusters=args.num_clusters,
-            env_size_x=args.env_size_x,
-            env_size_y=args.env_size_y,
-            max_steps=5000,
+            env_size=args.env_size,
+            max_steps=max(5000, int(args.env_size * 8)),
             render_mode="human",
             seed=args.seed,
         )
-        print(
-            f" Search map: {env.size_x:.0f} m × {env.size_y:.0f} m | "
-            f"people move each reset (R)"
-        )
         obs_dim, act_dim = env.obs_dim, env.act_dim
     else:
-        from envs.disaster_env import DisasterMeshEnv
         env = DisasterMeshEnv(
             num_drones=args.num_drones,
             num_clusters=args.num_clusters,
             env_size=args.env_size,
-            max_steps=5000,
+            max_steps=max(5000, int(args.env_size * 8)),
             render_mode="human",
             seed=args.seed,
         )
         obs_dim, act_dim = 25, 5
 
     model = None
-    if not args.model_path:
-        default_ckpt = "models/mappo_search.pt" if args.task == "search" else "models/mappo_drone_mesh.pt"
-        if os.path.exists(default_ckpt):
-            args.model_path = default_ckpt
-
-    if args.model_path:
-        import torch
-        _load_mappo()
-        if not os.path.exists(args.model_path):
-            print(f"[POLICY] Checkpoint not found: {args.model_path} — using search heuristic.")
-        elif MAPPOModel is None:
-            print("[POLICY] models/actor_critic.py is missing — using search heuristic.")
+    if args.task == "search" and args.policy == "model" and not args.model_path:
+        args.model_path = "models/mappo_search.pt"
+    load_nn = bool(args.model_path) and os.path.exists(args.model_path)
+    if args.task == "search" and args.policy == "sweep":
+        load_nn = False
+    if load_nn:
+        if MAPPOModel is None:
+            print("[WARNING] models/actor_critic.py is missing; using heuristic policy.")
         else:
-            print(f"[POLICY] Loading TRAINED weights from {args.model_path}")
-            model = MAPPOModel(num_drones=args.num_drones, obs_dim=obs_dim, act_dim=act_dim)
+            print(f"[MODEL] Loading policy checkpoint from {args.model_path}...")
+            discrete = bool(getattr(env, "discrete_actions", False))
+            state_dim = int(getattr(env, "state_dim", args.num_drones * obs_dim))
+            model = MAPPOModel(
+                num_drones=args.num_drones,
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                discrete=discrete,
+                state_dim=state_dim,
+            )
             try:
                 model.load(args.model_path, map_location="cpu")
                 model.eval()
-                print("[POLICY] Using trained MAPPO (this is what train.py saved).")
+                print("[MODEL] Model loaded successfully!")
             except Exception as e:
-                print(f"[POLICY] Load failed ({e}) — using search heuristic.")
+                print(f"[WARNING] Failed to load model ({e}), using heuristic policy.")
                 model = None
-    if model is None:
-        print("[POLICY] Using next-best-view search — training will NOT show up until a .pt file loads.")
 
     obs_dict, info_dict = env.reset(seed=args.seed)
-    if args.task == "search":
-        print(f" Survivors this episode: {env.survivors.num_survivors} (press R for a new layout)")
     agent_names = env.possible_agents
 
     dt_target = 1.0 / args.fps
@@ -207,47 +144,72 @@ def main():
                 continue
 
             if not paused:
-                step_num += 1
+                playback = 4 if args.task == "search" else 1
+                for _ in range(playback):
+                    step_num += 1
 
-                # Generate actions
-                if model is not None:
-                    obs_array = np.array([obs_dict[a] for a in agent_names], dtype=np.float32)
-                    state = obs_array.flatten()
-                    with torch.no_grad():
-                        obs_t = torch.tensor(obs_array, dtype=torch.float32)
-                        state_t = torch.tensor(state, dtype=torch.float32)
-                        actions_t, _, _, _ = model.get_action_and_value(obs_t, state_t, deterministic=True)
-                    actions_np = actions_t.cpu().numpy()
-                    actions = {
-                        agent_names[i]: actions_np[i]
-                        for i in range(args.num_drones)
-                        if agent_names[i] in env.agents
-                    }
-                else:
-                    actions = {}
-                    half = args.env_size / 2.0
-                    if args.task == "search":
-                        for i in range(args.num_drones):
-                            agent = agent_names[i]
-                            pos = env.drone_positions[i]
-                            udir = env._unexplored_dir(pos[:2], i)
-                            actions[agent] = np.array(
-                                [float(udir[0]), float(udir[1]), 0.0], dtype=np.float32
-                            )
+                    use_sweep = args.task == "search" and (
+                        args.policy == "sweep" or model is None
+                    )
+                    if use_sweep:
+                        actions = env.coverage_actions()
+                    elif model is not None:
+                        obs_array = np.array([obs_dict[a] for a in agent_names], dtype=np.float32)
+                        if getattr(env, "discrete_actions", False):
+                            state = np.asarray(env.global_state(), dtype=np.float32)
+                        else:
+                            state = obs_array.flatten()
+                        with torch.no_grad():
+                            obs_t = torch.tensor(obs_array, dtype=torch.float32)
+                            state_t = torch.tensor(state, dtype=torch.float32)
+                            actions_t, _, _, _ = model.get_action_and_value(obs_t, state_t, deterministic=True)
+                        actions_np = actions_t.cpu().numpy()
+                        actions = {
+                            agent_names[i]: actions_np[i]
+                            for i in range(args.num_drones)
+                            if agent_names[i] in env.agents
+                        }
                     else:
-                        t = step_num * 0.05
-                        for i in range(args.num_drones):
-                            if not env.drone_alive[i]:
-                                continue
-                            agent = agent_names[i]
-                            angle = t + (2 * np.pi * i / args.num_drones)
-                            vx = np.cos(angle) * 0.5
-                            vy = np.sin(angle) * 0.5
-                            vz = 0.05 * np.sin(t * 2 + i)
-                            role_toggle = 1.0 if i == 0 else -1.0
-                            actions[agent] = np.array([vx, vy, vz, role_toggle, 0.0], dtype=np.float32)
+                        actions = {}
+                        half = args.env_size / 2.0
+                        if args.task == "search":
+                            if not hasattr(env, "sweep_dir"):
+                                env.sweep_dir = np.ones(args.num_drones)
+                            for i in range(args.num_drones):
+                                agent = agent_names[i]
+                                pos = env.drone_positions[i]
+                                lane_x = -half + (i + 0.5) * (args.env_size / args.num_drones)
+                                vx = float(np.clip((lane_x - pos[0]) / 8.0, -1.0, 1.0))
+                                if pos[1] > half - 8.0:
+                                    env.sweep_dir[i] = -1.0
+                                elif pos[1] < -half + 8.0:
+                                    env.sweep_dir[i] = 1.0
+                                vy = float(env.sweep_dir[i])
+                                hover_z = getattr(env, "hover_altitude", 8.0)
+                                vz = float(np.clip((hover_z - pos[2]) / 5.0, -1.0, 1.0))
+                                actions[agent] = np.array([vx, vy, vz], dtype=np.float32)
+                        else:
+                            t = step_num * 0.05
+                            for i in range(args.num_drones):
+                                if not env.drone_alive[i]:
+                                    continue
+                                agent = agent_names[i]
+                                angle = t + (2 * np.pi * i / args.num_drones)
+                                vx = np.cos(angle) * 0.5
+                                vy = np.sin(angle) * 0.5
+                                vz = 0.05 * np.sin(t * 2 + i)
+                                role_toggle = 1.0 if i == 0 else -1.0
+                                actions[agent] = np.array([vx, vy, vz, role_toggle, 0.0], dtype=np.float32)
 
-                obs_dict, rews, terms, truncs, infos = env.step(actions)
+                    obs_dict, rews, terms, truncs, infos = env.step(actions)
+                    if all(terms.values()) or all(truncs.values()):
+                        stats = env.survivors.get_discovery_stats()
+                        print(
+                            f"[EPISODE END] Discovered: {stats['discovered_survivors']}/{stats['total_survivors']}"
+                        )
+                        obs_dict, info_dict = env.reset()
+                        step_num = 0
+                        break
 
                 # Update debug visuals at a smooth 10 Hz rate instead of 60 Hz to avoid strobe flickering
                 if step_num % 3 == 0:
@@ -354,26 +316,13 @@ def main():
                             f"Step: {step_num} | Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
                             f"({stats['discovery_rate']*100:.0f}%) | Conn: {env.connected_survivors} | {sat_text}"
                         )
-                    hud_xy = (
-                        [-env.size_x / 2 + 5, -env.size_y / 2 + 5, 25.0]
-                        if args.task == "search"
-                        else [-args.env_size / 2 + 5, -args.env_size / 2 + 5, 25.0]
-                    )
                     p.addUserDebugText(
                         hud_line,
-                        hud_xy,
+                        [-args.env_size / 2 + 5, -args.env_size / 2 + 5, 25.0],
                         textColorRGB=[1.0, 1.0, 1.0],
                         textSize=1.2,
                         physicsClientId=env.client,
                     )
-
-                # Check episode completion
-                if all(terms.values()) or all(truncs.values()):
-                    print(
-                        f"[EPISODE END] Discovered: {stats['discovered_survivors']}/{stats['total_survivors']}"
-                    )
-                    obs_dict, info_dict = env.reset()
-                    step_num = 0
 
             # Cap frame rate
             elapsed = time.time() - loop_start
