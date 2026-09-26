@@ -32,7 +32,15 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from envs.disaster_env import DisasterMeshEnv
 from envs.search_env import SurvivorSearchEnv
+from visualize_rubble import (
+    _SPEC_MOVE_SPEED,
+    enter_spectator_fly,
+    update_spectator_camera,
+)
 from visualize_town import camera_basis_from_yaw_pitch
+
+# Search fly is 1/3 of the shared rubble spectator base (18.0 m/poll).
+_SEARCH_FLY_MOVE_SPEED = _SPEC_MOVE_SPEED / 3.0
 
 try:
     from models.actor_critic import MAPPOModel
@@ -87,8 +95,17 @@ def apply_orbit_camera(client, yaw, pitch, dist, target):
     )
 
 
+def _disable_pybullet_hotkeys(client):
+    if client is None:
+        return
+    p.configureDebugVisualizer(
+        p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=client
+    )
+    p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0, physicsClientId=client)
+
+
 class SearchCamera:
-    """Keyboard camera: arrows pan the map, 1-9 follow a drone, 0 overview."""
+    """Keyboard camera: arrows pan, 1-9 follow a drone, 0 overview, F fly."""
 
     def __init__(self, client, num_drones, env_size):
         self.client = client
@@ -101,15 +118,30 @@ class SearchCamera:
         self._applied_pitch = None
         self._applied_dist = None
         self._applied_target = None
+        self.fly = False
+        self.fly_eye = None
         self.reset_overview()
 
     def reset_overview(self):
+        self.fly = False
+        self.fly_eye = None
         self.yaw = self.home_yaw
         self.pitch = self.home_pitch
         self.dist = self.home_dist
         self.target = self.home_target.copy()
         self.follow = None
         self._apply_camera_if_changed()
+
+    def enter_fly(self):
+        self.follow = None
+        self.yaw, self.pitch, self.dist, self.fly_eye = enter_spectator_fly(
+            self.client, self.yaw, self.pitch, self.dist, self.target
+        )
+        self.fly = True
+
+    def leave_fly(self):
+        self.fly = False
+        self.fly_eye = None
 
     def _apply_camera_if_changed(self):
         last = self._applied_target
@@ -145,11 +177,29 @@ class SearchCamera:
         self.target[2] = float(np.clip(self.target[2], 0.0, 40.0))
 
     def handle(self, keys, drone_positions, env=None):
+        if _key_hit(keys, ord("f")) or _key_hit(keys, ord("F")):
+            if self.fly:
+                self.reset_overview()
+                print("[CAM] Fly mode OFF")
+            else:
+                self.enter_fly()
+                print("[CAM] Fly mode ON")
+            return self.follow
+
         if _key_hit(keys, ord("0")):
+            was_fly = self.fly
             self.reset_overview()
+            if was_fly:
+                print("[CAM] Fly mode OFF")
             print("[CAM] Overview")
             return self.follow
+
+        left_fly = False
         if _key_hit(keys, 9):
+            if self.fly:
+                self.leave_fly()
+                left_fly = True
+                print("[CAM] Fly mode OFF")
             if self.follow is None:
                 self.follow = 0
             else:
@@ -157,10 +207,19 @@ class SearchCamera:
             print(f"[CAM] Follow D{self.follow}")
         for i in range(min(9, self.num_drones)):
             if _key_hit(keys, ord(str(i + 1))):
+                if self.fly:
+                    self.leave_fly()
+                    left_fly = True
+                    print("[CAM] Fly mode OFF")
+                    if self.dist < 8.0:
+                        self.dist = 20.0
                 self.follow = i
                 self.dist = min(self.dist, 28.0)
                 self.pitch = min(self.pitch, -24.0)
                 print(f"[CAM] Follow D{i}")
+
+        if self.fly:
+            return self.follow
 
         if _key_down(keys, ord("[")) or _key_down(keys, ord("-")):
             self.dist = min(220.0, self.dist * 1.04)
@@ -169,17 +228,18 @@ class SearchCamera:
 
         step = 1.2 + 0.04 * self.dist
         dx = dy = 0.0
-        if _key_down(keys, p.B3G_UP_ARROW):
-            dy += step
-        if _key_down(keys, p.B3G_DOWN_ARROW):
-            dy -= step
-        if _key_down(keys, p.B3G_LEFT_ARROW):
-            dx -= step
-        if _key_down(keys, p.B3G_RIGHT_ARROW):
-            dx += step
-        if dx or dy:
-            self.follow = None
-            self._pan(dx * 12.0, dy * 12.0, 1.0)
+        if not left_fly:
+            if _key_down(keys, p.B3G_UP_ARROW):
+                dy += step
+            if _key_down(keys, p.B3G_DOWN_ARROW):
+                dy -= step
+            if _key_down(keys, p.B3G_LEFT_ARROW):
+                dx -= step
+            if _key_down(keys, p.B3G_RIGHT_ARROW):
+                dx += step
+            if dx or dy:
+                self.follow = None
+                self._pan(dx * 12.0, dy * 12.0, 1.0)
 
         if self.follow is not None and drone_positions is not None:
             idx = int(np.clip(self.follow, 0, len(drone_positions) - 1))
@@ -479,9 +539,10 @@ def main():
     print("=" * 65)
     print(f" [3D VISUALIZER] task={args.task}")
     if args.task == "search":
-        print(" Search: 240 m rubble city, 5 m AGL, capsule survivors, MAPPO XY")
-        print(" Camera: starts top-down | arrows pan | 1/2/3 follow a drone | 0 overview")
+        print(" Search: 240 m rubble city, 5 m AGL, character meshes, MAPPO XY")
+        print(" Camera: starts top-down | arrows pan | 1/2/3 follow a drone | 0 overview | F fly")
         print("         [ ] zoom | Space pause | R reset | Q quit")
+        print(" Click the 3D view first or keys do nothing.")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")
     print("=" * 65)
 
@@ -557,6 +618,7 @@ def main():
     obs_dict, info_dict = env.reset(seed=args.seed)
     agent_names = env.possible_agents
     last_infos = info_dict
+    _disable_pybullet_hotkeys(env.client)
 
     dt_target = 1.0 / args.fps
     paused = False
@@ -582,15 +644,15 @@ def main():
             if ord("q") in keys or ord("Q") in keys or 27 in keys:  # 27 = ESC
                 print("[EXIT] User requested exit.")
                 break
-            if ord(" ") in keys and (keys[ord(" ")] & p.KEY_WAS_TRIGGERED):
-                paused = not paused
-                print(f"[{'PAUSED' if paused else 'RESUMED'}]")
             if ord("r") in keys and (keys[ord("r")] & p.KEY_WAS_TRIGGERED):
+                if cam.fly:
+                    print("[CAM] Fly mode OFF")
                 print("[RESET] Resetting environment...")
                 obs_dict, info_dict = env.reset()
                 last_infos = info_dict
                 step_num = 0
                 prev_alive[:] = True
+                _disable_pybullet_hotkeys(env.client)
                 cam = SearchCamera(env.client, args.num_drones, args.env_size)
                 if args.task == "search":
                     search_labels = SearchDroneLabels(env.client, args.num_drones)
@@ -601,6 +663,23 @@ def main():
                 continue
 
             cam.handle(keys, env.drone_positions, env)
+            if (
+                not cam.fly
+                and ord(" ") in keys
+                and (keys[ord(" ")] & p.KEY_WAS_TRIGGERED)
+            ):
+                paused = not paused
+                print(f"[{'PAUSED' if paused else 'RESUMED'}]")
+            if cam.fly:
+                cam.yaw, cam.pitch, cam.dist, cam.fly_eye = update_spectator_camera(
+                    env.client,
+                    keys,
+                    cam.yaw,
+                    cam.pitch,
+                    cam.dist,
+                    cam.fly_eye,
+                    move_speed=_SEARCH_FLY_MOVE_SPEED,
+                )
 
             if not paused:
                 # One physics/policy step per displayed frame. HUD below is ~2 Hz.
@@ -672,7 +751,7 @@ def main():
                         for i in range(args.num_drones):
                             if prev_alive[i] and not env.drone_alive[i]:
                                 print(f"[CRASH] D{i} hit rubble and is dead. Reward {rews[agent_names[i]]:.1f}")
-                                wreck = [1.0, 0.05, 0.05, 1.0]
+                                wreck = [0.45, 0.06, 0.06, 1.0]
                                 n_links = p.getNumJoints(env.drone_ids[i], physicsClientId=env.client)
                                 for link in range(-1, n_links):
                                     p.changeVisualShape(

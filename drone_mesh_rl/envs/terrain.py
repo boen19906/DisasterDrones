@@ -348,6 +348,10 @@ class Terrain:
         rim_tall_prob=0.15,
         # Per-axis cap; diagonal gradients land near 0.4
         rim_max_slope=0.34,
+        # Search pad: fade pavement→grass and a LOW berm on the outer band.
+        # Not the mountain rim (leave rim_width=0 for that).
+        edge_grass_width=0.0,
+        edge_rise_amp=0.0,
     ):
         self.size_x = float(size_x)
         self.size_y = float(size_y)
@@ -391,6 +395,8 @@ class Terrain:
         self.rim_tall_amp = tuple(float(v) for v in rim_tall_amp)
         self.rim_tall_prob = float(rim_tall_prob)
         self.rim_max_slope = float(rim_max_slope)
+        self.edge_grass_width = float(edge_grass_width)
+        self.edge_rise_amp = float(edge_rise_amp)
         self.grid_x = int(round(self.size_x / self.resolution))
         self.grid_y = int(round(self.size_y / self.resolution))
         self.resolution_x = self.resolution
@@ -896,6 +902,15 @@ class Terrain:
         # --- Soft seam: distance-to-nearest-downtown + smoothstep ---
         t = _smoothstep(0.0, self.blend_width, dist)
         Z = (1.0 - t) * city + t * grass
+        # Low uneven berm on the outer band (search pad). Not a mountain rim.
+        fade_w = float(getattr(self, "edge_grass_width", 0.0) or 0.0)
+        rise_amp = float(getattr(self, "edge_rise_amp", 0.0) or 0.0)
+        if fade_w > 1e-6 and rise_amp > 1e-6:
+            hx, hy = self.size_x / 2.0, self.size_y / 2.0
+            edge_d = np.minimum(hx - np.abs(X), hy - np.abs(Y))
+            w = 1.0 - _smoothstep(0.0, fade_w, edge_d)
+            n = 0.55 + 0.45 * (0.5 * (self._blurred_field(rng, 22.0, amp=1.0) + 1.0))
+            Z = Z + w * n * rise_amp
         # Shift up so the map stays non-negative without flattening the low side
         # of a long gentle grade (np.maximum(., 0) would zero half a km-scale map).
         Z = Z - float(np.min(Z))
@@ -983,6 +998,12 @@ class Terrain:
         dust_rgb = dust_rgb * (1.0 + 0.04 * light[:, :, None])
 
         rgb = (1.0 - t)[:, :, None] * dust_rgb + t[:, :, None] * grass_rgb
+        fade_w = float(getattr(self, "edge_grass_width", 0.0) or 0.0)
+        if fade_w > 1e-6:
+            hx, hy = self.size_x / 2.0, self.size_y / 2.0
+            edge_d = np.minimum(hx - np.abs(X), hy - np.abs(Y))
+            w = 1.0 - _smoothstep(0.0, fade_w, edge_d)
+            rgb = (1.0 - w)[:, :, None] * rgb + w[:, :, None] * grass_rgb
         rgb = np.clip(rgb, 0.0, 1.0)
         rgb_u8 = (rgb * 255.0 + 0.5).astype(np.uint8)
 
