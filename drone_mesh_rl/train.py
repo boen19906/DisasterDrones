@@ -230,6 +230,10 @@ def main():
         bc_path = os.path.splitext(args.save_path)[0] + "_bc.pt"
         model.save(bc_path)
         print(f"[BC] saved clone to {bc_path}")
+        if args.total_timesteps <= 0:
+            model.save(args.save_path)
+            print(f"[BC] weights saved to {args.save_path}")
+            return
     elif args.task == "search" and args.bc_steps > 0:
         behavior_clone_search(
             env, model, optimizer, env.possible_agents, args.device, steps=args.bc_steps

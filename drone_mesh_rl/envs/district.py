@@ -2100,7 +2100,12 @@ class RubbleTownLayout:
         self.walkable_resolution = res
         self.walkable = walkable
         self.street_mask = street
-        rows = [_piece_aabb(piece) for ruin in self.ruins for piece in ruin["pieces"]]
+        rows = []
+        kinds = []
+        for ruin in self.ruins:
+            for piece in ruin["pieces"]:
+                rows.append(_piece_aabb(piece))
+                kinds.append(str(piece.get("kind", "wall")))
         for tower in getattr(self, "towers", []) or []:
             rows.append(
                 (
@@ -2112,8 +2117,15 @@ class RubbleTownLayout:
                     tower["z0"] + tower["height"],
                 )
             )
+            kinds.append("tower")
         self.boxes = (
             np.asarray(rows, dtype=np.float64) if rows else np.zeros((0, 6), dtype=np.float64)
+        )
+        # Debris chunks can be flown through. Walls, slabs, and towers stay solid.
+        self.box_solid = (
+            np.array([k != "chunk" for k in kinds], dtype=bool)
+            if kinds
+            else np.zeros((0,), dtype=bool)
         )
         self.styles = ["concrete"] * len(self.boxes)
         self._ground_applied = True
