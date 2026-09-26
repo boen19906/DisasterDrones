@@ -181,6 +181,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.drone_positions = np.zeros((num_drones, 3))
         self.drone_velocities = np.zeros((num_drones, 3))
         self.drone_alive = np.ones(num_drones, dtype=bool)
+        self.drone_finds = np.zeros(num_drones, dtype=np.int32)
         self.step_count = 0
         self.newly_discovered = 0
         self.new_cells = 0
@@ -1336,6 +1337,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.coverage = np.zeros((self.cover_ny, self.cover_nx), dtype=np.float32)
         self.drone_velocities = np.zeros((self.num_drones, 3))
         self.drone_alive = np.ones(self.num_drones, dtype=bool)
+        self.drone_finds = np.zeros(self.num_drones, dtype=np.int32)
         self.newly_discovered = 0
         self.new_cells = 0
         self.overlap_cells = 0
@@ -1489,7 +1491,9 @@ class SurvivorSearchEnv(ParallelEnv):
         alive_pos = [
             self.drone_positions[i] for i in range(self.num_drones) if self.drone_alive[i]
         ]
+        prev_discovered = np.asarray(self.survivors.discovered, dtype=bool).copy()
         self.newly_discovered, _ = self.survivors.update_discovery(alive_pos, self.terrain)
+        self._credit_drone_finds(prev_discovered)
         self._sync_person_capsules()
 
         rewards = self._compute_rewards(collisions, building_kills, rubble_blocks)
@@ -1500,6 +1504,35 @@ class SurvivorSearchEnv(ParallelEnv):
         truncations = {a: ((all_found and mapped) or maxed or all_dead) for a in self.possible_agents}
         terminations = {a: False for a in self.possible_agents}
         return self._get_observations(), rewards, terminations, truncations, self._infos()
+
+    def _credit_drone_finds(self, prev_discovered):
+        """When a discovered flag flips, credit the closest alive drone in sensor range."""
+        discovered = np.asarray(self.survivors.discovered, dtype=bool)
+        prev = np.asarray(prev_discovered, dtype=bool)
+        if discovered.shape != prev.shape:
+            return
+        new_ids = np.flatnonzero(discovered & ~prev)
+        if new_ids.size == 0:
+            return
+        radius = float(self.sensor_radius)
+        for si in new_ids:
+            surv_xy = self.survivors.positions[int(si)][:2]
+            best_i = -1
+            best_d = radius + 1.0
+            for i in range(self.num_drones):
+                if not self.drone_alive[i]:
+                    continue
+                dist = float(
+                    np.hypot(
+                        self.drone_positions[i][0] - surv_xy[0],
+                        self.drone_positions[i][1] - surv_xy[1],
+                    )
+                )
+                if dist <= radius and dist < best_d:
+                    best_d = dist
+                    best_i = i
+            if best_i >= 0:
+                self.drone_finds[best_i] += 1
 
     def _compute_rewards(self, collisions, building_kills=None, rubble_blocks=None):
         """New cells and new people. Sitting still is costly while work remains."""

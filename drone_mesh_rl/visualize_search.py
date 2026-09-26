@@ -39,6 +39,11 @@ try:
 except ModuleNotFoundError:
     MAPPOModel = None
 
+try:
+    import tkinter as tk
+except ImportError:
+    tk = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="3D Visualizer for Drone Swarm Mesh")
@@ -184,6 +189,204 @@ def _search_drone_tag(index, alive):
     return f"D{index}" if alive else f"D{index} DEAD"
 
 
+class SearchStatusPanel:
+    """Dark tkinter status window beside the PyBullet search view. Created once.
+
+    On macOS, tk.Tk() must run before p.connect(p.GUI). PyBullet's Cocoa
+    backend creates an NSApplication that does not implement macOSVersion,
+    and Tk 8.6 then aborts with NSInvalidArgumentException (uncaught).
+    """
+
+    BG = "#171a1f"
+    FG = "#e8eaed"
+    DIM = "#9aa0a6"
+    CARD = "#22262e"
+    LINE = "#2c313a"
+    OK = "#81c995"
+    DEAD = "#f28b82"
+    TITLE = "#8ab4f8"
+
+    def __init__(self, num_drones):
+        self.num_drones = int(num_drones)
+        # After a prior abort, macOS can modal-block Tk() on "restore windows?"
+        if sys.platform == "darwin" and "-ApplePersistenceIgnoreState" not in sys.argv:
+            sys.argv[1:1] = ["-ApplePersistenceIgnoreState", "YES"]
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title("Search")
+        self.root.configure(bg=self.BG)
+        self.root.resizable(False, False)
+        try:
+            sw = int(self.root.winfo_screenwidth())
+            self.root.geometry(f"320x{self._window_h()}+{max(20, sw - 360)}+70")
+        except tk.TclError:
+            self.root.geometry(f"320x{self._window_h()}+40+70")
+
+        mono = ("TkFixedFont", 11)
+        title_font = ("TkDefaultFont", 13, "bold")
+        label_font = ("TkDefaultFont", 11)
+        small_font = ("TkDefaultFont", 10)
+
+        tk.Label(
+            self.root,
+            text="SEARCH",
+            font=title_font,
+            fg=self.TITLE,
+            bg=self.BG,
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(12, 6))
+
+        mission = tk.Frame(self.root, bg=self.BG)
+        mission.pack(fill="x", padx=10, pady=(0, 8))
+        self.mission = {}
+        for key, caption in (
+            ("found", "People found"),
+            ("left", "People left"),
+            ("total", "Total people"),
+            ("cover", "Map covered"),
+            ("step", "Step"),
+            ("flying", "Drones still flying"),
+        ):
+            row = tk.Frame(mission, bg=self.BG)
+            row.pack(fill="x", pady=1)
+            tk.Label(
+                row,
+                text=caption,
+                font=label_font,
+                fg=self.DIM,
+                bg=self.BG,
+                anchor="w",
+            ).pack(side="left")
+            val = tk.Label(
+                row,
+                text="—",
+                font=mono,
+                fg=self.FG,
+                bg=self.BG,
+                anchor="e",
+            )
+            val.pack(side="right")
+            self.mission[key] = val
+
+        tk.Frame(self.root, bg=self.LINE, height=1).pack(fill="x", padx=12, pady=(2, 8))
+
+        self.drones = []
+        for i in range(self.num_drones):
+            card = tk.Frame(self.root, bg=self.CARD)
+            card.pack(fill="x", padx=10, pady=3)
+            top = tk.Frame(card, bg=self.CARD)
+            top.pack(fill="x", padx=8, pady=(6, 0))
+            name = tk.Label(
+                top,
+                text=f"D{i}",
+                font=("TkDefaultFont", 12, "bold"),
+                fg=self.FG,
+                bg=self.CARD,
+                anchor="w",
+            )
+            name.pack(side="left")
+            status = tk.Label(
+                top,
+                text="Flying",
+                font=label_font,
+                fg=self.OK,
+                bg=self.CARD,
+                anchor="e",
+            )
+            status.pack(side="right")
+            pos = tk.Label(
+                card,
+                text="x 0.0  y 0.0  h 0.0",
+                font=mono,
+                fg=self.FG,
+                bg=self.CARD,
+                anchor="w",
+            )
+            pos.pack(fill="x", padx=8, pady=(2, 0))
+            extra = tk.Label(
+                card,
+                text="0.0 m/s    found 0",
+                font=small_font,
+                fg=self.DIM,
+                bg=self.CARD,
+                anchor="w",
+            )
+            extra.pack(fill="x", padx=8, pady=(0, 6))
+            self.drones.append(
+                {"name": name, "status": status, "pos": pos, "extra": extra}
+            )
+
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def show(self):
+        if self.root is None:
+            return
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.pump()
+        except tk.TclError:
+            self.root = None
+
+    def _window_h(self):
+        return 250 + 78 * max(1, self.num_drones)
+
+    def refresh(self, env):
+        if self.root is None:
+            return
+        stats = env.survivors.get_discovery_stats()
+        info = env._infos()[env.possible_agents[0]]
+        found = int(info.get("discovered_survivors", stats["discovered_survivors"]))
+        total = int(info.get("total_survivors", stats["total_survivors"]))
+        left = max(0, total - found)
+        cover = float(info.get("coverage_frac", 0.0)) * 100.0
+        step = int(info.get("step", getattr(env, "step_count", 0)))
+        flying = int(info.get("alive_drones", int(np.asarray(env.drone_alive).sum())))
+        self.mission["found"].config(text=str(found))
+        self.mission["left"].config(text=str(left))
+        self.mission["total"].config(text=str(total))
+        self.mission["cover"].config(text=f"{cover:.0f}%")
+        self.mission["step"].config(text=str(step))
+        self.mission["flying"].config(text=str(flying))
+
+        finds = np.asarray(getattr(env, "drone_finds", np.zeros(self.num_drones)), dtype=int)
+        for i in range(self.num_drones):
+            alive = bool(env.drone_alive[i])
+            pos = np.asarray(env.drone_positions[i], dtype=float)
+            vel = np.asarray(env.drone_velocities[i], dtype=float)
+            speed = float(np.hypot(vel[0], vel[1]))
+            found_n = int(finds[i]) if i < len(finds) else 0
+            row = self.drones[i]
+            row["name"].config(text=f"D{i}")
+            row["status"].config(
+                text="Flying" if alive else "Dead",
+                fg=self.OK if alive else self.DEAD,
+            )
+            row["pos"].config(
+                text=f"x {pos[0]:.1f}  y {pos[1]:.1f}  h {pos[2]:.1f}"
+            )
+            row["extra"].config(text=f"{speed:.1f} m/s    found {found_n}")
+        self.pump()
+
+    def pump(self):
+        if self.root is None:
+            return
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except tk.TclError:
+            self.root = None
+
+    def close(self):
+        if self.root is None:
+            return
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+        self.root = None
+
+
 class SearchDroneLabels:
     """D0/D1/... text above each search drone, replaced in place (no wipe)."""
 
@@ -228,6 +431,20 @@ def main():
         print("         [ ] zoom | Space pause | R reset | Q quit")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")
     print("=" * 65)
+
+    # Own NSApplication before SurvivorSearchEnv.reset -> p.connect(p.GUI).
+    status_panel = None
+    last_status = 0.0
+    if args.task == "search":
+        if tk is None:
+            print("[WARNING] tkinter unavailable; continuing 3D view.")
+        else:
+            try:
+                status_panel = SearchStatusPanel(args.num_drones)
+                print("[STATUS] Tk root created before PyBullet GUI")
+            except Exception as exc:
+                print(f"[WARNING] tkinter status window failed ({exc}); continuing 3D view.")
+                status_panel = None
 
     if args.task == "search":
         env = SurvivorSearchEnv(
@@ -289,6 +506,11 @@ def main():
     search_labels = (
         SearchDroneLabels(env.client, args.num_drones) if args.task == "search" else None
     )
+    if status_panel is not None:
+        status_panel.show()
+        status_panel.refresh(env)
+        last_status = time.time()
+        print("[STATUS] Search window ready")
 
     try:
         while True:
@@ -310,6 +532,9 @@ def main():
                 cam = SearchCamera(env.client, args.num_drones, args.env_size)
                 if args.task == "search":
                     search_labels = SearchDroneLabels(env.client, args.num_drones)
+                if status_panel is not None:
+                    status_panel.refresh(env)
+                    last_status = time.time()
                 continue
 
             cam.handle(keys, env.drone_positions)
@@ -403,6 +628,9 @@ def main():
                         prev_alive[:] = True
                         if args.task == "search":
                             search_labels = SearchDroneLabels(env.client, args.num_drones)
+                        if status_panel is not None:
+                            status_panel.refresh(env)
+                            last_status = time.time()
                         break
 
                 # Mesh still refreshes its overlay. Search labels are replaced in place above.
@@ -540,6 +768,9 @@ def main():
                     env.drone_alive,
                     follow=cam.follow,
                 )
+            if status_panel is not None and (time.time() - last_status) >= 0.25:
+                status_panel.refresh(env)
+                last_status = time.time()
 
             # Cap frame rate
             elapsed = time.time() - loop_start
@@ -549,6 +780,8 @@ def main():
     except (KeyboardInterrupt, p.error):
         pass
     finally:
+        if status_panel is not None:
+            status_panel.close()
         env.close()
         print("[VISUALIZER] Closed successfully.")
 
