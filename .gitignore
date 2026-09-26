@@ -18,6 +18,7 @@ ENV/
 *.swo
 
 # Project specific
+# Trained weight files only (keep models/*.py source tracked)
 *.pth
 *.pt
 *.h5
@@ -29,7 +30,9 @@ drone_mesh_rl/envs/ground_texture.png
 drone_mesh_rl/envs/terrain.obj
 drone_mesh_rl/envs/terrain.urdf
 
-# Logs
+# Training history and logs
+training_history.json
+training_curve.png
 *.log
 
 # OS generated files

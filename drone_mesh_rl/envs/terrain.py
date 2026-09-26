@@ -304,6 +304,8 @@ class Terrain:
         # (side ≤ 512; 3250/8 → ~406 → ~659 KB).
         resolution=8.0,
         seed=None,
+        flat=False,
+        with_structures=False,
         obstacle_boxes=None,
         city_size=250.0,
         city_centers=None,
@@ -397,6 +399,7 @@ class Terrain:
         self.dem_info = None
         self.z_offset = 0.0
         self._seed = seed
+        self.flat = bool(flat)
         self.obstacle_boxes = (
             np.asarray(obstacle_boxes, dtype=np.float64)
             if obstacle_boxes is not None and len(obstacle_boxes) > 0
@@ -406,7 +409,18 @@ class Terrain:
         self._grass_relief = None
         # Fine relief + belt landforms + rim (above grade) — rock / snow tint
         self._relief = None
-        self.heightmap = self._generate_heightmap(seed)
+        self.structures = []
+        if self.flat:
+            # Search trainer still asks for a flat field. Skip the city relief.
+            self.heightmap = np.zeros((self.grid_y, self.grid_x), dtype=np.float64)
+        else:
+            self.heightmap = self._generate_heightmap(seed)
+        if with_structures:
+            from .structures import generate_earthquake_layout
+
+            self.structures = generate_earthquake_layout(
+                self, seed=seed if seed is not None else 42
+            )
         self._texture_path = None
 
     @classmethod
@@ -425,6 +439,8 @@ class Terrain:
         info = load_dem(path, max_side=max_side, min_cell=min_cell)
         self = cls.__new__(cls)
         self.source = "dem"
+        self.flat = False
+        self.structures = []
         self.dem_info = info
         # Raster row 0 is north; flip so heightmap row 0 is the south (-Y) edge.
         patch = np.ascontiguousarray(np.flipud(info["elevation"]))
