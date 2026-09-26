@@ -2,7 +2,15 @@
 search_env.py — V1 multi-agent search: find as many survivors as possible.
 
 Fog-of-war coverage. A survivor is found when a drone flies over them
-(XY distance <= sensor_radius). No mesh, satellite, battery, or buildings.
+(XY distance <= 5 m). No mesh, satellite, battery, or buildings.
+
+Rewards (shared unless noted):
+  +10.0  each newly found survivor (primary)
+  +50.0  all survivors found
+  +~3.0  one full new 5 m sensor disk of coverage (~1/3.5 of a find)
+  -0.01  per step
+  -0.0004 per already-covered cell still under a sensor (light revisit / overlap)
+  -5.0   drone-drone collision (that drone only)
 """
 
 import functools
@@ -43,7 +51,7 @@ class SurvivorSearchEnv(ParallelEnv):
         drone_max_speed=4.0,
         drone_max_altitude=20.0,
         hover_altitude=8.0,
-        sensor_radius=8.0,
+        sensor_radius=5.0,
         cover_cells=20,
         pyb_freq=30,
         seed=None,
@@ -77,6 +85,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.drone_alive = np.ones(num_drones, dtype=bool)
         self.step_count = 0
         self.newly_discovered = 0
+        self.new_cells = 0
         self.overlap_cells = 0
 
         self.client = None
@@ -253,6 +262,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.drone_velocities = np.zeros((self.num_drones, 3))
         self.drone_alive = np.ones(self.num_drones, dtype=bool)
         self.newly_discovered = 0
+        self.new_cells = 0
         self.overlap_cells = 0
 
         self.terrain = Terrain(
@@ -311,8 +321,7 @@ class SurvivorSearchEnv(ParallelEnv):
                     collisions[i] = True
                     collisions[j] = True
 
-        _, overlap = self._mark_coverage(self.drone_positions)
-        self.overlap_cells = overlap
+        self.new_cells, self.overlap_cells = self._mark_coverage(self.drone_positions)
 
         self.newly_discovered, _ = self.survivors.update_discovery(
             list(self.drone_positions), self.terrain
@@ -330,16 +339,32 @@ class SurvivorSearchEnv(ParallelEnv):
         return self._get_observations(), rewards, terminations, truncations, self._infos()
 
     def _compute_rewards(self, collisions):
+        """People-first search: find survivors, then expand into unpainted ground."""
         stats = self.survivors.get_discovery_stats()
         all_found = stats["discovered_survivors"] == stats["total_survivors"] and stats["total_survivors"] > 0
-        shared = 10.0 * float(self.newly_discovered)
+
+        find_bonus = 10.0
+        # One new 5 m sensor disk ≈ 1/3.5 of a find, so coverage expands after
+        # local ground is cleared without beating the people objective.
+        cell_m = self.env_size / self.cover_cells
+        footprint_cells = max(1.0, np.pi * (self.sensor_radius ** 2) / (cell_m ** 2))
+        cover_per_cell = (find_bonus / 3.5) / footprint_cells
+
+        shared = find_bonus * float(self.newly_discovered)
+        shared += cover_per_cell * float(self.new_cells)
         shared -= 0.01
-        shared -= 0.002 * float(self.overlap_cells)
+        shared -= 0.0004 * float(self.overlap_cells)
         if all_found:
             shared += 50.0
+
         rewards = {}
         for i, agent in enumerate(self.possible_agents):
             rew = shared
+            # Extra nudge: if this drone's local map is fully searched, pay a
+            # little more for any new coverage this step so it leaves the patch.
+            crop = self._coverage_crop(self.drone_positions[i][0], self.drone_positions[i][1])
+            if crop.size > 0 and float(crop.mean()) >= 0.9 and self.new_cells > 0:
+                rew += 0.15 * cover_per_cell * float(self.new_cells)
             if collisions[i]:
                 rew -= 5.0
             rewards[agent] = rew
@@ -381,6 +406,8 @@ class SurvivorSearchEnv(ParallelEnv):
             "total_survivors": stats["total_survivors"],
             "discovery_rate": stats["discovery_rate"],
             "coverage_frac": float(self.coverage.mean()),
+            "new_cells": int(self.new_cells),
+            "overlap_cells": int(self.overlap_cells),
         }
         return {agent: dict(info) for agent in self.possible_agents}
 

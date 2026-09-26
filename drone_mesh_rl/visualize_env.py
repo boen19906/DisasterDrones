@@ -32,7 +32,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from envs.disaster_env import DisasterMeshEnv
 from envs.search_env import SurvivorSearchEnv
-from models.actor_critic import MAPPOModel
+
+try:
+    from models.actor_critic import MAPPOModel
+except ModuleNotFoundError:
+    MAPPOModel = None
 
 
 def parse_args():
@@ -77,15 +81,18 @@ def main():
 
     model = None
     if args.model_path and os.path.exists(args.model_path):
-        print(f"[MODEL] Loading policy checkpoint from {args.model_path}...")
-        model = MAPPOModel(num_drones=args.num_drones, obs_dim=obs_dim, act_dim=act_dim)
-        try:
-            model.load(args.model_path, map_location="cpu")
-            model.eval()
-            print("[MODEL] Model loaded successfully!")
-        except Exception as e:
-            print(f"[WARNING] Failed to load model ({e}), using heuristic policy.")
-            model = None
+        if MAPPOModel is None:
+            print("[WARNING] models/actor_critic.py is missing; using heuristic policy.")
+        else:
+            print(f"[MODEL] Loading policy checkpoint from {args.model_path}...")
+            model = MAPPOModel(num_drones=args.num_drones, obs_dim=obs_dim, act_dim=act_dim)
+            try:
+                model.load(args.model_path, map_location="cpu")
+                model.eval()
+                print("[MODEL] Model loaded successfully!")
+            except Exception as e:
+                print(f"[WARNING] Failed to load model ({e}), using heuristic policy.")
+                model = None
 
     obs_dict, info_dict = env.reset(seed=args.seed)
     agent_names = env.possible_agents
