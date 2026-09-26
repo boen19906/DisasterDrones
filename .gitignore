@@ -17,9 +17,7 @@ ENV/
 *.swo
 
 # Project specific
-# Models generated during training
-models/
-*/models/
+# Checkpoint weights only — keep Python source under */models/ trackable
 *.pth
 *.pt
 *.h5
