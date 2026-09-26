@@ -229,6 +229,7 @@ def main():
     paused = False
     step_num = 0
     cam = SearchCamera(env.client, args.num_drones, args.env_size)
+    prev_alive = np.ones(args.num_drones, dtype=bool)
 
     try:
         while True:
@@ -246,6 +247,7 @@ def main():
                 print("[RESET] Resetting environment...")
                 obs_dict, info_dict = env.reset()
                 step_num = 0
+                prev_alive[:] = True
                 cam = SearchCamera(env.client, args.num_drones, args.env_size)
                 continue
 
@@ -270,7 +272,12 @@ def main():
                         with torch.no_grad():
                             obs_t = torch.tensor(obs_array, dtype=torch.float32)
                             state_t = torch.tensor(state, dtype=torch.float32)
-                            actions_t, _, _, _ = model.get_action_and_value(obs_t, state_t, deterministic=True)
+                            action_mask = None
+                            if getattr(env, "discrete_actions", False) and hasattr(env, "action_mask"):
+                                action_mask = torch.tensor(env.action_mask(), dtype=torch.float32)
+                            actions_t, _, _, _ = model.get_action_and_value(
+                                obs_t, state_t, deterministic=True, action_mask=action_mask
+                            )
                         actions_np = actions_t.cpu().numpy()
                         actions = {
                             agent_names[i]: actions_np[i]
@@ -310,6 +317,20 @@ def main():
                                 actions[agent] = np.array([vx, vy, vz, role_toggle, 0.0], dtype=np.float32)
 
                     obs_dict, rews, terms, truncs, infos = env.step(actions)
+                    if args.task == "search":
+                        for i in range(args.num_drones):
+                            if prev_alive[i] and not env.drone_alive[i]:
+                                print(f"[CRASH] D{i} hit rubble and is dead. Reward {rews[agent_names[i]]:.1f}")
+                                wreck = [1.0, 0.05, 0.05, 1.0]
+                                n_links = p.getNumJoints(env.drone_ids[i], physicsClientId=env.client)
+                                for link in range(-1, n_links):
+                                    p.changeVisualShape(
+                                        env.drone_ids[i],
+                                        link,
+                                        rgbaColor=wreck,
+                                        physicsClientId=env.client,
+                                    )
+                            prev_alive[i] = bool(env.drone_alive[i])
                     if all(terms.values()) or all(truncs.values()):
                         stats = env.survivors.get_discovery_stats()
                         print(
@@ -317,10 +338,11 @@ def main():
                         )
                         obs_dict, info_dict = env.reset()
                         step_num = 0
+                        prev_alive[:] = True
                         break
 
-                # Update debug visuals at a smooth 10 Hz rate instead of 60 Hz to avoid strobe flickering
-                if step_num % 3 == 0:
+                # Debug text is expensive in the GUI. Refresh it a few times a second.
+                if step_num % 15 == 0:
                     p.removeAllUserDebugItems(physicsClientId=env.client)
 
                     alive_indices = [i for i in range(args.num_drones) if env.drone_alive[i]]
@@ -357,11 +379,19 @@ def main():
                         pos = env.drone_positions[i]
                         if args.task == "search":
                             if not env.drone_alive[i]:
-                                color = [0.35, 0.35, 0.35, 1.0]
-                                tag = f"D{i} [DEAD]"
+                                color = [1.0, 0.05, 0.05, 1.0]
+                                tag = f"D{i} DEAD"
                             else:
                                 color = [0.2, 0.5, 1.0, 1.0]
                                 tag = f"D{i}"
+                            n_links = p.getNumJoints(env.drone_ids[i], physicsClientId=env.client)
+                            for link in range(-1, n_links):
+                                p.changeVisualShape(
+                                    env.drone_ids[i],
+                                    link,
+                                    rgbaColor=color,
+                                    physicsClientId=env.client,
+                                )
                         else:
                             batt = env.battery_levels[i]
                             is_gw = bool(env.gateway_roles[i])
@@ -384,20 +414,7 @@ def main():
                             physicsClientId=env.client,
                         )
 
-                    if args.task == "search":
-                        surv_pos = env.survivors.get_positions()
-                        for s_idx in range(env.survivors.num_survivors):
-                            is_disc = bool(env.survivors.discovered[s_idx])
-                            marker = "[*]" if is_disc else "?"
-                            color = [0.0, 1.0, 0.2] if is_disc else [1.0, 0.35, 0.25]
-                            p.addUserDebugText(
-                                marker,
-                                [surv_pos[s_idx][0], surv_pos[s_idx][1], surv_pos[s_idx][2] + 2.2],
-                                textColorRGB=color,
-                                textSize=1.35,
-                                physicsClientId=env.client,
-                            )
-                    elif args.task != "search":
+                    if args.task != "search":
                         surv_pos = env.survivors.get_positions()
                         for s_idx in range(env.survivors.num_survivors):
                             is_disc = bool(env.survivors.discovered[s_idx])
@@ -427,10 +444,12 @@ def main():
                     stats = env.survivors.get_discovery_stats()
                     if args.task == "search":
                         cover = float(infos[env.possible_agents[0]].get("coverage_frac", 0.0))
+                        alive_n = int(env.drone_alive.sum())
                         cam_txt = f"FOLLOW D{cam.follow}" if cam.follow is not None else "FREE CAM"
                         hud_line = (
-                            f"SEARCH | {cam_txt} | Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
-                            f"| Cover: {cover*100:.0f}% | arrows pan  1-3 follow  0 overview"
+                            f"SEARCH | {cam_txt} | Alive: {alive_n}/{args.num_drones} | "
+                            f"Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
+                            f"| Cover: {cover*100:.0f}%"
                         )
                         hud_pos = cam.target + np.array([0.0, 0.0, 10.0])
                     else:

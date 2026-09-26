@@ -7,13 +7,15 @@ import torch
 
 
 class MultiAgentRolloutBuffer:
-    def __init__(self, buffer_size, num_agents, obs_dim, act_dim, state_dim, device="cpu"):
+    def __init__(self, buffer_size, num_agents, obs_dim, act_dim, state_dim, device="cpu", action_mask_dim=0, store_teacher=False):
         self.buffer_size = buffer_size
         self.num_agents = num_agents
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.state_dim = state_dim
         self.device = device
+        self.action_mask_dim = int(action_mask_dim)
+        self.store_teacher = bool(store_teacher)
         self.ptr = 0
         self._alloc()
 
@@ -28,11 +30,15 @@ class MultiAgentRolloutBuffer:
         self.dones = np.zeros((t, n), dtype=np.float32)
         self.advantages = np.zeros((t, n), dtype=np.float32)
         self.returns = np.zeros((t, n), dtype=np.float32)
+        if self.action_mask_dim > 0:
+            self.action_masks = np.ones((t, n, self.action_mask_dim), dtype=np.float32)
+        if self.store_teacher:
+            self.teacher_actions = np.zeros((t, n, 1), dtype=np.float32)
 
     def reset(self):
         self.ptr = 0
 
-    def insert(self, obs, global_state, actions, log_probs, rewards, values, dones):
+    def insert(self, obs, global_state, actions, log_probs, rewards, values, dones, action_masks=None, teacher_actions=None):
         idx = min(self.ptr, self.buffer_size - 1)
         self.obs[idx] = obs
         self.global_state[idx] = global_state
@@ -41,6 +47,10 @@ class MultiAgentRolloutBuffer:
         self.rewards[idx] = rewards
         self.values[idx] = values
         self.dones[idx] = dones
+        if self.action_mask_dim > 0 and action_masks is not None:
+            self.action_masks[idx] = action_masks
+        if self.store_teacher and teacher_actions is not None:
+            self.teacher_actions[idx] = np.asarray(teacher_actions, dtype=np.float32).reshape(self.num_agents, 1)
         self.ptr = min(self.ptr + 1, self.buffer_size)
 
     def compute_gae(self, next_values, next_done, gamma=0.99, gae_lambda=0.95):
@@ -70,6 +80,12 @@ class MultiAgentRolloutBuffer:
         advantages = self.advantages[:t].reshape(total)
         returns = self.returns[:t].reshape(total)
         values = self.values[:t].reshape(total)
+        masks = None
+        if self.action_mask_dim > 0:
+            masks = self.action_masks[:t].reshape(total, self.action_mask_dim)
+        teacher = None
+        if self.store_teacher:
+            teacher = self.teacher_actions[:t].reshape(total, 1)
 
         adv_std = advantages.std()
         if adv_std > 1e-8:
@@ -78,7 +94,7 @@ class MultiAgentRolloutBuffer:
         indices = np.random.permutation(total)
         for start in range(0, total, batch_size):
             mb = indices[start : start + batch_size]
-            yield {
+            batch = {
                 "obs": torch.as_tensor(obs[mb], device=self.device, dtype=torch.float32),
                 "state": torch.as_tensor(state[mb], device=self.device, dtype=torch.float32),
                 "actions": torch.as_tensor(actions[mb], device=self.device, dtype=torch.float32),
@@ -87,3 +103,8 @@ class MultiAgentRolloutBuffer:
                 "returns": torch.as_tensor(returns[mb], device=self.device, dtype=torch.float32),
                 "values": torch.as_tensor(values[mb], device=self.device, dtype=torch.float32),
             }
+            if masks is not None:
+                batch["action_mask"] = torch.as_tensor(masks[mb], device=self.device, dtype=torch.float32)
+            if teacher is not None:
+                batch["teacher_actions"] = torch.as_tensor(teacher[mb], device=self.device, dtype=torch.float32)
+            yield batch

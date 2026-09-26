@@ -55,12 +55,18 @@ class MAPPOModel(nn.Module):
             state = state.unsqueeze(0)
         return self.critic(state).squeeze(-1)
 
-    def get_action_and_value(self, obs, state, action=None, deterministic=False):
+    def get_action_and_value(self, obs, state, action=None, deterministic=False, action_mask=None):
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
 
         if self.discrete:
             logits = self.actor(obs)
+            if action_mask is not None:
+                mask = action_mask.bool()
+                if mask.dim() == 1:
+                    mask = mask.unsqueeze(0)
+                # A heading into rubble is not a choice. Stay stays available.
+                logits = logits.masked_fill(~mask, -1e8)
             dist = Categorical(logits=logits)
             if action is None:
                 action_idx = torch.argmax(logits, dim=-1) if deterministic else dist.sample()

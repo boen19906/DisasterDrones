@@ -50,7 +50,8 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Continue from save_path instead of random weights")
     parser.add_argument("--save_freq", type=int, default=10, help="Save frequency in iterations")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--bc_steps", type=int, default=0, help="Search only: imitate the lawnmower for N steps before PPO. 0 = MAPPO only.")
+    parser.add_argument("--bc_steps", type=int, default=0, help="Search only: imitate the coverage heading for N steps before PPO. 0 = 6000 on discrete search.")
+    parser.add_argument("--bc_coef", type=float, default=0.1, help="Search only: keep imitating the unpainted-cell heading during PPO.")
     return parser.parse_args()
 
 
@@ -97,6 +98,43 @@ def behavior_clone_search(env, model, optimizer, agent_names, device, steps=1200
     print(f"[BC] done mse={last_loss:.4f}")
 
 
+def behavior_clone_headings(env, model, optimizer, agent_names, device, steps=6000):
+    """Copy the heading toward unpainted ground. People stay hidden. Walls stay masked."""
+    print(f"[BC] Cloning unpainted-cell headings for {steps} steps...")
+    obs_dict, _ = search_reset(env, 0, 0)
+    last_loss = 0.0
+    info = None
+    for t in range(steps):
+        obs = flatten_obs(obs_dict, agent_names)
+        mask = env.action_mask()
+        teacher = env.planner_actions(mask)
+        state = critic_state(env, obs)
+        _, logp, _, _ = model.get_action_and_value(
+            torch.as_tensor(obs, device=device, dtype=torch.float32),
+            torch.as_tensor(state, device=device, dtype=torch.float32),
+            action=torch.as_tensor(teacher, device=device, dtype=torch.float32),
+            action_mask=torch.as_tensor(mask, device=device, dtype=torch.float32),
+        )
+        loss = -logp.mean()
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        last_loss = float(loss.item())
+        expert = {agent_names[i]: np.array([teacher[i]], dtype=np.float32) for i in range(len(agent_names))}
+        obs_dict, _, terms, truncs, infos = env.step(expert)
+        info = infos[agent_names[0]]
+        if any(terms.values()) or any(truncs.values()):
+            obs_dict, _ = search_reset(env, 0, t + 1)
+        if (t + 1) % 1000 == 0 and info is not None:
+            print(
+                f"  [BC] step {t+1}/{steps} ce={last_loss:.3f} "
+                f"found={info['discovered_survivors']}/{info['total_survivors']} "
+                f"cover={info['coverage_frac']*100:.1f}%"
+            )
+    print(f"[BC] done ce={last_loss:.3f}")
+
+
 def eval_search(env, model, agent_names, device, episodes=5, base_seed=9000):
     """Deterministic finds/coverage on fresh map sizes."""
     found_rates, covers = [], []
@@ -110,6 +148,7 @@ def eval_search(env, model, agent_names, device, episodes=5, base_seed=9000):
                     torch.as_tensor(obs, device=device, dtype=torch.float32),
                     torch.as_tensor(critic_state(env, obs), device=device, dtype=torch.float32),
                     deterministic=True,
+                    action_mask=torch.as_tensor(env.action_mask(), device=device, dtype=torch.float32),
                 )
             actions_np = actions_t.cpu().numpy()
             act_dict = {agent_names[i]: actions_np[i] for i in range(len(agent_names))}
@@ -182,10 +221,16 @@ def main():
         print(f"[RESUME] No checkpoint at {args.save_path}, starting random.")
     optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
+    if args.task == "search" and discrete and args.bc_steps <= 0:
+        args.bc_steps = 6000
     if args.task == "search" and args.bc_steps > 0 and discrete:
-        print("[MAPPO] discrete search skips the lawnmower clone")
-        args.bc_steps = 0
-    if args.task == "search" and args.bc_steps > 0:
+        behavior_clone_headings(
+            env, model, optimizer, env.possible_agents, args.device, steps=args.bc_steps
+        )
+        bc_path = os.path.splitext(args.save_path)[0] + "_bc.pt"
+        model.save(bc_path)
+        print(f"[BC] saved clone to {bc_path}")
+    elif args.task == "search" and args.bc_steps > 0:
         behavior_clone_search(
             env, model, optimizer, env.possible_agents, args.device, steps=args.bc_steps
         )
@@ -203,6 +248,8 @@ def main():
         act_dim=stored_act_dim,
         state_dim=state_dim,
         device=args.device,
+        action_mask_dim=(env.n_actions if discrete else 0),
+        store_teacher=discrete,
     )
 
     obs_dict, info_dict = (
@@ -240,7 +287,15 @@ def main():
             with torch.no_grad():
                 obs_t = torch.tensor(obs_array, device=args.device, dtype=torch.float32)
                 state_t = torch.tensor(global_state, device=args.device, dtype=torch.float32)
-                actions_t, log_probs_t, _, _ = model.get_action_and_value(obs_t, state_t)
+                action_mask = None
+                teacher_np = None
+                if discrete:
+                    mask_np = env.action_mask()
+                    teacher_np = env.planner_actions(mask_np)
+                    action_mask = torch.as_tensor(mask_np, device=args.device, dtype=torch.float32)
+                actions_t, log_probs_t, _, _ = model.get_action_and_value(
+                    obs_t, state_t, action_mask=action_mask
+                )
                 values_t = model.get_value(state_t).repeat(args.num_drones)
 
             actions_np = actions_t.cpu().numpy()
@@ -253,7 +308,7 @@ def main():
 
             rews_array = np.clip(
                 np.array([rew_dict[a] for a in agent_names], dtype=np.float32),
-                -40.0,
+                -80.0,
                 80.0,
             )
             dones_array = np.array([term_dict[a] or trunc_dict[a] for a in agent_names], dtype=np.float32)
@@ -274,6 +329,8 @@ def main():
                 rewards=rews_array,
                 values=values_np,
                 dones=dones_array,
+                action_masks=(None if action_mask is None else action_mask.cpu().numpy()),
+                teacher_actions=teacher_np,
             )
 
             # Check if any agent done (or episode done)
@@ -315,8 +372,17 @@ def main():
                 b_values = batch["values"]
 
                 _, new_log_probs, entropy, new_values = model.get_action_and_value(
-                    b_obs, b_state, action=b_actions
+                    b_obs, b_state, action=b_actions, action_mask=batch.get("action_mask")
                 )
+                bc_loss = torch.zeros((), device=args.device)
+                if args.task == "search" and args.bc_coef > 0.0 and "teacher_actions" in batch:
+                    _, teacher_logp, _, _ = model.get_action_and_value(
+                        b_obs,
+                        b_state,
+                        action=batch["teacher_actions"],
+                        action_mask=batch.get("action_mask"),
+                    )
+                    bc_loss = -teacher_logp.mean()
 
                 log_ratio = new_log_probs - b_log_probs
                 ratio = torch.exp(log_ratio)
@@ -335,7 +401,7 @@ def main():
                 # Entropy loss
                 entropy_loss = entropy.mean()
 
-                loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+                loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss + args.bc_coef * bc_loss
 
                 optimizer.zero_grad()
                 loss.backward()

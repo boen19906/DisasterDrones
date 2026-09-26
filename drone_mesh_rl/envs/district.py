@@ -116,6 +116,12 @@ _BROKEN_ROAD_TEX_NAME = "rubble_town_road.png"
 _BROKEN_ROAD_WIDTH = 6.4
 _BROKEN_ROAD_LIFT = 0.08
 _BROKEN_ROAD_HALF_THICK = 0.045
+_N_STANDING_TOWERS = 3
+_TOWER_RGBS = (
+    [0.42, 0.40, 0.36, 1.0],
+    [0.24, 0.22, 0.20, 1.0],
+    [0.34, 0.32, 0.29, 1.0],
+)
 def _rubble_lots():
     """One shell in every block of the 28 m street grid."""
     lines = _RUBBLE_LINES
@@ -738,6 +744,8 @@ def _build_varied_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, 
     )
 
     n_chunks = int(rng.integers(4, 7))
+    n_tall = int(rng.integers(1, 3))
+    tall_ids = {int(i) for i in rng.choice(n_chunks, size=n_tall, replace=False)}
     catalog = (
         (3.6, 3.1, 1.7),
         (4.4, 3.2, 2.4),
@@ -769,6 +777,11 @@ def _build_varied_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, 
         if not _footprint_clear(crect, buildings, cars, None, [], gap_b=0.0, gap_c=0.15):
             px = 0.55 * px + 0.45 * cx
             py = 0.55 * py + 0.45 * cy
+        # One or two chunks stand above a 5 m hover. The rest stay debris-height.
+        if ci in tall_ids:
+            chunk_hz = 0.5 * float(rng.uniform(6.0, 9.0))
+        else:
+            chunk_hz = 0.5 * full[2]
         pieces.append(
             _ruin_piece(
                 terrain,
@@ -776,7 +789,7 @@ def _build_varied_ruin_shell(terrain, cx, cy, sx, sy, height, open_side, index, 
                 py,
                 chx,
                 chy,
-                0.5 * full[2],
+                chunk_hz,
                 _quat_axis_angle(0.0, 0.0, 1.0, float(rng.uniform(-0.8, 0.8))),
                 list(_RUIN_CHUNK_RGB[ci % len(_RUIN_CHUNK_RGB)]),
                 "chunk",
@@ -1706,46 +1719,165 @@ def _near_roads(px, py, lines, clearance):
     return False
 
 
-def _layout_rubble_shells(terrain, center, size, seed):
-    """One ruin in most blocks. A few lots stay empty, and the bends stay clear."""
-    rng = np.random.default_rng(int(seed) + 41)
+def _road_distance(px, py, lines):
+    best = 1e9
+    for points, _lift in lines:
+        best = min(best, _dist_to_polyline(px, py, points))
+    return best
+
+
+def _block_tower_pad(xs, ys, ix, iy, lines, center, size, rng):
+    """An axis-aligned tower site inside one block, off the road centerlines."""
+    x0, x1 = float(xs[ix]), float(xs[ix + 1])
+    y0, y1 = float(ys[iy]), float(ys[iy + 1])
+    cell_w = x1 - x0
+    cell_h = y1 - y0
+    sx = float(min(rng.uniform(8.0, 12.0), cell_w - 4.0))
+    sy = float(min(rng.uniform(8.0, 11.0), cell_h - 4.0))
+    if sx < 7.0 or sy < 7.0:
+        return None
+    hx, hy = 0.5 * sx, 0.5 * sy
+    lo_x, hi_x = x0 + hx + 1.4, x1 - hx - 1.4
+    lo_y, hi_y = y0 + hy + 1.4, y1 - hy - 1.4
+    if lo_x >= hi_x or lo_y >= hi_y:
+        return None
+    ocx, ocy = float(center[0]), float(center[1])
+    half = 0.5 * float(size)
+    spots = [(0.5 * (x0 + x1), 0.5 * (y0 + y1))]
+    for _ in range(10):
+        spots.append((float(rng.uniform(lo_x, hi_x)), float(rng.uniform(lo_y, hi_y))))
+    best = None
+    best_d = -1.0
+    for px, py in spots:
+        px = float(np.clip(px, ocx - half + hx + 2.0, ocx + half - hx - 2.0))
+        py = float(np.clip(py, ocy - half + hy + 2.0, ocy + half - hy - 2.0))
+        px = float(np.clip(px, lo_x, hi_x))
+        py = float(np.clip(py, lo_y, hi_y))
+        dist = _road_distance(px, py, lines)
+        # Footprint stays off the centerline: center is at least a half-width away.
+        if dist < max(hx, hy) + 0.6:
+            continue
+        if dist > best_d:
+            best_d = dist
+            best = (px, py, dist)
+    if best is None:
+        return None
+    px, py, dist = best
+    return {
+        "ix": int(ix),
+        "iy": int(iy),
+        "px": float(px),
+        "py": float(py),
+        "sx": float(sx),
+        "sy": float(sy),
+        "road_dist": float(dist),
+    }
+
+
+def _choose_tower_pads(center, size, seed, k=_N_STANDING_TOWERS):
+    """Seed-varying blocks that can hold a standing tower off the roads."""
+    rng = np.random.default_rng(int(seed) + 113)
+    xs, ys = _city_block_axes(center, size, seed)
+    lines = _rubble_road_lines(center, size, seed)
+    order = [(ix, iy) for iy in range(len(ys) - 1) for ix in range(len(xs) - 1)]
+    rng.shuffle(order)
+    pads = []
+    for ix, iy in order:
+        local = np.random.default_rng(int(seed) + 17 * int(ix) + 131 * int(iy) + 900)
+        pad = _block_tower_pad(xs, ys, ix, iy, lines, center, size, local)
+        if pad is not None:
+            pads.append(pad)
+    for min_clear in (8.0, 6.0, 4.5, 3.0):
+        chosen = [pad for pad in pads if pad["road_dist"] >= min_clear]
+        if len(chosen) >= k:
+            return chosen[:k]
+    pads.sort(key=lambda pad: -pad["road_dist"])
+    if len(pads) < k:
+        raise RuntimeError(f"only {len(pads)} standing-tower sites, need {k}")
+    return pads[:k]
+
+
+def _build_standing_towers(terrain, pads, seed):
+    """Intact axis-aligned towers, 24–40 m, concrete or charred. Not ruin pieces."""
+    rng = np.random.default_rng(int(seed) + 151)
+    color_order = rng.permutation(len(_TOWER_RGBS))
+    towers = []
+    for i, pad in enumerate(pads):
+        height = float(rng.uniform(24.0, 40.0))
+        px, py = float(pad["px"]), float(pad["py"])
+        hx, hy = 0.5 * float(pad["sx"]), 0.5 * float(pad["sy"])
+        z0 = _sample_heightmap(terrain, px, py)
+        rgba = list(_TOWER_RGBS[int(color_order[i % len(_TOWER_RGBS)])])
+        towers.append(
+            {
+                "cx": px,
+                "cy": py,
+                "sx": float(pad["sx"]),
+                "sy": float(pad["sy"]),
+                "hx": hx,
+                "hy": hy,
+                "hz": 0.5 * height,
+                "height": height,
+                "z0": float(z0),
+                "z": float(z0) + 0.5 * height,
+                "xmin": px - hx,
+                "xmax": px + hx,
+                "ymin": py - hy,
+                "ymax": py + hy,
+                "rgba": rgba,
+                "ix": int(pad["ix"]),
+                "iy": int(pad["iy"]),
+            }
+        )
+    return towers
+
+
+def _layout_rubble_shells(terrain, center, size, seed, skip_blocks=()):
+    """One ruin in most blocks. Tower blocks stay empty, and the bends stay clear."""
+    skip = {(int(ix), int(iy)) for ix, iy in skip_blocks}
     cx, cy = float(center[0]), float(center[1])
     half = 0.5 * float(size)
     xs, ys = _city_block_axes(center, size, seed)
     lines = _rubble_road_lines(center, size, seed)
-    empty = {(1, 2), (3, 0)}
     sides = ("n", "s", "e", "w")
-    ruins = []
-    for iy in range(len(ys) - 1):
-        for ix in range(len(xs) - 1):
-            if (ix, iy) in empty:
-                continue
-            cell_w = float(xs[ix + 1] - xs[ix])
-            cell_h = float(ys[iy + 1] - ys[iy])
-            sx = float(np.clip(0.48 * cell_w, 11.0, 16.5))
-            sy = float(np.clip(0.48 * cell_h, 10.0, 15.5))
-            px = 0.5 * (xs[ix] + xs[ix + 1]) + float(rng.uniform(-2.5, 2.5))
-            py = 0.5 * (ys[iy] + ys[iy + 1]) + float(rng.uniform(-2.5, 2.5))
-            px = float(np.clip(px, cx - half + 0.5 * sx + 2.0, cx + half - 0.5 * sx - 2.0))
-            py = float(np.clip(py, cy - half + 0.5 * sy + 2.0, cy + half - 0.5 * sy - 2.0))
-            if _near_roads(px, py, lines, 8.0):
-                continue
-            ruins.append(
-                _build_ruin_shell(
-                    terrain,
-                    px,
-                    py,
-                    sx,
-                    sy,
-                    float(rng.uniform(12.0, 18.0)),
-                    sides[(ix + 2 * iy) % 4],
-                    len(ruins),
-                    [],
-                    [],
-                    vary=True,
+    best = []
+    for clearance in (8.0, 6.0, 4.0, 2.0, 0.0):
+        rng = np.random.default_rng(int(seed) + 41)
+        ruins = []
+        for iy in range(len(ys) - 1):
+            for ix in range(len(xs) - 1):
+                if (ix, iy) in skip:
+                    continue
+                cell_w = float(xs[ix + 1] - xs[ix])
+                cell_h = float(ys[iy + 1] - ys[iy])
+                sx = float(np.clip(0.48 * cell_w, 11.0, 16.5))
+                sy = float(np.clip(0.48 * cell_h, 10.0, 15.5))
+                px = 0.5 * (xs[ix] + xs[ix + 1]) + float(rng.uniform(-2.5, 2.5))
+                py = 0.5 * (ys[iy] + ys[iy + 1]) + float(rng.uniform(-2.5, 2.5))
+                px = float(np.clip(px, cx - half + 0.5 * sx + 2.0, cx + half - 0.5 * sx - 2.0))
+                py = float(np.clip(py, cy - half + 0.5 * sy + 2.0, cy + half - 0.5 * sy - 2.0))
+                if clearance > 0.0 and _near_roads(px, py, lines, clearance):
+                    continue
+                ruins.append(
+                    _build_ruin_shell(
+                        terrain,
+                        px,
+                        py,
+                        sx,
+                        sy,
+                        float(rng.uniform(12.0, 18.0)),
+                        sides[(ix + 2 * iy) % 4],
+                        len(ruins),
+                        [],
+                        [],
+                        vary=True,
+                    )
                 )
-            )
-    return ruins
+        if len(ruins) > len(best):
+            best = ruins
+        if len(ruins) >= 18:
+            return ruins
+    return best
 
 
 def _print_rubble_town(town):
@@ -1757,6 +1889,11 @@ def _print_rubble_town(town):
         print(
             f"[RUBBLE-TOWN] shell[{i}] x={ruin['cx']:.3f} y={ruin['cy']:.3f} "
             f"height={ruin['height']:.1f}"
+        )
+    for i, tower in enumerate(getattr(town, "towers", []) or []):
+        print(
+            f"[RUBBLE-TOWN] tower[{i}] x={tower['cx']:.3f} y={tower['cy']:.3f} "
+            f"height={tower['height']:.1f}  block=({tower['ix']}, {tower['iy']})"
         )
 
 
@@ -1868,14 +2005,19 @@ class RubbleTownLayout:
                 f"size={self.size:.0f} m"
             )
         self.roads = _layout_broken_streets(terrain, self.center, self.size, self.seed)
-        self.ruins = _layout_rubble_shells(terrain, self.center, self.size, self.seed)
+        tower_pads = _choose_tower_pads(self.center, self.size, self.seed)
+        skip = [(pad["ix"], pad["iy"]) for pad in tower_pads]
+        self.ruins = _layout_rubble_shells(
+            terrain, self.center, self.size, self.seed, skip_blocks=skip
+        )
+        self.towers = _build_standing_towers(terrain, tower_pads, self.seed)
         self.ground_z = _sample_heightmap(terrain, self.center[0], self.center[1])
         self._bind_search_surface()
         _print_rubble_town(self)
         verify_rubble_town(self, district)
 
     def _bind_search_surface(self):
-        """Street mask and ruin AABBs so search can walk roads and crash on shells."""
+        """Streets plus open lots are walkable. The street mask is only the road ribbon."""
         res = 2.0
         ox, oy = float(self.center[0]), float(self.center[1])
         half = 0.5 * self.size
@@ -1907,20 +2049,48 @@ class RubbleTownLayout:
                             cx = ox - half + (jx + 0.5) * res
                             if (cx - x) * (cx - x) + (cy - y) * (cy - y) <= reach2:
                                 street[jy, jx] = True
+        walkable = np.ones((n, n), dtype=bool)
+        xs = ox - half + (np.arange(n) + 0.5) * res
+        ys = oy - half + (np.arange(n) + 0.5) * res
+        xx, yy = np.meshgrid(xs, ys)
         for ruin in self.ruins:
-            for iy in range(n):
-                cy = oy - half + (iy + 0.5) * res
-                if cy < ruin["ymin"] or cy > ruin["ymax"]:
-                    continue
-                for ix in range(n):
-                    cx = ox - half + (ix + 0.5) * res
-                    if ruin["xmin"] <= cx <= ruin["xmax"]:
-                        street[iy, ix] = False
+            walkable &= ~(
+                (xx >= ruin["xmin"])
+                & (xx <= ruin["xmax"])
+                & (yy >= ruin["ymin"])
+                & (yy <= ruin["ymax"])
+            )
+            for piece in ruin["pieces"]:
+                aabb = _piece_aabb(piece)
+                walkable &= ~(
+                    (xx >= aabb[0])
+                    & (xx <= aabb[3])
+                    & (yy >= aabb[1])
+                    & (yy <= aabb[4])
+                )
+        for tower in getattr(self, "towers", []) or []:
+            walkable &= ~(
+                (xx >= tower["xmin"])
+                & (xx <= tower["xmax"])
+                & (yy >= tower["ymin"])
+                & (yy <= tower["ymax"])
+            )
         self.origin = (ox, oy)
         self.walkable_resolution = res
-        self.walkable = street
+        self.walkable = walkable
         self.street_mask = street
         rows = [_piece_aabb(piece) for ruin in self.ruins for piece in ruin["pieces"]]
+        for tower in getattr(self, "towers", []) or []:
+            rows.append(
+                (
+                    tower["xmin"],
+                    tower["ymin"],
+                    tower["z0"],
+                    tower["xmax"],
+                    tower["ymax"],
+                    tower["z0"] + tower["height"],
+                )
+            )
         self.boxes = (
             np.asarray(rows, dtype=np.float64) if rows else np.zeros((0, 6), dtype=np.float64)
         )
@@ -1932,21 +2102,10 @@ class RubbleTownLayout:
         del terrain
         self._ground_applied = True
 
-    def is_walkable(self, x, y):
-        """True on a street that is not inside a ruin footprint."""
-        ox, oy = self.origin
-        half = self.size / 2.0
-        res = self.walkable_resolution
-        gx = int((x - ox + half) / res)
-        gy = int((y - oy + half) / res)
-        if gx < 0 or gy < 0 or gx >= self.walkable.shape[1] or gy >= self.walkable.shape[0]:
-            return False
-        return bool(self.walkable[gy, gx])
-
-    def sample_walkable(self, rng, n=1, prefer_street=True):
-        """Sample n street positions. prefer_street matches TownLayout's signature."""
-        del prefer_street
-        ys, xs = np.where(self.walkable)
+    def _mask_points(self, rng, mask, n):
+        if n <= 0:
+            return np.zeros((0, 2))
+        ys, xs = np.where(mask)
         if len(xs) == 0:
             return np.zeros((n, 2))
         idx = rng.choice(len(xs), size=n, replace=True)
@@ -1959,6 +2118,52 @@ class RubbleTownLayout:
                 ys[idx] * res - half + res * 0.5 + oy,
             ]
         )
+
+    def is_walkable(self, x, y):
+        """True on a street or open lot that is not inside a ruin or tower."""
+        ox, oy = self.origin
+        half = self.size / 2.0
+        res = self.walkable_resolution
+        gx = int((x - ox + half) / res)
+        gy = int((y - oy + half) / res)
+        if gx < 0 or gy < 0 or gx >= self.walkable.shape[1] or gy >= self.walkable.shape[0]:
+            return False
+        return bool(self.walkable[gy, gx])
+
+    def is_street(self, x, y):
+        """True on the road ribbon, including asphalt a ruin or tower covers."""
+        ox, oy = self.origin
+        half = self.size / 2.0
+        res = self.walkable_resolution
+        gx = int((x - ox + half) / res)
+        gy = int((y - oy + half) / res)
+        if gx < 0 or gy < 0 or gx >= self.street_mask.shape[1] or gy >= self.street_mask.shape[0]:
+            return False
+        return bool(self.street_mask[gy, gx])
+
+    def sample_walkable(self, rng, n=1, prefer_street=True):
+        """Sample streets and open lots. prefer_street splits the draw about in half."""
+        n = int(n)
+        street = self.walkable & self.street_mask
+        lots = self.walkable & ~self.street_mask
+        if prefer_street and street.any() and lots.any():
+            n_street = n // 2
+            n_lot = n - n_street
+            if n == 1:
+                n_street = 1 if float(rng.random()) < 0.5 else 0
+                n_lot = 1 - n_street
+            pts = np.vstack(
+                [
+                    self._mask_points(rng, street, n_street),
+                    self._mask_points(rng, lots, n_lot),
+                ]
+            )
+            rng.shuffle(pts)
+            return pts
+        mask = street if prefer_street and street.any() else self.walkable
+        if not mask.any():
+            mask = self.walkable
+        return self._mask_points(rng, mask, n)
 
 
 class DistrictLayout:
@@ -2310,7 +2515,7 @@ def spawn_district_in_pybullet(client, district, window_tex=None, road_tex=None)
 
 
 def spawn_rubble_town_in_pybullet(client, town):
-    """Continuous cracked-asphalt streets plus the ruined shells. No intact buildings."""
+    """Cracked-asphalt streets, ruined shells, and a few standing towers."""
     road_path = _broken_road_texture_path()
     try:
         road_tex = p.loadTexture(road_path, physicsClientId=client)
@@ -2378,11 +2583,29 @@ def spawn_rubble_town_in_pybullet(client, town):
                     physicsClientId=client,
                 )
             )
+    tower_bodies = []
+    for tower in getattr(town, "towers", []) or []:
+        vis = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[tower["hx"], tower["hy"], tower["hz"]],
+            rgbaColor=tower["rgba"],
+            physicsClientId=client,
+        )
+        tower_bodies.append(
+            p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=vis,
+                basePosition=[tower["cx"], tower["cy"], tower["z"]],
+                physicsClientId=client,
+            )
+        )
     print(
         f"[RUBBLE-TOWN] slabs={len(road_bodies)}  ruin_bodies={len(ruin_bodies)}  "
-        f"shells={len(town.ruins)}  tex={os.path.basename(road_path)}"
+        f"shells={len(town.ruins)}  towers={len(tower_bodies)}  "
+        f"tex={os.path.basename(road_path)}"
     )
-    return road_bodies + ruin_bodies
+    return road_bodies + ruin_bodies + tower_bodies
 
 
 def _default_overview_eye(district):
