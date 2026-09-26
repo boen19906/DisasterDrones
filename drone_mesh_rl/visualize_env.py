@@ -2,9 +2,9 @@
 visualize_env.py — Lightweight 3D spectator over real USGS terrain.
 
 Default: loads the single elevation GeoTIFF in drone_mesh_rl/data/ as the
-PyBullet heightfield, tiles that patch 2x2 in memory, then adds one plain
-300 m district of colored boxes (no roads or props). --procedural restores
-the two-downtown metro. Camera-only loop (no drones).
+PyBullet heightfield, tiles that patch 2x2 in memory, then copies the same
+300 m district onto each tile. --procedural restores the two-downtown metro.
+Camera-only loop (no drones).
 
 Usage:
   cd drone_mesh_rl && python3 visualize_env.py
@@ -30,7 +30,8 @@ from envs.terrain import Terrain, find_dem_file, spawn_terrain_in_pybullet
 from envs.district import (
     DistrictLayout,
     frame_district_camera,
-    spawn_district_in_pybullet,
+    matching_tile_centers,
+    spawn_districts_in_pybullet,
 )
 from envs.town import (
     MetroLayout,
@@ -296,7 +297,7 @@ def build_world(client, env_size, seed):
 
 
 def build_dem_world(client, dem_path):
-    """Load the tiled USGS DEM, then one plain district (no metro/roads)."""
+    """Load the tiled USGS DEM, then the original district plus three copies."""
     t0 = time.perf_counter()
     terrain = Terrain.from_dem(dem_path)
     t_load = time.perf_counter() - t0
@@ -305,15 +306,24 @@ def build_dem_world(client, dem_path):
     t_spawn = time.perf_counter() - t0
     t0 = time.perf_counter()
     district = DistrictLayout(terrain)
-    spawn_district_in_pybullet(client, district)
+    centers = matching_tile_centers(terrain, district.center, district.size)
+    districts = [district]
+    for c in centers[1:]:
+        districts.append(district.copy_to(terrain, c))
+    print("[DISTRICT] four tile centers:")
+    for i, c in enumerate(centers):
+        label = "original" if i == 0 else f"copy {i}"
+        print(f"[DISTRICT]   {i} ({c[0]:.3f}, {c[1]:.3f})  {label}")
+    spawn_districts_in_pybullet(client, districts)
     t_district = time.perf_counter() - t0
     counts = district.counts()
     print(
-        f"[DISTRICT] center=({district.center[0]:.1f}, {district.center[1]:.1f})  "
-        f"size={district.size:.0f} m  "
+        f"[DISTRICT] original=({district.center[0]:.1f}, {district.center[1]:.1f})  "
+        f"size={district.size:.0f} m  copies={len(districts) - 1}  "
         f"shops={counts['shop']}  midrises={counts['midrise']}  "
         f"towers={counts['tower']}  total={len(district.buildings)}  "
-        f"place+spawn={t_district:.3f}s"
+        f"roads={len(district.roads)}  trees={len(district.trees)}  "
+        f"cars={len(district.cars)}  place+spawn={t_district:.3f}s"
     )
 
     info = terrain.dem_info
@@ -437,7 +447,7 @@ def main():
     if args.procedural:
         print(" [3D METRO VIEWER] Two-downtown spectator")
     else:
-        print(" [3D TERRAIN VIEWER] USGS elevation + one plain district")
+        print(" [3D TERRAIN VIEWER] USGS elevation + four copied districts")
     if not gui:
         print(" --headless: timing/body-count check (p.DIRECT).")
     else:
