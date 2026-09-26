@@ -3,9 +3,10 @@ search_env.py - Multi-agent search on a rectangular map.
 
 The world is a 240 m rubble city on a 250 m pad: next-best-view coverage
 and a leftover-survivor hunt choose where unfinished work is. The learning
-interface is Boen's. Each drone picks one of 9 headings (8 neighbors or
-stay), reads a shared coarse 8x8 coverage map, and is turned back when a
-heading would pin it on a wall. Drones hold 5 m AGL over the heightfield. The heading in the observation points at
+interface is Boen's. Each drone picks a heading plus climb, level, or
+descend, reads a shared coarse 8x8 coverage map, and is turned back when a
+heading would hit a wall or tower. Rubble chunks can be flown through.
+Search credit is only counted near 5 m AGL. The heading in the observation points at
 that search goal (a high-gain unpainted patch, or a leftover person), not
 at the nearest uncovered cell. Every drone reads the same painted map and
 teammate XY; overlapping headings are turned toward cells that drone owns.
@@ -53,7 +54,9 @@ from .town import TownLayout
 
 COVER_CROP = 7  # local visited-map window (odd)
 GLOBAL_BINS = 8  # coarse coverage map shared by every drone and the critic
-N_ACTIONS = 9
+N_ACTIONS = 27  # 8 headings x (level, climb, descend) + stay, climb, descend
+MIN_AGL = 1.5
+SEARCH_AGL_MAX = 8.0  # paint and find only at or below this height
 MAP_EDGE_MARGIN = 0.75  # fly almost to the pad wall so a 5 m sensor covers the rim
 DRONE_VISUAL_SCALE = 2.5
 CRASH_RANGE = 3.5
@@ -98,6 +101,16 @@ _MOVE_HEADINGS = np.array(
 _HEADING_NORM = np.linalg.norm(_HEADING_XY, axis=1)
 _HEADING_NORM[_HEADING_NORM == 0.0] = 1.0
 _HEADING_XY = _HEADING_XY / _HEADING_NORM[:, None]
+# Action layout: 0-7 level, 8-15 climb, 16-23 descend, 24 stay, 25 climb, 26 descend.
+_VZ_BY_BAND = (0.0, 1.0, -1.0)
+
+
+def _action_parts(idx):
+    """Return (heading index into _HEADING_XY, vertical sign)."""
+    idx = int(idx)
+    if idx >= 24:
+        return 8, _VZ_BY_BAND[min(max(idx - 24, 0), 2)]
+    return idx % 8, _VZ_BY_BAND[idx // 8]
 
 
 class SurvivorSearchEnv(ParallelEnv):
@@ -127,8 +140,10 @@ class SurvivorSearchEnv(ParallelEnv):
         cover_cells=None,
         pyb_freq=30,
         seed=None,
+        legacy_xy=False,
     ):
         super().__init__()
+        self.legacy_xy = bool(legacy_xy)
         self.num_drones = num_drones
         self.num_clusters = num_clusters
         self.survivors_per_cluster = survivors_per_cluster
@@ -158,7 +173,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.possible_agents = [f"drone_{i}" for i in range(num_drones)]
         self.agents = list(self.possible_agents)
 
-        # Vel, search heading, walls, teammates, progress, rubble sense, local crop, shared map.
+        # Vel, search heading, walls, teammates, progress, rubble sense,
+        # altitude, climb-helps, local crop, shared map.
+        # legacy_xy drops altitude, vz, and the 8 climb-helps bits (136 at N=3).
         self.obs_dim = (
             2
             + 2
@@ -167,13 +184,18 @@ class SurvivorSearchEnv(ParallelEnv):
             + 2
             + 1
             + 8
+            + (0 if self.legacy_xy else 1 + 1 + 8)
             + COVER_CROP * COVER_CROP
             + GLOBAL_BINS * GLOBAL_BINS
         )
         self.discrete_actions = True
-        self.n_actions = N_ACTIONS
-        self.act_dim = N_ACTIONS
-        self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 2 * num_drones
+        if self.legacy_xy:
+            self.n_actions = 9  # 8 headings + stay. Action 8 is hover.
+            self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 2 * num_drones
+        else:
+            self.n_actions = N_ACTIONS
+            self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 3 * num_drones
+        self.act_dim = self.n_actions
 
         self.terrain = None
         self.survivors = None
@@ -190,6 +212,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.nav_goal = np.zeros((num_drones, 2), dtype=np.float64)
         self.has_nav_goal = np.zeros(num_drones, dtype=bool)
         self.goal_hold = np.zeros(num_drones, dtype=np.int32)
+        self.abandoned_goals = [[] for _ in range(num_drones)]
         self.goal_is_person = np.zeros(num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(num_drones, dtype=np.int32)
         self.street_mask = np.ones((self.cover_ny, self.cover_nx), dtype=bool)
@@ -520,6 +543,8 @@ class SurvivorSearchEnv(ParallelEnv):
                 world = self._cell_to_world(gx, gy)
                 if not self._cell_is_searchable(world):
                     continue
+                if self._goal_abandoned(drone_index, world):
+                    continue
                 my_d = float(np.linalg.norm(world - my_xy))
                 if not share:
                     stolen = False
@@ -547,6 +572,8 @@ class SurvivorSearchEnv(ParallelEnv):
                         continue
                     world = self._cell_to_world(gx, gy)
                     if not self._cell_is_searchable(world):
+                        continue
+                    if self._goal_abandoned(drone_index, world):
                         continue
                     d = float(np.linalg.norm(world - my_xy))
                     if d < fallback_d:
@@ -643,6 +670,8 @@ class SurvivorSearchEnv(ParallelEnv):
         if self.goal_hold[drone_index] <= 0:
             return False
         goal = self.nav_goal[drone_index]
+        if self._goal_abandoned(drone_index, goal):
+            return False
         if self.goal_is_person[drone_index]:
             for person in self._undiscovered_people():
                 if float(np.linalg.norm(person - goal)) < 8.0:
@@ -678,19 +707,92 @@ class SurvivorSearchEnv(ParallelEnv):
             return owned
         return self._unfinished_centroid()
 
+    def _ahead_street_xy(self, x, y):
+        """A street cell far enough ahead to leave the cell the drone is already on."""
+        mask = getattr(self, "street_mask", None)
+        if mask is None or not mask.any():
+            return None
+        sx, sy = self._nearest_street_cell(*self._world_to_cell(x, y))
+        neighbors = (
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        )
+        best = None
+        best_key = None
+        for dx, dy in neighbors:
+            cx, cy = sx, sy
+            last = None
+            unpainted = 0
+            clear_sum = 0.0
+            for _ in range(STREET_LOOKAHEAD_CELLS):
+                nx, ny = cx + dx, cy + dy
+                if nx < 0 or ny < 0 or nx >= self.cover_nx or ny >= self.cover_ny:
+                    break
+                if not mask[ny, nx]:
+                    break
+                cx, cy = nx, ny
+                last = (cx, cy)
+                if self.coverage[cy, cx] < 0.5:
+                    unpainted += 1
+                clear_sum += float(self.street_clearance[cy, cx])
+            if last is None:
+                continue
+            world = self._cell_to_world(last[0], last[1])
+            dist = float(np.hypot(world[0] - x, world[1] - y))
+            if dist < 8.0:
+                continue
+            key = (unpainted, dist, clear_sum)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = world
+        return best
+
     def _metric_search_dir(self, drone_index, x, y):
         target = self._search_target_xy(drone_index)
         if target is None:
             return 0.0, 0.0
         waypoint = self._street_waypoint((x, y), target)
-        return float(waypoint[0] - x), float(waypoint[1] - y)
+        dx = float(waypoint[0] - x)
+        dy = float(waypoint[1] - y)
+        # On the near face of a pile the street point collapses under the drone
+        # and the old code spun in place. Drop that goal and leave down the street.
+        if abs(dx) + abs(dy) < 8.0 and not self._line_clear_xy((x, y), target):
+            self._abandon_goal(drone_index, target)
+            ahead = self._ahead_street_xy(x, y)
+            if ahead is not None:
+                dx = float(ahead[0] - x)
+                dy = float(ahead[1] - y)
+        return dx, dy
+
+    def _abandon_goal(self, drone_index, target):
+        if not hasattr(self, "abandoned_goals"):
+            self.abandoned_goals = [[] for _ in range(self.num_drones)]
+        bucket = self.abandoned_goals[drone_index]
+        point = np.asarray(target, dtype=np.float64).reshape(2).copy()
+        for prev in bucket:
+            if float(np.hypot(prev[0] - point[0], prev[1] - point[1])) < 12.0:
+                return
+        bucket.append(point)
+
+    def _goal_abandoned(self, drone_index, world):
+        bucket = getattr(self, "abandoned_goals", None)
+        if not bucket:
+            return False
+        point = np.asarray(world, dtype=np.float64).reshape(2)
+        for prev in bucket[drone_index]:
+            if float(np.hypot(prev[0] - point[0], prev[1] - point[1])) < 12.0:
+                return True
+        return False
 
     def _inland_search_dir(self, drone_index, pos):
         """Fly at the search goal. On a wall, drop the outbound component so they slide."""
         ux, uy = self._metric_search_dir(drone_index, pos[0], pos[1])
-        if abs(ux) + abs(uy) < 1.0:
-            ang = 0.35 * self.step_count + drone_index
-            ux, uy = float(np.cos(ang)), float(np.sin(ang))
         lx, ly = self._lim_x(), self._lim_y()
         if pos[0] >= lx - TURN_MARGIN:
             ux = min(ux, 0.0)
@@ -787,39 +889,252 @@ class SurvivorSearchEnv(ParallelEnv):
                 return True
         return self._interior_coverage() < 0.995
 
+    def _agl_of(self, pos):
+        return float(pos[2]) - self._ground_z(float(pos[0]), float(pos[1]))
+
+    def _solid_boxes(self):
+        boxes = self._town_boxes()
+        if boxes is None:
+            return None
+        if self.legacy_xy:
+            return boxes
+        solid = getattr(self.town, "box_solid", None) if self.town is not None else None
+        if solid is None or len(solid) != len(boxes):
+            return boxes
+        if not np.any(solid):
+            return None
+        return boxes[np.asarray(solid, dtype=bool)]
+
+    def _hits_solid(self, pos, radius=None):
+        boxes = self._solid_boxes()
+        if boxes is None:
+            return False
+        r = BUILDING_RADIUS if radius is None else float(radius)
+        p = np.asarray(pos, dtype=np.float64).reshape(3)
+        return TownLayout.sphere_hits_boxes(p, r, boxes)
+
+    def _solid_clearance(self, pos):
+        boxes = self._solid_boxes()
+        if boxes is None:
+            return 1e6
+        p = np.asarray(pos, dtype=np.float64).reshape(3)
+        return TownLayout.sphere_clearance(p, boxes)
+
+    def _path_hits_solid(self, pos_a, pos_b):
+        if self._hits_solid(pos_b):
+            return True
+        boxes = self._solid_boxes()
+        if boxes is None:
+            return False
+        a = np.asarray(pos_a, dtype=np.float64).reshape(3)
+        b = np.asarray(pos_b, dtype=np.float64).reshape(3)
+        if TownLayout.segment_hits_boxes(a, b, boxes):
+            return True
+        mid = 0.5 * (a + b)
+        return self._hits_solid(mid)
+
+    def _motion_end(self, pos, heading_idx, vz_sign):
+        """Where one discrete step would land, including the altitude clamp."""
+        dt = 1.0 / self.pyb_freq
+        step = self.drone_max_speed * dt
+        heading = _HEADING_XY[int(heading_idx)]
+        end = np.asarray(pos, dtype=np.float64).reshape(3).copy()
+        end[0] += float(heading[0]) * step
+        end[1] += float(heading[1]) * step
+        lx, ly = self._lim_x(), self._lim_y()
+        end[0] = float(np.clip(end[0], -lx, lx))
+        end[1] = float(np.clip(end[1], -ly, ly))
+        if self.legacy_xy:
+            end[2] = self._agl_z(end[0], end[1])
+            return end
+        gz = self._ground_z(end[0], end[1])
+        z = float(pos[2]) + float(vz_sign) * step
+        end[2] = float(np.clip(z, gz + MIN_AGL, gz + self.drone_max_altitude))
+        return end
+
+    def _motion_blocked(self, pos, heading_idx, vz_sign):
+        """True when this heading and vertical sign would hit a wall or the altitude limit."""
+        heading = _HEADING_XY[int(heading_idx)]
+        if abs(float(heading[0])) + abs(float(heading[1])) > 0.1 and self._map_edge_blocked(pos, heading):
+            return True
+        end = self._motion_end(pos, heading_idx, vz_sign)
+        if float(vz_sign) > 0.0 and end[2] <= float(pos[2]) + 0.05:
+            return True
+        if float(vz_sign) < 0.0 and end[2] >= float(pos[2]) - 0.05:
+            return True
+        start = np.asarray(pos, dtype=np.float64).reshape(3).copy()
+        if self.legacy_xy:
+            start[2] = self._agl_z(float(start[0]), float(start[1]))
+        return self._path_hits_solid(start, end)
+
     def _rubble_sense(self, pos):
-        """Nearest-rubble distance and which of the 8 headings would clip a box."""
-        here = [float(pos[0]), float(pos[1]), float(self._agl_z(pos[0], pos[1]))]
-        clear = float(np.clip(self._building_clearance(here) / 20.0, 0.0, 1.0))
+        """Clearance at this height, level hits, and which headings open if the drone climbs."""
+        if self.legacy_xy:
+            pos = np.asarray(pos, dtype=np.float64).reshape(3).copy()
+            pos[2] = self._agl_z(float(pos[0]), float(pos[1]))
+        here = [float(pos[0]), float(pos[1]), float(pos[2])]
+        clear = float(np.clip(self._solid_clearance(here) / 20.0, 0.0, 1.0))
         hits = np.zeros(8, dtype=np.float32)
+        helps = np.zeros(8, dtype=np.float32)
         for k in range(8):
-            hits[k] = 1.0 if self._heading_into_building(pos, _HEADING_XY[k]) else 0.0
-        return clear, hits
+            level_hit = self._motion_blocked(pos, k, 0.0)
+            climb_hit = self._motion_blocked(pos, k, 1.0)
+            hits[k] = 1.0 if level_hit else 0.0
+            helps[k] = 1.0 if level_hit and not climb_hit else 0.0
+        return clear, hits, helps
 
     def action_mask(self):
-        """1 where the heading is legal. A heading into rubble is removed. Stay stays."""
+        """1 where the move is legal. Walls and towers are removed. Chunks are not. Stay stays."""
         mask = np.ones((self.num_drones, self.n_actions), dtype=np.float32)
+        if self.legacy_xy:
+            for i in range(self.num_drones):
+                pos = self.drone_positions[i]
+                for h in range(8):
+                    if self._motion_blocked(pos, h, 0.0):
+                        mask[i, h] = 0.0
+            return mask
         for i in range(self.num_drones):
             pos = self.drone_positions[i]
-            _, hits = self._rubble_sense(pos)
-            mask[i, :8] = 1.0 - hits
+            for band, vz in enumerate(_VZ_BY_BAND):
+                for h in range(8):
+                    if self._motion_blocked(pos, h, vz):
+                        mask[i, band * 8 + h] = 0.0
+            if self._motion_blocked(pos, 8, 1.0):
+                mask[i, 25] = 0.0
+            if self._motion_blocked(pos, 8, -1.0):
+                mask[i, 26] = 0.0
         return mask
 
+    def _first_solid_ahead(self, pos, ux, uy, reach=45.0):
+        """Nearest wall or tower the ray hits at this altitude. (distance, top_z) or None."""
+        boxes = self._solid_boxes()
+        if boxes is None or len(boxes) == 0:
+            return None
+        dx, dy = float(ux), float(uy)
+        nrm = float(np.hypot(dx, dy))
+        if nrm < 1e-6:
+            return None
+        dx, dy = dx / nrm, dy / nrm
+        ox, oy, oz = float(pos[0]), float(pos[1]), float(pos[2])
+        xmin, ymin, zmin = boxes[:, 0], boxes[:, 1], boxes[:, 2]
+        xmax, ymax, zmax = boxes[:, 3], boxes[:, 4], boxes[:, 5]
+        big = 1e9
+        if abs(dx) < 1e-8:
+            inside = (ox >= xmin) & (ox <= xmax)
+            tx0 = np.where(inside, -big, big)
+            tx1 = np.where(inside, big, -big)
+        else:
+            tx0 = np.minimum((xmin - ox) / dx, (xmax - ox) / dx)
+            tx1 = np.maximum((xmin - ox) / dx, (xmax - ox) / dx)
+        if abs(dy) < 1e-8:
+            inside = (oy >= ymin) & (oy <= ymax)
+            ty0 = np.where(inside, -big, big)
+            ty1 = np.where(inside, big, -big)
+        else:
+            ty0 = np.minimum((ymin - oy) / dy, (ymax - oy) / dy)
+            ty1 = np.maximum((ymin - oy) / dy, (ymax - oy) / dy)
+        t_enter = np.maximum(tx0, ty0)
+        t_exit = np.minimum(tx1, ty1)
+        valid = (t_exit >= np.maximum(t_enter, 0.0)) & (t_enter <= reach) & (t_exit >= 0.0)
+        valid &= (oz + 0.4 >= zmin) & (oz <= zmax + 0.4)
+        if not np.any(valid):
+            return None
+        dist = np.where(valid, np.maximum(t_enter, 0.0), big)
+        i = int(np.argmin(dist))
+        if not np.isfinite(dist[i]) or dist[i] >= big / 2:
+            return None
+        return float(dist[i]), float(zmax[i])
+
+    def _heading_index(self, ux, uy):
+        best_k = 0
+        best_dot = -1e9
+        for k in range(8):
+            dot = float(_HEADING_XY[k, 0]) * float(ux) + float(_HEADING_XY[k, 1]) * float(uy)
+            if dot > best_dot:
+                best_dot = dot
+                best_k = k
+        return best_k
+
     def planner_actions(self, mask=None):
-        """Heading toward unpainted ground, chosen only from headings that miss rubble."""
+        """Head toward unpainted ground. Climb a clearable shell, then drop to search."""
         if mask is None:
             mask = self.action_mask()
-        actions = np.full(self.num_drones, 8.0, dtype=np.float32)
+        stay = 8.0 if self.legacy_xy else 24.0
+        actions = np.full(self.num_drones, stay, dtype=np.float32)
         for i in range(self.num_drones):
             if not self.drone_alive[i]:
                 continue
-            ux, uy = self._inland_search_dir(i, self.drone_positions[i])
-            best_k = 8
+            pos = self.drone_positions[i]
+            ux, uy = self._inland_search_dir(i, pos)
+            street = np.array([ux, uy], dtype=np.float64)
+            sn = float(np.hypot(street[0], street[1])) or 1.0
+            street = street / sn
+            direct = None
+            target = self._search_target_xy(i)
+            if target is not None:
+                direct = np.asarray(target, dtype=np.float64) - pos[:2]
+                dn = float(np.hypot(direct[0], direct[1]))
+                direct = direct / dn if dn > 1.0 else None
+            hop = None
+            aim = street
+            if direct is not None and not self.legacy_xy:
+                dist_goal = float(np.linalg.norm(np.asarray(target, dtype=np.float64) - pos[:2]))
+                info = self._first_solid_ahead(pos, direct[0], direct[1], reach=max(dist_goal, 8.0))
+                gz = self._ground_z(float(pos[0]), float(pos[1]))
+                # The search cell is behind a shell this drone can fly over.
+                if (
+                    info is not None
+                    and info[0] < dist_goal - 2.0
+                    and info[1] < gz + self.drone_max_altitude - 1.0
+                ):
+                    hop = info
+                    aim = direct
+            desired = self._heading_index(aim[0], aim[1])
+            agl = self._agl_of(pos)
+            step_m = self.drone_max_speed / self.pyb_freq
+            climbing = False
+            if hop is not None and float(pos[2]) < hop[1] + 1.2:
+                steps_up = (hop[1] + 1.2 - float(pos[2])) / step_m
+                steps_to = max(hop[0], 0.5) / step_m
+                if steps_up + 1.0 >= steps_to or hop[0] < 14.0:
+                    climbing = True
+            if self.legacy_xy:
+                if mask[i, desired] > 0.5:
+                    actions[i] = float(desired)
+                continue
+            if climbing:
+                if mask[i, 8 + desired] > 0.5:
+                    actions[i] = float(8 + desired)
+                    continue
+                if mask[i, 25] > 0.5:
+                    actions[i] = 25.0
+                    continue
+            crossing = False
+            if agl > SEARCH_AGL_MAX and not climbing:
+                over = self._first_solid_ahead(pos, aim[0], aim[1], reach=16.0)
+                if over is not None and float(pos[2]) > over[1] + 0.3 and over[0] < 14.0:
+                    crossing = True
+                elif mask[i, 16 + desired] > 0.5:
+                    actions[i] = float(16 + desired)
+                    continue
+                elif mask[i, 26] > 0.5:
+                    actions[i] = 26.0
+                    continue
+            if mask[i, desired] > 0.5:
+                actions[i] = float(desired)
+                continue
+            if not crossing and mask[i, 8 + desired] > 0.5:
+                actions[i] = float(8 + desired)
+                continue
+            if mask[i, 25] > 0.5 and hop is not None:
+                actions[i] = 25.0
+                continue
+            best_k = 24
             best_dot = -1e9
             for k in range(8):
                 if mask[i, k] < 0.5:
                     continue
-                dot = float(_HEADING_XY[k, 0]) * float(ux) + float(_HEADING_XY[k, 1]) * float(uy)
+                dot = float(_HEADING_XY[k, 0]) * float(aim[0]) + float(_HEADING_XY[k, 1]) * float(aim[1])
                 if dot > best_dot:
                     best_dot = dot
                     best_k = k
@@ -964,6 +1279,9 @@ class SurvivorSearchEnv(ParallelEnv):
         """Fly the chosen heading. Map edges slide; rubble contact is a crash."""
         pos = np.asarray(pos, dtype=np.float64).copy()
         vel = np.asarray(vel, dtype=np.float64).copy()
+        if self.legacy_xy:
+            pos[2] = self._agl_z(float(pos[0]), float(pos[1]))
+            vel[2] = 0.0
         old = pos.copy()
         lx, ly = self._lim_x(), self._lim_y()
         # The chosen heading is what flies. A step into rubble is blocked. The map
@@ -995,17 +1313,28 @@ class SurvivorSearchEnv(ParallelEnv):
             hit_y = True
         pos[0] = float(np.clip(pos[0], -lx, lx))
         pos[1] = float(np.clip(pos[1], -ly, ly))
-        pos[2] = float(self._agl_z(pos[0], pos[1]))
-        vel[2] = 0.0
+        if self.legacy_xy:
+            pos[2] = self._agl_z(pos[0], pos[1])
+            vel[2] = 0.0
+            building_hit = False
+            if self._path_hits_solid(old, pos) or self._hits_solid(pos):
+                building_hit = True
+                pos = old.copy()
+                pos[2] = self._agl_z(pos[0], pos[1])
+                vel[:] = 0.0
+            return pos, vel, building_hit
+        gz = self._ground_z(pos[0], pos[1])
+        pos[2] = float(np.clip(pos[2], gz + MIN_AGL, gz + self.drone_max_altitude))
+        if pos[2] <= gz + MIN_AGL + 1e-3 and vel[2] < 0.0:
+            vel[2] = 0.0
+        if pos[2] >= gz + self.drone_max_altitude - 1e-3 and vel[2] > 0.0:
+            vel[2] = 0.0
         building_hit = False
-        # Map edges slide. A step that would enter rubble stops short of it.
-        if self._path_hits_building(old, pos) or self._hits_building(pos):
+        # Chunks are passable. A step into a wall or tower stops short of it.
+        if self._path_hits_solid(old, pos) or self._hits_solid(pos):
             building_hit = True
             pos = old.copy()
-            pos[2] = float(self._agl_z(pos[0], pos[1]))
             vel[:] = 0.0
-        pos[2] = float(self._agl_z(pos[0], pos[1]))
-        vel[2] = 0.0
         return pos, vel, building_hit
 
     def _mark_coverage(self, positions):
@@ -1017,6 +1346,8 @@ class SurvivorSearchEnv(ParallelEnv):
         already = self.coverage >= 1.0
         for i, pos in enumerate(positions):
             if i < len(self.drone_alive) and not self.drone_alive[i]:
+                continue
+            if self._agl_of(pos) > SEARCH_AGL_MAX:
                 continue
             cx, cy = self._world_to_cell(pos[0], pos[1])
             cell_mx = self.size_x / self.cover_nx
@@ -1068,13 +1399,19 @@ class SurvivorSearchEnv(ParallelEnv):
         return small.ravel()
 
     def global_state(self):
-        """Shared coverage map plus normalized drone XY, for the critic."""
+        """Shared coverage map plus normalized drone XYZ, for the critic."""
         hx = max(self.size_x / 2.0, 1.0)
         hy = max(self.size_y / 2.0, 1.0)
         pos = np.empty((self.num_drones, 2), dtype=np.float32)
         pos[:, 0] = self.drone_positions[:, 0] / hx
         pos[:, 1] = self.drone_positions[:, 1] / hy
-        return np.concatenate([self._shared_map(), pos.ravel()])
+        alt = np.array(
+            [self._agl_of(self.drone_positions[i]) / max(self.drone_max_altitude, 1.0) for i in range(self.num_drones)],
+            dtype=np.float32,
+        )
+        if self.legacy_xy:
+            return np.concatenate([self._shared_map(), pos.ravel()])
+        return np.concatenate([self._shared_map(), pos.ravel(), alt])
 
     def _init_coverage_sweep(self):
         """Split the rectangle into north-south lanes, one subset per drone."""
@@ -1344,6 +1681,7 @@ class SurvivorSearchEnv(ParallelEnv):
         self.nav_goal = np.zeros((self.num_drones, 2), dtype=np.float64)
         self.has_nav_goal = np.zeros(self.num_drones, dtype=bool)
         self.goal_hold = np.zeros(self.num_drones, dtype=np.int32)
+        self.abandoned_goals = [[] for _ in range(self.num_drones)]
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
         self.town = None
@@ -1433,10 +1771,14 @@ class SurvivorSearchEnv(ParallelEnv):
                 self.drone_velocities[i] = act * self.drone_max_speed
             else:
                 idx = int(np.clip(np.rint(float(raw[0])) if raw.size else 0, 0, self.n_actions - 1))
-                heading = _HEADING_XY[idx]
+                if self.legacy_xy:
+                    heading_idx, vz_sign = (8, 0.0) if idx >= 8 else (idx, 0.0)
+                else:
+                    heading_idx, vz_sign = _action_parts(idx)
+                heading = _HEADING_XY[heading_idx]
                 self.drone_velocities[i, 0] = heading[0] * self.drone_max_speed
                 self.drone_velocities[i, 1] = heading[1] * self.drone_max_speed
-                self.drone_velocities[i, 2] = 0.0
+                self.drone_velocities[i, 2] = float(vz_sign) * self.drone_max_speed
 
         collisions = np.zeros(self.num_drones, dtype=bool)
         building_kills = np.zeros(self.num_drones, dtype=bool)
@@ -1487,7 +1829,9 @@ class SurvivorSearchEnv(ParallelEnv):
 
         self.new_cells, self.overlap_cells = self._mark_coverage(self.drone_positions)
         alive_pos = [
-            self.drone_positions[i] for i in range(self.num_drones) if self.drone_alive[i]
+            self.drone_positions[i]
+            for i in range(self.num_drones)
+            if self.drone_alive[i] and self._agl_of(self.drone_positions[i]) <= SEARCH_AGL_MAX
         ]
         self.newly_discovered, _ = self.survivors.update_discovery(alive_pos, self.terrain)
         self._sync_person_capsules()
@@ -1524,7 +1868,7 @@ class SurvivorSearchEnv(ParallelEnv):
             if self._drone_new_cells[i] == 0 and self._drone_overlap[i] > 0:
                 rew -= 0.25
             if self.drone_alive[i] and not rubble_blocks[i]:
-                speed = float(np.hypot(self.drone_velocities[i][0], self.drone_velocities[i][1]))
+                speed = float(np.linalg.norm(self.drone_velocities[i]))
                 if speed < 0.5 and work_remains:
                     rew -= 1.0
             if collisions[i]:
@@ -1566,13 +1910,20 @@ class SurvivorSearchEnv(ParallelEnv):
                 idx += 2
             obs[idx] = stats["discovery_rate"]
             obs[idx + 1] = uncovered_frac
-            clear, hits = self._rubble_sense(pos)
+            clear, hits, helps = self._rubble_sense(pos)
             obs[idx + 2] = clear
             obs[idx + 3 : idx + 11] = hits
+            if self.legacy_xy:
+                tail = idx + 11
+            else:
+                obs[idx + 11] = float(np.clip(self._agl_of(pos) / max(self.drone_max_altitude, 1.0), 0.0, 1.5))
+                obs[idx + 12] = vel[2] / self.drone_max_speed
+                obs[idx + 13 : idx + 21] = helps
+                tail = idx + 21
             crop = self._coverage_crop(pos[0], pos[1])
-            obs[idx + 11 : idx + 11 + crop.size] = crop
+            obs[tail : tail + crop.size] = crop
             shared = self._shared_map()
-            obs[idx + 11 + crop.size : idx + 11 + crop.size + shared.size] = shared
+            obs[tail + crop.size : tail + crop.size + shared.size] = shared
             observations[agent] = obs
         return observations
 

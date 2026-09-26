@@ -56,6 +56,11 @@ def parse_args():
         choices=["sweep", "model"],
         help="search: sweep = scripted lawnmower. model = learned MAPPO (default)",
     )
+    parser.add_argument(
+        "--legacy-xy",
+        action="store_true",
+        help="Viewer only: 5 m XY policy (obs 136, 9 actions, critic 70). Chunks block.",
+    )
     return parser.parse_args()
 
 
@@ -216,6 +221,31 @@ class SearchDroneLabels:
             self._last[i] = None if item_id < 0 else key
 
 
+class SearchHud:
+    """One status line (found / alive / cover), replaced in place."""
+
+    def __init__(self, client):
+        self.client = client
+        self.item_id = -1
+        self._last = None
+
+    def sync(self, text, position):
+        xyz = [float(position[0]), float(position[1]), float(position[2])]
+        key = (text, round(xyz[0], 2), round(xyz[1], 2), round(xyz[2], 2))
+        if self.item_id >= 0 and self._last == key:
+            return
+        kwargs = {
+            "textColorRGB": [1.0, 1.0, 1.0],
+            "textSize": 1.4,
+            "physicsClientId": self.client,
+        }
+        if self.item_id >= 0:
+            kwargs["replaceItemUniqueId"] = self.item_id
+        item_id = int(p.addUserDebugText(text, xyz, **kwargs))
+        self.item_id = item_id
+        self._last = None if item_id < 0 else key
+
+
 def main():
     args = parse_args()
     if args.env_size is None:
@@ -237,8 +267,14 @@ def main():
             max_steps=max(5000, int(args.env_size * 8)),
             render_mode="human",
             seed=args.seed,
+            legacy_xy=args.legacy_xy,
         )
         obs_dim, act_dim = env.obs_dim, env.act_dim
+        if args.legacy_xy:
+            print(
+                f" Legacy XY: obs={obs_dim} act={act_dim} state={env.state_dim} "
+                "(hover 5 m, chunks solid, action 8 = stay)"
+            )
     else:
         env = DisasterMeshEnv(
             num_drones=args.num_drones,
@@ -280,6 +316,7 @@ def main():
 
     obs_dict, info_dict = env.reset(seed=args.seed)
     agent_names = env.possible_agents
+    last_infos = info_dict
 
     dt_target = 1.0 / args.fps
     paused = False
@@ -289,6 +326,7 @@ def main():
     search_labels = (
         SearchDroneLabels(env.client, args.num_drones) if args.task == "search" else None
     )
+    search_hud = SearchHud(env.client) if args.task == "search" else None
 
     try:
         while True:
@@ -305,11 +343,13 @@ def main():
             if ord("r") in keys and (keys[ord("r")] & p.KEY_WAS_TRIGGERED):
                 print("[RESET] Resetting environment...")
                 obs_dict, info_dict = env.reset()
+                last_infos = info_dict
                 step_num = 0
                 prev_alive[:] = True
                 cam = SearchCamera(env.client, args.num_drones, args.env_size)
                 if args.task == "search":
                     search_labels = SearchDroneLabels(env.client, args.num_drones)
+                    search_hud = SearchHud(env.client)
                 continue
 
             cam.handle(keys, env.drone_positions)
@@ -379,6 +419,7 @@ def main():
                                 actions[agent] = np.array([vx, vy, vz, role_toggle, 0.0], dtype=np.float32)
 
                     obs_dict, rews, terms, truncs, infos = env.step(actions)
+                    last_infos = infos
                     if args.task == "search":
                         for i in range(args.num_drones):
                             if prev_alive[i] and not env.drone_alive[i]:
@@ -533,6 +574,20 @@ def main():
                         textSize=1.2,
                         physicsClientId=env.client,
                     )
+
+            if search_hud is not None:
+                stats = env.survivors.get_discovery_stats()
+                cover = 0.0
+                if last_infos:
+                    cover = float(last_infos[env.possible_agents[0]].get("coverage_frac", 0.0))
+                alive_n = int(np.sum(env.drone_alive))
+                cam_txt = f"FOLLOW D{cam.follow}" if cam.follow is not None else "OVERVIEW"
+                hud_line = (
+                    f"SEARCH | {cam_txt} | Alive: {alive_n}/{args.num_drones} | "
+                    f"Found: {stats['discovered_survivors']}/{stats['total_survivors']} "
+                    f"| Cover: {cover * 100:.0f}%"
+                )
+                search_hud.sync(hud_line, cam.target + np.array([0.0, 0.0, 10.0]))
 
             if search_labels is not None:
                 search_labels.sync(
