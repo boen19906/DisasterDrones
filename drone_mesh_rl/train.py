@@ -430,7 +430,9 @@ def main():
                 f" | Found: {found:.1f}/{total} | Cover: "
                 f"{infos[agent_names[0]].get('coverage_frac', 0)*100:4.1f}%"
             )
-            avg_battery = 100.0
+            avg_battery = float(np.mean(env.battery) * 100.0) if hasattr(env, "battery") else 100.0
+            if hasattr(env, "wind_speed"):
+                extra += f" | Wind: {float(env.wind_speed()):.1f} m/s"
         else:
             avg_battery = env.battery_levels.mean()
 

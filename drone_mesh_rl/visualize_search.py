@@ -57,7 +57,12 @@ except ImportError:
 def parse_args():
     parser = argparse.ArgumentParser(description="3D Visualizer for Drone Swarm Mesh")
     parser.add_argument("--model_path", type=str, default="", help="Optional model checkpoint path")
-    parser.add_argument("--num_drones", type=int, default=3, help="Number of drones")
+    parser.add_argument(
+        "--num_drones",
+        type=int,
+        default=None,
+        help="Number of drones. Default: the count saved in the checkpoint, else 3.",
+    )
     parser.add_argument("--num_clusters", type=int, default=4, help="Number of survivor clusters")
     parser.add_argument("--env_size", type=float, default=None, help="Terrain size in meters")
     parser.add_argument("--fps", type=float, default=30.0, help="Display FPS target")
@@ -344,6 +349,7 @@ class SearchStatusPanel:
             ("cover", "Map covered"),
             ("step", "Step"),
             ("flying", "Drones still flying"),
+            ("mesh", "Radio mesh"),
         ):
             row = tk.Frame(mission, bg=self.BG)
             row.pack(fill="x", pady=1)
@@ -446,6 +452,11 @@ class SearchStatusPanel:
         self.mission["cover"].config(text=f"{cover:.0f}%")
         self.mission["step"].config(text=str(step))
         self.mission["flying"].config(text=str(flying))
+        linked = True if not hasattr(env, "mesh_connected") else bool(env.mesh_connected())
+        self.mission["mesh"].config(
+            text="Linked" if linked else "Broken",
+            fg=self.OK if linked else self.DEAD,
+        )
 
         finds = np.asarray(getattr(env, "drone_finds", np.zeros(self.num_drones)), dtype=int)
         for i in range(self.num_drones):
@@ -463,7 +474,13 @@ class SearchStatusPanel:
             row["pos"].config(
                 text=f"x {pos[0]:.1f}  y {pos[1]:.1f}  h {pos[2]:.1f}"
             )
-            row["extra"].config(text=f"{speed:.1f} m/s    found {found_n}")
+            bat = 0.0
+            if hasattr(env, "battery") and i < len(env.battery):
+                bat = 100.0 * float(env.battery[i])
+            wind = ""
+            if hasattr(env, "wind_speed"):
+                wind = f"    wind {float(env.wind_speed()):.1f} m/s"
+            row["extra"].config(text=f"{speed:.1f} m/s    bat {bat:.0f}%{wind}    found {found_n}")
         self.pump()
 
     def pump(self):
@@ -517,6 +534,19 @@ class SearchDroneLabels:
             self._last[i] = None if item_id < 0 else key
 
 
+def _checkpoint_num_drones(path):
+    """Team size stored with a MAPPO checkpoint, or None if the file has none."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    if isinstance(ckpt, dict) and ckpt.get("num_drones") is not None:
+        return int(ckpt["num_drones"])
+    return None
+
+
 def main():
     args = parse_args()
     if args.headless:
@@ -530,11 +560,18 @@ def main():
         return
     if args.env_size is None:
         args.env_size = 250.0 if args.task == "search" else 100.0
+    if args.num_drones is None:
+        model_path = args.model_path
+        if args.task == "search" and args.policy == "model" and not model_path:
+            model_path = "models/mappo_search.pt"
+        saved = _checkpoint_num_drones(model_path) if args.policy == "model" else None
+        args.num_drones = saved if saved is not None else 3
+    follow_keys = "/".join(str(i) for i in range(1, min(9, args.num_drones) + 1))
     print("=" * 65)
     print(f" [3D VISUALIZER] task={args.task}")
     if args.task == "search":
         print(" Search: 240 m rubble city, 5 m AGL, character meshes, MAPPO XY")
-        print(" Camera: starts top-down | arrows pan | 1/2/3 follow a drone | 0 overview | F fly")
+        print(f" Camera: starts top-down | arrows pan | {follow_keys} follow a drone | 0 overview | F fly")
         print("         [ ] zoom | Space pause | R reset | Q quit")
         print(" Click the 3D view first or keys do nothing.")
     print(" Controls: Space = Pause | R = Reset Episode | Q / ESC = Exit")

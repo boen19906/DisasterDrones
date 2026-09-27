@@ -439,6 +439,30 @@ class Terrain:
                 self, seed=seed if seed is not None else 42
             )
         self._texture_path = None
+        self._cache_height_axes()
+
+    def _cache_height_axes(self):
+        """World coordinates of the heightmap columns and rows. Built once."""
+        self._axis_x, self._axis_y = self.vertex_axes()
+
+    @staticmethod
+    def _fract_index(axis, value):
+        """Same fractional index np.interp would return, without allocating an arange."""
+        n = axis.shape[0]
+        if n <= 1 or value <= axis[0]:
+            return 0.0
+        last = n - 1
+        if value >= axis[last]:
+            return float(last)
+        j = int(np.searchsorted(axis, value, side="right") - 1)
+        if j < 0:
+            return 0.0
+        if j >= last:
+            return float(last)
+        span = float(axis[j + 1] - axis[j])
+        if span == 0.0:
+            return float(j)
+        return j + (float(value) - float(axis[j])) / span
 
     @classmethod
     def from_dem(cls, path=None, max_side=DEM_MAX_GRID_SIDE, min_cell=DEM_MIN_CELL_M):
@@ -479,6 +503,7 @@ class Terrain:
         self._relief = None
         self.peak_height_range = (0.0, float(np.max(self.heightmap)))
         self._texture_path = None
+        self._cache_height_axes()
         return self
 
     def vertex_axes(self):
@@ -493,16 +518,22 @@ class Terrain:
 
     def get_height(self, x, y):
         """Bilinear ground height (heightmap z) at world (x, y), clamped to the grid."""
-        xs, ys = self.vertex_axes()
-        fx = float(np.clip(np.interp(x, xs, np.arange(self.grid_x)), 0, self.grid_x - 1))
-        fy = float(np.clip(np.interp(y, ys, np.arange(self.grid_y)), 0, self.grid_y - 1))
-        j0, i0 = int(np.floor(fx)), int(np.floor(fy))
-        j1, i1 = min(j0 + 1, self.grid_x - 1), min(i0 + 1, self.grid_y - 1)
+        xs = self._axis_x
+        ys = self._axis_y
+        fx = self._fract_index(xs, float(x))
+        fy = self._fract_index(ys, float(y))
+        j0, i0 = int(fx), int(fy)
+        if j0 >= self.grid_x:
+            j0 = self.grid_x - 1
+        if i0 >= self.grid_y:
+            i0 = self.grid_y - 1
+        j1 = j0 + 1 if j0 + 1 < self.grid_x else j0
+        i1 = i0 + 1 if i0 + 1 < self.grid_y else i0
         tx, ty = fx - j0, fy - i0
         Z = self.heightmap
-        top = Z[i0, j0] * (1 - tx) + Z[i0, j1] * tx
-        bot = Z[i1, j0] * (1 - tx) + Z[i1, j1] * tx
-        return float(top * (1 - ty) + bot * ty)
+        top = Z[i0, j0] * (1.0 - tx) + Z[i0, j1] * tx
+        bot = Z[i1, j0] * (1.0 - tx) + Z[i1, j1] * tx
+        return float(top * (1.0 - ty) + bot * ty)
 
     def world_to_crs(self, x, y):
         """DEM only: world (x, y) -> raster CRS coordinates (e.g. lon, lat)."""

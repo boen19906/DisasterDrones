@@ -20,7 +20,9 @@ Rewards:
   -0.25  a drone paints nothing and is only re-covering
   -0.01  per step (shared)
   -1.0   drone-drone collision (that drone only)
+  -2.0   the alive drones are not one radio mesh (that drone only)
   -50.0  building crash, that drone is dead
+  -50.0  battery empty, that drone is dead
   -1.0   not moving while cells or people remain (that drone only)
 """
 
@@ -51,6 +53,27 @@ from .district import (
     spawn_rubble_town_dressing,
     spawn_rubble_town_in_pybullet,
 )
+from .network import calculate_link
+
+
+def _farthest_link_m(has_los):
+    """Largest separation where calculate_link still closes. FSPL is monotonic."""
+    lo = 0.0
+    hi = 4000.0
+    origin = (0.0, 0.0, 0.0)
+    for _ in range(48):
+        mid = 0.5 * (lo + hi)
+        ok, _rssi = calculate_link(origin, (mid, 0.0, 0.0), has_los)
+        if ok:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+# A blocked hop dies near 56 m. A clear hop still closes across this whole city.
+_NLOS_LINK_M = _farthest_link_m(False)
+_LOS_LINK_M = _farthest_link_m(True)
 from .survivors import SurvivorCluster
 from .terrain import Terrain, spawn_terrain_in_pybullet
 from .town import TownLayout, apply_spectator_sun
@@ -75,8 +98,16 @@ BUILDING_STANDOFF_M = 2.5  # prefer street center; not a hard stop
 BUILDING_LOOKAHEAD_M = 3.5  # about one fast step; longer looks freeze them in town
 BUILDING_COMMIT_M = 6.0  # this close, a heading into rubble is a crash, not a hover
 BUILDING_CRASH_PENALTY = 50.0  # lethal building hit, that drone only
+BATTERY_DEATH_PENALTY = 50.0  # empty battery, that drone only
+BATTERY_LEVEL_DRAIN = 1.0 / 1100.0  # continuous cruise dies late in a 1500-step episode
+BATTERY_HOVER_DRAIN = 1.0 / 2500.0
+BATTERY_CLIMB_MULT = 2.0  # climbing spends the pack faster than level flight
+WIND_MAX_MS = 8.0  # prevailing wind is sampled inside this cap
+WIND_GUST_MS = 2.5  # slow gust added on top, then the sum is capped
+WIND_GUST_PERIOD = 600  # steps for one gust cycle (~20 s at 30 Hz)
 LETHAL_RUBBLE = False  # False: block the step, stay alive, small penalty. True: die and pay the crash penalty.
 RUBBLE_BLOCK_PENALTY = 5.0
+MESH_BREAK_PENALTY = 2.0  # alive drones are not one radio mesh
 GOAL_HOLD_STEPS = 150
 COVER_CELL_M = 5.0
 TEAM_KEEP_M = 12.0  # do not claim cells inside another drone's sensor disk
@@ -255,14 +286,16 @@ class SurvivorSearchEnv(ParallelEnv):
         self.possible_agents = [f"drone_{i}" for i in range(num_drones)]
         self.agents = list(self.possible_agents)
 
-        # Vel, search heading, walls, teammates, progress, rubble sense,
-        # altitude, climb-helps, local crop, shared map.
-        # legacy_xy drops altitude, vz, and the 8 climb-helps bits (136 at N=3).
+        # Vel, search heading, walls, teammates, progress, battery, body-frame wind,
+        # rubble sense, altitude, climb-helps, local crop, shared map.
+        # legacy_xy drops altitude, vz, and the 8 climb-helps bits.
         self.obs_dim = (
             2
             + 2
             + 4
             + 2 * (num_drones - 1)
+            + 2
+            + 1
             + 2
             + 1
             + 8
@@ -273,10 +306,10 @@ class SurvivorSearchEnv(ParallelEnv):
         self.discrete_actions = True
         if self.legacy_xy:
             self.n_actions = 9  # 8 headings + stay. Action 8 is hover.
-            self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 2 * num_drones
+            self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 2 * num_drones + num_drones + 2
         else:
             self.n_actions = N_ACTIONS
-            self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 3 * num_drones
+            self.state_dim = GLOBAL_BINS * GLOBAL_BINS + 3 * num_drones + num_drones + 2
         self.act_dim = self.n_actions
 
         self.terrain = None
@@ -286,6 +319,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.drone_positions = np.zeros((num_drones, 3))
         self.drone_velocities = np.zeros((num_drones, 3))
         self.drone_alive = np.ones(num_drones, dtype=bool)
+        self.battery = np.ones(num_drones, dtype=np.float64)
+        self._cmd_vel = np.zeros((num_drones, 3), dtype=np.float64)
+        self._sample_wind(seed)
         self.drone_finds = np.zeros(num_drones, dtype=np.int32)
         self.step_count = 0
         self.newly_discovered = 0
@@ -619,6 +655,40 @@ class SurvivorSearchEnv(ParallelEnv):
     def _has_walkable_unmapped(self):
         return self._unmapped_searchable_count() > 0
 
+    def _cell_center_axes(self):
+        """World x of each coverage column and y of each row. Built once."""
+        key = (self.cover_nx, self.cover_ny, float(self.size_x), float(self.size_y))
+        cached = getattr(self, "_cell_center_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        gx = np.arange(self.cover_nx, dtype=np.float64)
+        gy = np.arange(self.cover_ny, dtype=np.float64)
+        wx = (gx + 0.5) / self.cover_nx * self.size_x - self.size_x / 2.0
+        wy = (gy + 0.5) / self.cover_ny * self.size_y - self.size_y / 2.0
+        self._cell_center_cache = (key, wx, wy)
+        return wx, wy
+
+    def _visit_gain_grid(self):
+        """Unmapped cells a sensor disk would paint, for every coverage cell."""
+        unmapped = self.coverage < 0.5
+        ny, nx = unmapped.shape
+        cell_mx = self.size_x / self.cover_nx
+        cell_my = self.size_y / self.cover_ny
+        rad_x = max(1, int(np.ceil(self.sensor_radius / cell_mx)))
+        rad_y = max(1, int(np.ceil(self.sensor_radius / cell_my)))
+        gain = np.zeros((ny, nx), dtype=np.int32)
+        radius = float(self.sensor_radius)
+        for dy in range(-rad_y, rad_y + 1):
+            for dx in range(-rad_x, rad_x + 1):
+                if np.hypot(dx * cell_mx, dy * cell_my) > radius:
+                    continue
+                src_y = slice(max(dy, 0), ny + min(dy, 0))
+                dst_y = slice(max(-dy, 0), ny + min(-dy, 0))
+                src_x = slice(max(dx, 0), nx + min(dx, 0))
+                dst_x = slice(max(-dx, 0), nx + min(-dx, 0))
+                gain[dst_y, dst_x] += unmapped[src_y, src_x]
+        return gain
+
     def _search_goal_xy(self, drone_index):
         """Hunt leftover people once mapping is mostly done; otherwise next-best-view."""
         people = self._undiscovered_people()
@@ -649,72 +719,53 @@ class SurvivorSearchEnv(ParallelEnv):
             heading = None
         share = leftover <= LEFTOVER_CELLS
 
-        candidates = []
-        for gy in range(self.cover_ny):
-            for gx in range(self.cover_nx):
-                if self.coverage[gy, gx] >= 0.5:
-                    continue
-                world = self._cell_to_world(gx, gy)
-                if not self._cell_is_searchable(world):
-                    continue
-                my_d = float(np.linalg.norm(world - my_xy))
-                if not share:
-                    stolen = False
-                    for other in others:
-                        other_d = float(np.linalg.norm(world - other))
-                        if other_d + 1.0 < my_d:
-                            stolen = True
-                            break
-                    if stolen:
-                        continue
-                    skip_claim = False
-                    for claim in claimed:
-                        if float(np.linalg.norm(world - claim)) < CLAIM_KEEP_M:
-                            skip_claim = True
-                            break
-                    if skip_claim:
-                        continue
-                candidates.append((world, gx, gy, my_d))
-        if not candidates:
-            fallback = None
-            fallback_d = 1e18
-            for gy in range(self.cover_ny):
-                for gx in range(self.cover_nx):
-                    if self.coverage[gy, gx] >= 0.5:
-                        continue
-                    world = self._cell_to_world(gx, gy)
-                    if not self._cell_is_searchable(world):
-                        continue
-                    d = float(np.linalg.norm(world - my_xy))
-                    if d < fallback_d:
-                        fallback_d = d
-                        fallback = world
-            if fallback is None and people:
+        wx_axis, wy_axis = self._cell_center_axes()
+        playable = (
+            (np.abs(wx_axis) <= self._lim_x() - GOAL_EDGE_M)[None, :]
+            & (np.abs(wy_axis) <= self._lim_y() - GOAL_EDGE_M)[:, None]
+        )
+        open_cells = (self.coverage < 0.5) & self.street_mask & playable
+        ys, xs = np.nonzero(open_cells)
+        if xs.size == 0:
+            if people:
                 hunt = self._hunt_survivor_xy(drone_index)
                 if hunt is not None:
                     self.goal_is_person[drone_index] = True
                     return hunt
-            return fallback
+            return None
 
-        best = None
-        best_score = -1e18
-        nearest = None
-        nearest_d = 1e18
-        for world, gx, gy, my_d in candidates:
-            if my_d < nearest_d:
-                nearest_d = my_d
-                nearest = world
-            if my_d < 8.0:
-                continue
-            gain = self._new_cells_if_visit(gx, gy)
-            score = gain / (1.0 + 0.035 * my_d)
-            if heading is not None and my_d > 1e-3:
-                align = float(np.dot(heading, (world - my_xy) / my_d))
-                score += 0.15 * max(0.0, align)
-            if score > best_score:
-                best_score = score
-                best = world
-        return best if best is not None else nearest
+        wx = wx_axis[xs]
+        wy = wy_axis[ys]
+        my_d = np.hypot(wx - my_xy[0], wy - my_xy[1])
+        keep = np.ones(xs.shape[0], dtype=bool)
+        if not share:
+            for other in others:
+                other_d = np.hypot(wx - other[0], wy - other[1])
+                keep &= ~(other_d + 1.0 < my_d)
+            for claim in claimed:
+                claim_xy = np.asarray(claim, dtype=np.float64).reshape(-1)[:2]
+                keep &= ~(np.hypot(wx - claim_xy[0], wy - claim_xy[1]) < CLAIM_KEEP_M)
+        if not np.any(keep):
+            i = int(np.argmin(my_d))
+            return np.array([wx[i], wy[i]], dtype=np.float64)
+
+        xs, ys, wx, wy, my_d = xs[keep], ys[keep], wx[keep], wy[keep], my_d[keep]
+        gain = self._visit_gain_grid()[ys, xs].astype(np.float64)
+        score = gain / (1.0 + 0.035 * my_d)
+        eligible = my_d >= 8.0
+        if heading is not None:
+            align = np.zeros(my_d.shape, dtype=np.float64)
+            far = my_d > 1e-3
+            align[far] = (
+                heading[0] * (wx[far] - my_xy[0]) + heading[1] * (wy[far] - my_xy[1])
+            ) / my_d[far]
+            score = score + 0.15 * np.maximum(0.0, align)
+        score = np.where(eligible, score, -np.inf)
+        if np.any(eligible):
+            i = int(np.argmax(score))
+            return np.array([wx[i], wy[i]], dtype=np.float64)
+        i = int(np.argmin(my_d))
+        return np.array([wx[i], wy[i]], dtype=np.float64)
 
     def _owned_unfinished_centroid(self, drone_index):
         """Mean of unpainted cells this drone is closest to (team Voronoi)."""
@@ -925,20 +976,15 @@ class SurvivorSearchEnv(ParallelEnv):
 
     def _velocity_toward_unmapped(self, drone_index, pos):
         ux, uy = self._inland_search_dir(drone_index, pos)
-        keep_apart = (
-            not self.goal_is_person[drone_index]
-            and self._unmapped_searchable_count() > LEFTOVER_CELLS
-        )
-        if keep_apart:
-            for j in range(self.num_drones):
-                if j == drone_index:
-                    continue
-                rel = pos[:2] - self.drone_positions[j][:2]
-                dist = float(np.hypot(rel[0], rel[1]))
-                if 1e-3 < dist < TEAM_KEEP_M:
-                    push = (TEAM_KEEP_M - dist) / TEAM_KEEP_M
-                    ux += float(rel[0]) / dist * push
-                    uy += float(rel[1]) / dist * push
+        for j in range(self.num_drones):
+            if j == drone_index or not self.drone_alive[j]:
+                continue
+            rel = pos[:2] - self.drone_positions[j][:2]
+            dist = float(np.hypot(rel[0], rel[1]))
+            if 1e-3 < dist < TEAM_KEEP_M:
+                push = (TEAM_KEEP_M - dist) / TEAM_KEEP_M
+                ux += float(rel[0]) / dist * push
+                uy += float(rel[1]) / dist * push
         if abs(ux) + abs(uy) < 1e-6:
             ang = 2.0 * np.pi * drone_index / max(self.num_drones, 1) + 0.15 * self.step_count
             ux = float(np.cos(ang))
@@ -1004,17 +1050,43 @@ class SurvivorSearchEnv(ParallelEnv):
         return float(pos[2]) - self._ground_z(float(pos[0]), float(pos[1]))
 
     def _solid_boxes(self):
+        town = self.town
+        cached = getattr(self, "_solid_boxes_cache", None)
+        if cached is not None and cached[0] is town:
+            return cached[1]
         boxes = self._town_boxes()
-        if boxes is None:
-            return None
-        if self.legacy_xy:
-            return boxes
-        solid = getattr(self.town, "box_solid", None) if self.town is not None else None
-        if solid is None or len(solid) != len(boxes):
-            return boxes
-        if not np.any(solid):
-            return None
-        return boxes[np.asarray(solid, dtype=bool)]
+        result = None
+        if boxes is not None:
+            if self.legacy_xy:
+                result = boxes
+            else:
+                solid = getattr(town, "box_solid", None) if town is not None else None
+                if solid is None or len(solid) != len(boxes):
+                    result = boxes
+                elif np.any(solid):
+                    result = np.ascontiguousarray(boxes[np.asarray(solid, dtype=bool)])
+        self._solid_boxes_cache = (town, result)
+        return result
+
+    def _boxes_near_points(self, boxes, points, margin):
+        """Boxes whose AABB can touch the points expanded by margin."""
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        pad = float(margin)
+        xmin = float(pts[:, 0].min()) - pad
+        xmax = float(pts[:, 0].max()) + pad
+        ymin = float(pts[:, 1].min()) - pad
+        ymax = float(pts[:, 1].max()) + pad
+        zmin = float(pts[:, 2].min()) - pad
+        zmax = float(pts[:, 2].max()) + pad
+        keep = (
+            (boxes[:, 3] >= xmin)
+            & (boxes[:, 0] <= xmax)
+            & (boxes[:, 4] >= ymin)
+            & (boxes[:, 1] <= ymax)
+            & (boxes[:, 5] >= zmin)
+            & (boxes[:, 2] <= zmax)
+        )
+        return boxes[keep]
 
     def _hits_solid(self, pos, radius=None):
         boxes = self._solid_boxes()
@@ -1022,7 +1094,10 @@ class SurvivorSearchEnv(ParallelEnv):
             return False
         r = BUILDING_RADIUS if radius is None else float(radius)
         p = np.asarray(pos, dtype=np.float64).reshape(3)
-        return TownLayout.sphere_hits_boxes(p, r, boxes)
+        near = self._boxes_near_points(boxes, p, r)
+        if len(near) == 0:
+            return False
+        return TownLayout.sphere_hits_boxes(p, r, near)
 
     def _solid_clearance(self, pos):
         boxes = self._solid_boxes()
@@ -1032,17 +1107,33 @@ class SurvivorSearchEnv(ParallelEnv):
         return TownLayout.sphere_clearance(p, boxes)
 
     def _path_hits_solid(self, pos_a, pos_b):
-        if self._hits_solid(pos_b):
-            return True
         boxes = self._solid_boxes()
         if boxes is None:
             return False
         a = np.asarray(pos_a, dtype=np.float64).reshape(3)
         b = np.asarray(pos_b, dtype=np.float64).reshape(3)
-        if TownLayout.segment_hits_boxes(a, b, boxes):
+        near = self._boxes_near_points(boxes, np.stack((a, b)), BUILDING_RADIUS)
+        if len(near) == 0:
+            return False
+        if TownLayout.sphere_hits_boxes(b, BUILDING_RADIUS, near):
+            return True
+        if TownLayout.segment_hits_boxes(a, b, near):
             return True
         mid = 0.5 * (a + b)
-        return self._hits_solid(mid)
+        return TownLayout.sphere_hits_boxes(mid, BUILDING_RADIUS, near)
+
+    def _pair_paths_hit(self, origins, targets):
+        """Same blocked test as _path_hits_solid, for many segments at once."""
+        origins = np.asarray(origins, dtype=np.float64).reshape(-1, 3)
+        targets = np.asarray(targets, dtype=np.float64).reshape(-1, 3)
+        count = len(origins)
+        boxes = self._solid_boxes()
+        if boxes is None or count == 0:
+            return np.zeros(count, dtype=bool)
+        end_hit = TownLayout.sphere_hit_mask(targets, BUILDING_RADIUS, boxes)
+        seg_hit = TownLayout.segments_hit_boxes(origins, targets, boxes)
+        mid_hit = TownLayout.sphere_hit_mask(0.5 * (origins + targets), BUILDING_RADIUS, boxes)
+        return end_hit | seg_hit | mid_hit
 
     def _motion_end(self, pos, heading_idx, vz_sign):
         """Where one discrete step would land, including the altitude clamp."""
@@ -1106,8 +1197,269 @@ class SurvivorSearchEnv(ParallelEnv):
                 helps[k] = 1.0 if level_hit and not climb_hit else 0.0
         return clear, hits, helps
 
+    def _radio_pos(self, pos):
+        """Where the drone actually flies: hover height, which is what the radio uses."""
+        p = np.asarray(pos, dtype=np.float64).reshape(3).copy()
+        p[2] = self._agl_z(float(p[0]), float(p[1]))
+        return p
+
+    def _radio_link_pos(self, a, b):
+        """True when the mesh link budget still closes between two hover positions."""
+        a = np.asarray(a, dtype=np.float64).reshape(3)
+        b = np.asarray(b, dtype=np.float64).reshape(3)
+        delta = a - b
+        dist = float(np.sqrt(delta @ delta))
+        # Inside the blocked-hop range a wall cannot drop the link, so skip the ray.
+        if dist <= _NLOS_LINK_M:
+            return True
+        if dist > _LOS_LINK_M:
+            return False
+        return not self._path_hits_solid(a, b)
+
+    def _end_for_action(self, drone_index, action):
+        pos = self.drone_positions[drone_index]
+        action = int(action)
+        if self.legacy_xy:
+            heading = 8 if action >= 8 else action
+            return self._radio_pos(self._motion_end(pos, heading, 0.0))
+        if action >= 24:
+            return self._radio_pos(pos)
+        heading, _vz = _action_parts(action)
+        return self._radio_pos(self._motion_end(pos, heading, 0.0))
+
+    def _links_connected(self, alive, links):
+        if len(alive) <= 1:
+            return True
+        parent = {i: i for i in alive}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for (i, j), ok in links.items():
+            if not ok:
+                continue
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+        root = find(alive[0])
+        return all(find(i) == root for i in alive)
+
+    def mesh_connected(self):
+        """Alive drones form one mesh. One drone is linked by itself."""
+        alive = [i for i in range(self.num_drones) if self.drone_alive[i]]
+        if len(alive) <= 1:
+            return True
+        pos = [self._radio_pos(self.drone_positions[i]) for i in range(self.num_drones)]
+        links = {}
+        for a, i in enumerate(alive):
+            for j in alive[a + 1 :]:
+                links[(i, j)] = self._radio_link_pos(pos[i], pos[j])
+        return self._links_connected(alive, links)
+
+    def _nearest_teammate_dist(self, origin, positions, others):
+        best = 1e9
+        for j in others:
+            best = min(best, float(np.hypot(origin[0] - positions[j][0], origin[1] - positions[j][1])))
+        return best
+
+    def _gap_to_others(self, end, drone_index):
+        best = 1e9
+        for j in range(self.num_drones):
+            if j == drone_index or not self.drone_alive[j]:
+                continue
+            best = min(
+                best,
+                float(np.hypot(end[0] - self.drone_positions[j, 0], end[1] - self.drone_positions[j, 1])),
+            )
+        return best
+
+    def _apply_separation_mask(self, mask):
+        """Drop a heading that would land inside another drone."""
+        alive = [i for i in range(self.num_drones) if self.drone_alive[i]]
+        if len(alive) <= 1:
+            return mask
+        n_actions = mask.shape[1]
+        for i in alive:
+            legal = [a for a in range(n_actions) if mask[i, a] > 0.5]
+            if not legal:
+                continue
+            kept = []
+            best_a = legal[0]
+            best_gap = -1.0
+            for a in legal:
+                gap = self._gap_to_others(self._end_for_action(i, a), i)
+                if gap > best_gap:
+                    best_gap = gap
+                    best_a = a
+                if gap >= CRASH_RANGE:
+                    kept.append(a)
+            if not kept:
+                kept = [best_a]
+            allowed = set(kept)
+            for a in range(n_actions):
+                if a not in allowed:
+                    mask[i, a] = 0.0
+        return mask
+
+    def _nudge_apart(self, drone_index, ux, uy, dist):
+        cand = np.asarray(self.drone_positions[drone_index], dtype=np.float64).copy()
+        cand[0] = float(np.clip(cand[0] + ux * dist, -self._lim_x(), self._lim_x()))
+        cand[1] = float(np.clip(cand[1] + uy * dist, -self._lim_y(), self._lim_y()))
+        cand[2] = self._agl_z(cand[0], cand[1])
+        if self._hits_building(cand, radius=BUILDING_HARD_M):
+            return False
+        self.drone_positions[drone_index] = cand
+        return True
+
+    def _separate_drones(self):
+        """Slide overlapping drones out to CRASH_RANGE. A wall keeps the one that has room."""
+        alive = [i for i in range(self.num_drones) if self.drone_alive[i]]
+        if len(alive) <= 1:
+            return
+        for _ in range(3):
+            moved = False
+            for a, i in enumerate(alive):
+                for j in alive[a + 1 :]:
+                    dx = float(self.drone_positions[i, 0] - self.drone_positions[j, 0])
+                    dy = float(self.drone_positions[i, 1] - self.drone_positions[j, 1])
+                    dist = float(np.hypot(dx, dy))
+                    if dist >= CRASH_RANGE:
+                        continue
+                    if dist < 1e-4:
+                        dx, dy, dist = 1.0, 0.0, 1.0
+                    need = (CRASH_RANGE - dist) * 0.5 + 0.05
+                    ux, uy = dx / dist, dy / dist
+                    self._nudge_apart(i, ux, uy, need)
+                    self._nudge_apart(j, -ux, -uy, need)
+                    moved = True
+            if not moved:
+                return
+
+    def _mesh_end_states(self, drone_index, ends, others, pos, alive, base):
+        """For each landing, whether the mesh still holds and the nearest teammate gap."""
+        ends = [np.asarray(end, dtype=np.float64).reshape(3) for end in ends]
+        count = len(ends)
+        if count == 0:
+            return []
+        others = list(others)
+        link_ok = np.ones((count, len(others)), dtype=bool)
+        origins = []
+        targets = []
+        slots = []
+        for s, end in enumerate(ends):
+            for k, j in enumerate(others):
+                other = np.asarray(pos[j], dtype=np.float64).reshape(3)
+                delta = end - other
+                dist = float(np.sqrt(delta @ delta))
+                if dist <= _NLOS_LINK_M:
+                    continue
+                if dist > _LOS_LINK_M:
+                    link_ok[s, k] = False
+                    continue
+                origins.append(end)
+                targets.append(other)
+                slots.append((s, k))
+        if slots:
+            hits = self._pair_paths_hit(origins, targets)
+            for (s, k), blocked in zip(slots, hits):
+                link_ok[s, k] = not bool(blocked)
+        states = []
+        for s, end in enumerate(ends):
+            links = dict(base)
+            for k, j in enumerate(others):
+                key = (drone_index, j) if drone_index < j else (j, drone_index)
+                links[key] = bool(link_ok[s, k])
+            gap = self._nearest_teammate_dist(end, pos, others)
+            states.append((self._links_connected(alive, links), gap))
+        return states
+
+    def _apply_mesh_mask(self, mask):
+        """Drop headings that would split the radio mesh. A broken mesh may only step closer."""
+        mask = self._apply_separation_mask(mask)
+        alive = [i for i in range(self.num_drones) if self.drone_alive[i]]
+        if len(alive) <= 1:
+            return mask
+        pos = [self._radio_pos(self.drone_positions[i]) for i in range(self.num_drones)]
+        base = {}
+        for a, i in enumerate(alive):
+            for j in alive[a + 1 :]:
+                base[(i, j)] = self._radio_link_pos(pos[i], pos[j])
+        connected_now = self._links_connected(alive, base)
+        n_actions = mask.shape[1]
+        stay = 8 if self.legacy_xy else 24
+        for i in alive:
+            others = [j for j in alive if j != i]
+            legal = [a for a in range(n_actions) if mask[i, a] > 0.5]
+            if not legal:
+                continue
+            here = pos[i]
+            here_gap = self._nearest_teammate_dist(here, pos, others)
+            kept = []
+            closest = None
+            end_state = {}
+            pending = []
+            action_ends = []
+            for a in legal:
+                end = self._end_for_action(i, a)
+                key = end.tobytes()
+                action_ends.append((a, key))
+                if key not in end_state:
+                    end_state[key] = None
+                    pending.append((key, end))
+            for key, state in zip(
+                (item[0] for item in pending),
+                self._mesh_end_states(i, [item[1] for item in pending], others, pos, alive, base),
+            ):
+                end_state[key] = state
+            for a, key in action_ends:
+                holds, gap = end_state[key]
+                if connected_now:
+                    if holds:
+                        kept.append(a)
+                elif holds or gap <= here_gap + 1.4:
+                    kept.append(a)
+                if closest is None or gap < closest[0]:
+                    closest = (gap, a)
+            if connected_now and not kept:
+                kept = [stay] if stay in legal else ([closest[1]] if closest else legal[:1])
+            elif not kept and closest is not None:
+                kept = [closest[1]]
+            if not kept:
+                continue
+            allowed = set(kept)
+            for a in range(n_actions):
+                if a not in allowed:
+                    mask[i, a] = 0.0
+        return mask
+
+    def _mesh_keep_action(self, drone_index, idx):
+        """If a later override picked a heading that drops the mesh, take a legal one."""
+        mask = self.action_mask()[drone_index]
+        idx = int(idx)
+        if 0 <= idx < len(mask) and mask[idx] > 0.5:
+            return idx
+        stay = 8 if self.legacy_xy else 24
+        if mask[stay] > 0.5:
+            return stay
+        for k in range(len(mask)):
+            if mask[k] > 0.5:
+                return k
+        return idx
+
     def action_mask(self):
         """1 where the move is legal. Walls and towers are removed. Chunks are not. Stay stays."""
+        sig = self.drone_positions.tobytes()
+        cached = getattr(self, "_mask_cache", None)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        mask = self._build_action_mask()
+        self._mask_cache = (sig, mask)
+        return mask
+
+    def _build_action_mask(self):
         mask = np.ones((self.num_drones, self.n_actions), dtype=np.float32)
         if self.legacy_xy:
             for i in range(self.num_drones):
@@ -1115,7 +1467,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 for h in range(8):
                     if self._motion_blocked(pos, h, 0.0):
                         mask[i, h] = 0.0
-            return mask
+            return self._apply_mesh_mask(mask)
         for i in range(self.num_drones):
             pos = self.drone_positions[i]
             tower_close = False
@@ -1141,7 +1493,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 mask[i, 25] = 0.0
             if self._motion_blocked(pos, 8, -1.0):
                 mask[i, 26] = 0.0
-        return mask
+        return self._apply_mesh_mask(mask)
 
     def _first_solid_ahead(self, pos, ux, uy, reach=45.0):
         """Nearest wall or tower the ray hits at this altitude. (distance, top_z) or None."""
@@ -1509,6 +1861,7 @@ class SurvivorSearchEnv(ParallelEnv):
                             best_k = k
                     choice = float(best_k)
             choice = float(self._pace_override(i, pos, int(choice), self.step_count, mask[i]))
+            choice = float(self._mesh_keep_action(i, int(choice)))
             actions[i] = choice
             self._plan_action[i] = int(choice)
             final = int(choice)
@@ -1650,14 +2003,55 @@ class SurvivorSearchEnv(ParallelEnv):
             best = np.array([1.0, 0.0]) if norm < 1e-6 else inward / norm
         return best
 
+    def _sample_wind(self, seed):
+        """One prevailing wind for the episode, plus a slow gust around it."""
+        rng = np.random.default_rng(None if seed is None else int(seed) + 104729)
+        speed = float(rng.uniform(0.0, WIND_MAX_MS))
+        ang = float(rng.uniform(0.0, 2.0 * math.pi))
+        self._wind_base = np.array(
+            [math.cos(ang) * speed, math.sin(ang) * speed], dtype=np.float64
+        )
+        self._wind_gust_amp = float(rng.uniform(0.0, WIND_GUST_MS))
+        self._wind_gust_heading = float(rng.uniform(0.0, 2.0 * math.pi))
+        self._wind_phase = float(rng.uniform(0.0, 2.0 * math.pi))
+
+    def _wind_xy(self):
+        """Horizontal wind this step, in m/s, capped at WIND_MAX_MS."""
+        phase = self._wind_phase + 2.0 * math.pi * self.step_count / WIND_GUST_PERIOD
+        gust = self._wind_gust_amp * math.sin(phase)
+        wx = float(self._wind_base[0] + math.cos(self._wind_gust_heading) * gust)
+        wy = float(self._wind_base[1] + math.sin(self._wind_gust_heading) * gust)
+        mag = math.hypot(wx, wy)
+        if mag > WIND_MAX_MS:
+            scale = WIND_MAX_MS / mag
+            wx *= scale
+            wy *= scale
+        return wx, wy
+
+    def wind_speed(self):
+        wx, wy = self._wind_xy()
+        return math.hypot(wx, wy)
+
+    def _body_wind(self, vel):
+        """Wind in the drone's air-velocity frame. Hover uses world +x as forward."""
+        wx, wy = self._wind_xy()
+        speed = float(np.hypot(vel[0], vel[1]))
+        if speed > 0.5:
+            fx, fy = float(vel[0]) / speed, float(vel[1]) / speed
+        else:
+            fx, fy = 1.0, 0.0
+        forward = wx * fx + wy * fy
+        right = wx * fy - wy * fx
+        return forward, right
+
     def _move_with_soft_walls(self, drone_index, pos, vel, dt):
         """Fly the chosen heading. Map edges slide; rubble contact is a crash."""
         pos = np.asarray(pos, dtype=np.float64).copy()
         vel = np.asarray(vel, dtype=np.float64).copy()
         old = pos.copy()
         lx, ly = self._lim_x(), self._lim_y()
-        # The chosen heading is what flies. A step into rubble is blocked. The map
-        # edge only drops the outward component so a drone can still slide along the rim.
+        # The chosen heading is air velocity. Wind is added on the ground track.
+        # The map edge only drops the outward component so a drone can still slide.
         if pos[0] >= lx - TURN_MARGIN and vel[0] > 0.0:
             vel[0] = 0.0
         elif pos[0] <= -lx + TURN_MARGIN and vel[0] < 0.0:
@@ -1666,23 +2060,35 @@ class SurvivorSearchEnv(ParallelEnv):
             vel[1] = 0.0
         elif pos[1] <= -ly + TURN_MARGIN and vel[1] < 0.0:
             vel[1] = 0.0
-        pos = pos + vel * dt
+        wx, wy = self._wind_xy()
+        ground = vel.copy()
+        ground[0] += wx
+        ground[1] += wy
+        if pos[0] >= lx - TURN_MARGIN and ground[0] > 0.0:
+            ground[0] = 0.0
+        elif pos[0] <= -lx + TURN_MARGIN and ground[0] < 0.0:
+            ground[0] = 0.0
+        if pos[1] >= ly - TURN_MARGIN and ground[1] > 0.0:
+            ground[1] = 0.0
+        elif pos[1] <= -ly + TURN_MARGIN and ground[1] < 0.0:
+            ground[1] = 0.0
+        pos = pos + ground * dt
         if pos[0] > lx:
             pos[0] = lx
-            vel[0] = 0.0
-            hit_x = True
+            if vel[0] > 0.0:
+                vel[0] = 0.0
         elif pos[0] < -lx:
             pos[0] = -lx
-            vel[0] = 0.0
-            hit_x = True
+            if vel[0] < 0.0:
+                vel[0] = 0.0
         if pos[1] > ly:
             pos[1] = ly
-            vel[1] = 0.0
-            hit_y = True
+            if vel[1] > 0.0:
+                vel[1] = 0.0
         elif pos[1] < -ly:
             pos[1] = -ly
-            vel[1] = 0.0
-            hit_y = True
+            if vel[1] < 0.0:
+                vel[1] = 0.0
         pos[0] = float(np.clip(pos[0], -lx, lx))
         pos[1] = float(np.clip(pos[1], -ly, ly))
         pos[2] = float(self._agl_z(pos[0], pos[1]))
@@ -1770,9 +2176,12 @@ class SurvivorSearchEnv(ParallelEnv):
             [self._agl_of(self.drone_positions[i]) / max(self.drone_max_altitude, 1.0) for i in range(self.num_drones)],
             dtype=np.float32,
         )
+        bat = np.asarray(self.battery, dtype=np.float32)
+        wx, wy = self._wind_xy()
+        wind = np.array([wx / WIND_MAX_MS, wy / WIND_MAX_MS], dtype=np.float32)
         if self.legacy_xy:
-            return np.concatenate([self._shared_map(), pos.ravel()])
-        return np.concatenate([self._shared_map(), pos.ravel(), alt])
+            return np.concatenate([self._shared_map(), pos.ravel(), bat, wind])
+        return np.concatenate([self._shared_map(), pos.ravel(), alt, bat, wind])
 
     def _init_coverage_sweep(self):
         """Split the rectangle into north-south lanes, one subset per drone."""
@@ -1963,19 +2372,24 @@ class SurvivorSearchEnv(ParallelEnv):
         self.drone_ids = []
         self._drone_yaw = np.zeros(self.num_drones, dtype=np.float64)
         self._drone_crash_tinted = np.zeros(self.num_drones, dtype=bool)
-        lx, ly = self._lim_x(), self._lim_y()
         use_mesh = self._uses_search_meshes() and self._drone_vis >= 0
+        # Start inside the blocked-link range so the radio mesh is already one piece.
+        spacing = 20.0
+        cols = int(np.ceil(np.sqrt(self.num_drones)))
         for i in range(self.num_drones):
-            frac = (i + 0.5) / max(self.num_drones, 1)
-            x = -lx * 0.7 + frac * (1.4 * lx)
-            y = -ly * 0.35 + (i % 2) * (0.25 * ly)
+            col, row = i % cols, i // cols
+            x = (col - (cols - 1) / 2.0) * spacing
+            y = (row - (cols - 1) / 2.0) * spacing
             z = self._agl_z(x, y)
             cleared = self._push_out_of_buildings([x, y, z], radius=BUILDING_HARD_M)
             x, y, z = float(cleared[0]), float(cleared[1]), float(cleared[2])
             self.drone_positions[i] = [x, y, z]
+        self._pull_spawn_into_mesh()
+        for i in range(self.num_drones):
             if not use_mesh:
                 self.drone_ids.append(-1)
                 continue
+            x, y, z = (float(v) for v in self.drone_positions[i])
             did = p.createMultiBody(
                 baseMass=0,
                 baseCollisionShapeIndex=-1,
@@ -1985,7 +2399,6 @@ class SurvivorSearchEnv(ParallelEnv):
                 physicsClientId=self.client,
             )
             self.drone_ids.append(did)
-
         if self.render_mode == "human" and self.client is not None:
             p.resetDebugVisualizerCamera(
                 cameraDistance=max(self.size_x, self.size_y) * 1.05,
@@ -1994,6 +2407,52 @@ class SurvivorSearchEnv(ParallelEnv):
                 cameraTargetPosition=[0.0, 0.0, 0.0],
                 physicsClientId=self.client,
             )
+
+    def _pull_spawn_into_mesh(self):
+        """Nudge any drone a ruin pushed out of radio range back toward the group."""
+        for _ in range(40):
+            if self.mesh_connected():
+                return
+            alive = [i for i in range(self.num_drones) if self.drone_alive[i]]
+            pos = [self._radio_pos(self.drone_positions[i]) for i in range(self.num_drones)]
+            parent = {i: i for i in alive}
+
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for a, i in enumerate(alive):
+                for j in alive[a + 1 :]:
+                    if self._radio_link_pos(pos[i], pos[j]):
+                        ri, rj = find(i), find(j)
+                        if ri != rj:
+                            parent[rj] = ri
+            groups = {}
+            for i in alive:
+                groups.setdefault(find(i), []).append(i)
+            largest = max(groups.values(), key=len)
+            for i in alive:
+                if i in largest:
+                    continue
+                target = min(
+                    largest,
+                    key=lambda j: float(np.hypot(pos[i][0] - pos[j][0], pos[i][1] - pos[j][1])),
+                )
+                step = pos[target][:2] - pos[i][:2]
+                norm = float(np.hypot(step[0], step[1]))
+                if norm < 1e-3:
+                    continue
+                moved = pos[i].copy()
+                moved[0] += float(step[0]) / norm * min(12.0, norm)
+                moved[1] += float(step[1]) / norm * min(12.0, norm)
+                cleared = self._push_out_of_buildings(self._radio_pos(moved), radius=BUILDING_HARD_M)
+                self.drone_positions[i] = [
+                    float(cleared[0]),
+                    float(cleared[1]),
+                    float(cleared[2]),
+                ]
 
     def _spawn_person_meshes(self, rng):
         """One textured character per survivor. Pose is set once; no per-step updates."""
@@ -2031,6 +2490,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.coverage = np.zeros((self.cover_ny, self.cover_nx), dtype=np.float32)
         self.drone_velocities = np.zeros((self.num_drones, 3))
         self.drone_alive = np.ones(self.num_drones, dtype=bool)
+        self.battery = np.ones(self.num_drones, dtype=np.float64)
+        self._cmd_vel = np.zeros((self.num_drones, 3), dtype=np.float64)
+        self._sample_wind(self._seed)
         self.drone_finds = np.zeros(self.num_drones, dtype=np.int32)
         self.newly_discovered = 0
         self.new_cells = 0
@@ -2286,6 +2748,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 idx = int(np.clip(np.rint(float(raw[0])) if raw.size else 0, 0, self.n_actions - 1))
                 idx = self._unstick_action(i, idx, self.drone_positions[i])
                 idx = self._pace_override(i, self.drone_positions[i], idx, self.step_count - 1)
+                idx = self._mesh_keep_action(i, idx)
                 if self.legacy_xy:
                     heading_idx, vz_sign = (8, 0.0) if idx >= 8 else (idx, 0.0)
                 else:
@@ -2295,6 +2758,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 self.drone_velocities[i, 1] = heading[1] * self.drone_max_speed
                 self.drone_velocities[i, 2] = float(vz_sign) * self.drone_max_speed
 
+        self._cmd_vel = self.drone_velocities.copy()
         collisions = np.zeros(self.num_drones, dtype=bool)
         building_kills = np.zeros(self.num_drones, dtype=bool)
         rubble_blocks = np.zeros(self.num_drones, dtype=bool)
@@ -2318,6 +2782,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 rubble_blocks[i] = True
                 self.drone_velocities[i][:] = 0.0
 
+        self._separate_drones()
         for i in range(self.num_drones):
             if not self.drone_alive[i]:
                 continue
@@ -2366,8 +2831,9 @@ class SurvivorSearchEnv(ParallelEnv):
         self.newly_discovered, _ = self.survivors.update_discovery(alive_pos, self.terrain)
         self._tint_found_people(prev_discovered)
         self._credit_drone_finds(prev_discovered)
+        battery_deaths = self._drain_batteries()
 
-        rewards = self._compute_rewards(collisions, building_kills, rubble_blocks)
+        rewards = self._compute_rewards(collisions, building_kills, rubble_blocks, battery_deaths)
         all_found = int(self.survivors.discovered.sum()) == self.survivors.num_survivors
         mapped = self._interior_coverage() >= 0.995
         maxed = self.step_count >= self.max_steps
@@ -2470,17 +2936,50 @@ class SurvivorSearchEnv(ParallelEnv):
             if best_i >= 0:
                 self.drone_finds[best_i] += 1
 
-    def _compute_rewards(self, collisions, building_kills=None, rubble_blocks=None):
+    def _battery_cost(self, drone_index):
+        """Charge for the commanded air move. Headwind costs more. Tailwind cannot go below hover."""
+        vel = self._cmd_vel[drone_index]
+        speed = float(np.hypot(vel[0], vel[1]))
+        if speed < 0.5 and abs(float(vel[2])) < 0.5:
+            return BATTERY_HOVER_DRAIN
+        wx, wy = self._wind_xy()
+        along = (float(vel[0]) * wx + float(vel[1]) * wy) / max(speed, 1e-6)
+        factor = 1.0 - along / WIND_MAX_MS
+        floor = BATTERY_HOVER_DRAIN / BATTERY_LEVEL_DRAIN
+        cost = BATTERY_LEVEL_DRAIN * max(floor, factor)
+        if float(vel[2]) > 0.5:
+            cost *= BATTERY_CLIMB_MULT
+        return cost
+
+    def _drain_batteries(self):
+        """Spend charge. An empty pack kills that drone for the rest of the episode."""
+        deaths = np.zeros(self.num_drones, dtype=bool)
+        for i in range(self.num_drones):
+            if not self.drone_alive[i]:
+                self.battery[i] = 0.0
+                continue
+            self.battery[i] = max(0.0, float(self.battery[i]) - self._battery_cost(i))
+            if self.battery[i] <= 0.0:
+                self.battery[i] = 0.0
+                self.drone_alive[i] = False
+                self.drone_velocities[i][:] = 0.0
+                deaths[i] = True
+        return deaths
+
+    def _compute_rewards(self, collisions, building_kills=None, rubble_blocks=None, battery_deaths=None):
         """New cells and new people. Sitting still is costly while work remains."""
         if building_kills is None:
             building_kills = np.zeros(self.num_drones, dtype=bool)
         if rubble_blocks is None:
             rubble_blocks = np.zeros(self.num_drones, dtype=bool)
+        if battery_deaths is None:
+            battery_deaths = np.zeros(self.num_drones, dtype=bool)
         stats = self.survivors.get_discovery_stats()
         all_found = (
             stats["discovered_survivors"] == stats["total_survivors"] and stats["total_survivors"] > 0
         )
         work_remains = self._interior_coverage() < 0.995 or not all_found
+        mesh_broken = not self.mesh_connected()
 
         shared = 10.0 * float(self.newly_discovered)
         shared -= 0.01
@@ -2498,10 +2997,14 @@ class SurvivorSearchEnv(ParallelEnv):
                     rew -= 1.0
             if collisions[i]:
                 rew -= 1.0
+            if mesh_broken and self.drone_alive[i]:
+                rew -= MESH_BREAK_PENALTY
             if rubble_blocks[i]:
                 rew -= RUBBLE_BLOCK_PENALTY
             if building_kills[i]:
                 rew -= BUILDING_CRASH_PENALTY
+            if battery_deaths[i]:
+                rew -= BATTERY_DEATH_PENALTY
             rewards[agent] = rew
         return rewards
 
@@ -2535,16 +3038,20 @@ class SurvivorSearchEnv(ParallelEnv):
                 idx += 2
             obs[idx] = stats["discovery_rate"]
             obs[idx + 1] = uncovered_frac
+            obs[idx + 2] = float(self.battery[i])
+            wind_fwd, wind_right = self._body_wind(self._cmd_vel[i])
+            obs[idx + 3] = float(np.clip(wind_fwd / WIND_MAX_MS, -1.5, 1.5))
+            obs[idx + 4] = float(np.clip(wind_right / WIND_MAX_MS, -1.5, 1.5))
             clear, hits, helps = self._rubble_sense(pos)
-            obs[idx + 2] = clear
-            obs[idx + 3 : idx + 11] = hits
+            obs[idx + 5] = clear
+            obs[idx + 6 : idx + 14] = hits
             if self.legacy_xy:
-                tail = idx + 11
+                tail = idx + 14
             else:
-                obs[idx + 11] = float(np.clip(self._agl_of(pos) / max(self.drone_max_altitude, 1.0), 0.0, 1.5))
-                obs[idx + 12] = vel[2] / self.drone_max_speed
-                obs[idx + 13 : idx + 21] = helps
-                tail = idx + 21
+                obs[idx + 14] = float(np.clip(self._agl_of(pos) / max(self.drone_max_altitude, 1.0), 0.0, 1.5))
+                obs[idx + 15] = vel[2] / self.drone_max_speed
+                obs[idx + 16 : idx + 24] = helps
+                tail = idx + 24
             crop = self._coverage_crop(pos[0], pos[1])
             obs[tail : tail + crop.size] = crop
             shared = self._shared_map()

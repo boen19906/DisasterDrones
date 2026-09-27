@@ -1093,7 +1093,7 @@ class TownLayout:
         a = np.asarray(point_a, dtype=np.float64).reshape(3)
         b = np.asarray(point_b, dtype=np.float64).reshape(3)
         d = b - a
-        if np.allclose(d, 0.0):
+        if float(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) < 1e-24:
             return TownLayout.sphere_hits_boxes(a, 1e-6, boxes)
 
         n = len(boxes)
@@ -1124,6 +1124,46 @@ class TownLayout:
                 return False
 
         return bool(np.any(alive & (tmax >= 0.0) & (tmin <= 1.0)))
+
+    @staticmethod
+    def segments_hit_boxes(origins, ends, boxes):
+        """True for each segment that intersects any AABB. Same slab test, many segments."""
+        origins = np.asarray(origins, dtype=np.float64).reshape(-1, 3)
+        ends = np.asarray(ends, dtype=np.float64).reshape(-1, 3)
+        count = len(origins)
+        if boxes is None or len(boxes) == 0 or count == 0:
+            return np.zeros(count, dtype=bool)
+        delta = ends - origins
+        hit = np.zeros(count, dtype=bool)
+        degenerate = np.einsum("ij,ij->i", delta, delta) < 1e-24
+        if np.any(degenerate):
+            hit[degenerate] = TownLayout.sphere_hit_mask(origins[degenerate], 1e-6, boxes)
+        use = ~degenerate
+        if not np.any(use):
+            return hit
+        origin = origins[use]
+        step = delta[use]
+        n_boxes = len(boxes)
+        tmin = np.zeros((len(origin), n_boxes), dtype=np.float64)
+        tmax = np.ones((len(origin), n_boxes), dtype=np.float64)
+        alive = np.ones((len(origin), n_boxes), dtype=bool)
+        for axis in range(3):
+            da = step[:, axis]
+            parallel = np.abs(da) < 1e-12
+            amin = boxes[:, axis]
+            amax = boxes[:, axis + 3]
+            oa = origin[:, axis]
+            alive &= ~(parallel[:, None] & ((oa[:, None] < amin) | (oa[:, None] > amax)))
+            inv = np.where(parallel, 1.0, 1.0 / np.where(parallel, 1.0, da))
+            t1 = (amin[None, :] - oa[:, None]) * inv[:, None]
+            t2 = (amax[None, :] - oa[:, None]) * inv[:, None]
+            t_enter = np.minimum(t1, t2)
+            t_exit = np.maximum(t1, t2)
+            tmin = np.where(parallel[:, None], tmin, np.maximum(tmin, t_enter))
+            tmax = np.where(parallel[:, None], tmax, np.minimum(tmax, t_exit))
+            alive &= tmin <= tmax
+        hit[use] = np.any(alive & (tmax >= 0.0) & (tmin <= 1.0), axis=1)
+        return hit
 
     @staticmethod
     def segment_clear(point_a, point_b, boxes):
