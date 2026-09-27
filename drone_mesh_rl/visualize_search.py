@@ -349,7 +349,6 @@ class SearchStatusPanel:
             ("cover", "Map covered"),
             ("step", "Step"),
             ("flying", "Drones still flying"),
-            ("mesh", "Radio mesh"),
         ):
             row = tk.Frame(mission, bg=self.BG)
             row.pack(fill="x", pady=1)
@@ -433,7 +432,7 @@ class SearchStatusPanel:
             self.root = None
 
     def _window_h(self):
-        return 250 + 78 * max(1, self.num_drones)
+        return 226 + 78 * max(1, self.num_drones)
 
     def refresh(self, env):
         if self.root is None:
@@ -452,11 +451,6 @@ class SearchStatusPanel:
         self.mission["cover"].config(text=f"{cover:.0f}%")
         self.mission["step"].config(text=str(step))
         self.mission["flying"].config(text=str(flying))
-        linked = True if not hasattr(env, "mesh_connected") else bool(env.mesh_connected())
-        self.mission["mesh"].config(
-            text="Linked" if linked else "Broken",
-            fg=self.OK if linked else self.DEAD,
-        )
 
         finds = np.asarray(getattr(env, "drone_finds", np.zeros(self.num_drones)), dtype=int)
         for i in range(self.num_drones):
@@ -503,35 +497,55 @@ class SearchStatusPanel:
 
 
 class SearchDroneLabels:
-    """D0/D1/... text above each search drone, replaced in place (no wipe)."""
+    """D0/D1/... text above each search drone.
+
+    PyBullet's replaceItemUniqueId often leaves the previous text where it
+    was, so a name floats away from the body. Drop every label and draw the
+    current set again instead of replacing one item.
+    """
 
     def __init__(self, client, num_drones):
         self.client = client
         self.num_drones = int(num_drones)
-        self.item_ids = [-1] * self.num_drones
+        self._last = [None] * self.num_drones
+
+    def clear(self):
+        if self.client is None:
+            return
+        try:
+            p.removeAllUserDebugItems(physicsClientId=self.client)
+        except Exception:
+            pass
         self._last = [None] * self.num_drones
 
     def sync(self, drone_positions, drone_alive, follow=None):
+        keys = []
+        specs = []
+        changed = False
         for i in range(self.num_drones):
             alive = bool(drone_alive[i])
             tag = _search_drone_tag(i, alive)
-            color = [0.2, 0.5, 1.0] if alive else [1.0, 0.05, 0.05]
+            color = (0.2, 0.5, 1.0) if alive else (1.0, 0.05, 0.05)
             size = 1.4 if follow == i else 1.0
             pos = np.asarray(drone_positions[i], dtype=np.float64)
-            xyz = [float(pos[0]), float(pos[1]), float(pos[2]) + 1.2]
-            key = (tag, tuple(color), size, round(xyz[0], 3), round(xyz[1], 3), round(xyz[2], 3))
-            if self.item_ids[i] >= 0 and self._last[i] == key:
-                continue
-            kwargs = {
-                "textColorRGB": color,
-                "textSize": size,
-                "physicsClientId": self.client,
-            }
-            if self.item_ids[i] >= 0:
-                kwargs["replaceItemUniqueId"] = self.item_ids[i]
-            item_id = int(p.addUserDebugText(tag, xyz, **kwargs))
-            self.item_ids[i] = item_id
-            self._last[i] = None if item_id < 0 else key
+            xyz = (round(float(pos[0]), 2), round(float(pos[1]), 2), round(float(pos[2]) + 1.2, 2))
+            key = (tag, color, size, xyz)
+            keys.append(key)
+            specs.append((tag, color, size, xyz))
+            if self._last[i] != key:
+                changed = True
+        if not changed:
+            return
+        self.clear()
+        for i, (tag, color, size, xyz) in enumerate(specs):
+            p.addUserDebugText(
+                tag,
+                list(xyz),
+                textColorRGB=list(color),
+                textSize=size,
+                physicsClientId=self.client,
+            )
+            self._last[i] = keys[i]
 
 
 def _checkpoint_num_drones(path):
@@ -677,6 +691,8 @@ def main():
                 if cam.fly:
                     print("[CAM] Fly mode OFF")
                 print("[RESET] Resetting environment...")
+                if search_labels is not None:
+                    search_labels.clear()
                 obs_dict, info_dict = env.reset()
                 step_num = 0
                 prev_alive[:] = True
@@ -792,6 +808,8 @@ def main():
                         print(
                             f"[EPISODE END] Discovered: {stats['discovered_survivors']}/{stats['total_survivors']}"
                         )
+                        if search_labels is not None:
+                            search_labels.clear()
                         obs_dict, info_dict = env.reset()
                         step_num = 0
                         prev_alive[:] = True

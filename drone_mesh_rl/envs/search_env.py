@@ -92,7 +92,9 @@ _MESH_RGBA = [1.0, 1.0, 1.0, 1.0]
 _FOUND_RGBA = [0.15, 1.0, 0.25, 1.0]
 _CRASH_RGBA = [0.45, 0.06, 0.06, 1.0]
 CRASH_RANGE = 3.5
-BUILDING_RADIUS = 0.55  # lethal airframe radius
+BUILDING_RADIUS = 0.55  # point used for a hard crash test
+BODY_KEEP_M = 1.7  # drone mesh reaches about this far; closer and the body is in the ruin
+BODY_EXIT_M = 6.0  # one-step pull to here so the mesh is out of the ruin immediately
 BUILDING_HARD_M = 1.25  # refuse a heading that would clip this soon
 BUILDING_STANDOFF_M = 2.5  # prefer street center; not a hard stop
 BUILDING_LOOKAHEAD_M = 3.5  # about one fast step; longer looks freeze them in town
@@ -124,6 +126,7 @@ TALL_AVOID_M = 14.0  # a tower this close is not a climb; go around
 DETOUR_LOCK_STEPS = 16  # keep the around-heading so a corner cannot flip it
 STUCK_STEPS = 60  # net movement inside STUCK_RADIUS this long means the drone is stuck
 STUCK_RADIUS = 3.5
+EXIT_LOCK_STEPS = 12  # after a rubble bump, keep the away-heading this many steps
 PACE_STEPS = 36  # still inside PACE_RADIUS on painted ground: stop the shuttle
 PACE_RADIUS = 14.0
 PACE_LOCK_STEPS = 100  # hold the heading toward leftover work across empty streets
@@ -356,6 +359,8 @@ class SurvivorSearchEnv(ParallelEnv):
         self._pace_cached = np.full(num_drones, -1, dtype=np.int32)
         self.goal_is_person = np.zeros(num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(num_drones, dtype=np.int32)
+        self._exit_action = np.full(num_drones, 24, dtype=np.int32)
+        self._exit_left = np.zeros(num_drones, dtype=np.int32)
         self.street_mask = np.ones((self.cover_ny, self.cover_nx), dtype=bool)
         self.street_clearance = np.full((self.cover_ny, self.cover_nx), 99.0)
 
@@ -1167,7 +1172,11 @@ class SurvivorSearchEnv(ParallelEnv):
         start = np.asarray(pos, dtype=np.float64).reshape(3).copy()
         if self.legacy_xy:
             start[2] = self._agl_z(float(start[0]), float(start[1]))
-        return self._path_hits_solid(start, end)
+        if self._path_hits_solid(start, end):
+            return True
+        end_fly = np.asarray(end, dtype=np.float64).reshape(3).copy()
+        end_fly[2] = self._agl_z(float(end_fly[0]), float(end_fly[1]))
+        return self._building_clearance(end_fly) < BODY_KEEP_M
 
 
     def _rubble_sense(self, pos):
@@ -1941,7 +1950,36 @@ class SurvivorSearchEnv(ParallelEnv):
         p[2] = self._agl_z(p[0], p[1])
         if not self._hits_building(p, radius=r):
             return p
-        for dist in (r, r + 1.0, r + 2.5, r + 4.0, 8.0, 12.0):
+        boxes = self._town_boxes()
+        best = None
+        best_dist = 1e9
+        if boxes is not None:
+            pad = r + 0.4
+            for box in boxes:
+                if p[2] < box[2] - r or p[2] > box[5] + r:
+                    continue
+                if p[0] < box[0] - r or p[0] > box[3] + r or p[1] < box[1] - r or p[1] > box[4] + r:
+                    continue
+                faces = (
+                    (box[0] - pad, p[1], p[0] - (box[0] - r)),
+                    (box[3] + pad, p[1], (box[3] + r) - p[0]),
+                    (p[0], box[1] - pad, p[1] - (box[1] - r)),
+                    (p[0], box[4] + pad, (box[4] + r) - p[1]),
+                )
+                for x, y, dist in faces:
+                    if dist >= best_dist:
+                        continue
+                    cand = p.copy()
+                    cand[0] = float(np.clip(x, -self._lim_x(), self._lim_x()))
+                    cand[1] = float(np.clip(y, -self._lim_y(), self._lim_y()))
+                    cand[2] = self._agl_z(cand[0], cand[1])
+                    if self._hits_building(cand, radius=r):
+                        continue
+                    best = cand
+                    best_dist = float(dist)
+        if best is not None:
+            return best
+        for dist in (r, r + 1.0, r + 2.5, r + 4.0, 8.0, 16.0, 28.0):
             for heading in _MOVE_HEADINGS:
                 cand = p.copy()
                 cand[0] += heading[0] * dist
@@ -1952,6 +1990,83 @@ class SurvivorSearchEnv(ParallelEnv):
                 if not self._hits_building(cand, radius=r):
                     return cand
         return p
+
+    def _nearest_building_away(self, pos):
+        """Unit XY pointing out of the nearest building, and the gap to it."""
+        boxes = self._town_boxes()
+        p = np.asarray(pos, dtype=np.float64).reshape(3)
+        if boxes is None or len(boxes) == 0:
+            return np.array([1.0, 0.0], dtype=np.float64), 1e9
+        cx = np.clip(p[0], boxes[:, 0], boxes[:, 3])
+        cy = np.clip(p[1], boxes[:, 1], boxes[:, 4])
+        cz = np.clip(p[2], boxes[:, 2], boxes[:, 5])
+        delta = np.stack((p[0] - cx, p[1] - cy, p[2] - cz), axis=1)
+        dist = np.linalg.norm(delta, axis=1)
+        i = int(np.argmin(dist))
+        if dist[i] < 1e-3:
+            left = float(p[0] - boxes[i, 0])
+            right = float(boxes[i, 3] - p[0])
+            down = float(p[1] - boxes[i, 1])
+            up = float(boxes[i, 4] - p[1])
+            if min(left, right) <= min(down, up):
+                return np.array([-1.0 if left < right else 1.0, 0.0]), 0.0
+            return np.array([0.0, -1.0 if down < up else 1.0]), 0.0
+        away = delta[i, :2]
+        norm = float(np.hypot(away[0], away[1])) or 1.0
+        return away / norm, float(dist[i])
+
+    def _best_exit_action(self, pos):
+        """Level heading straight out from the nearest face. None if every step goes deeper."""
+        pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        away, _gap = self._nearest_building_away(pos)
+        here = self._building_clearance(pos)
+        best_h = None
+        best_dot = 0.15
+        for h in range(8):
+            end = self._motion_end(pos, h, 0.0)
+            end[2] = self._agl_z(float(end[0]), float(end[1]))
+            clear = self._building_clearance(end)
+            if clear < here - 0.05:
+                continue
+            if self._path_hits_building(pos, end) and clear <= here + 0.05:
+                continue
+            dot = float(_HEADING_XY[h, 0]) * float(away[0]) + float(_HEADING_XY[h, 1]) * float(away[1])
+            if dot > best_dot:
+                best_dot = dot
+                best_h = h
+        return best_h
+
+    def _keep_body_out_of_rubble(self, drone_index):
+        """If the mesh overlaps a ruin, place it clear in this step."""
+        clear = self._building_clearance(self.drone_positions[drone_index])
+        if clear >= BODY_KEEP_M:
+            if clear >= BODY_EXIT_M:
+                self._exit_left[drone_index] = 0
+            return
+        pushed = self._push_out_of_buildings(self.drone_positions[drone_index], radius=BODY_EXIT_M)
+        if self._building_clearance(pushed) > clear + 0.05:
+            self.drone_positions[drone_index] = pushed
+            self._mask_cache = None
+            clear = self._building_clearance(pushed)
+        if clear < BODY_EXIT_M:
+            away, _gap = self._nearest_building_away(self.drone_positions[drone_index])
+            nudged = np.asarray(self.drone_positions[drone_index], dtype=np.float64).copy()
+            step = max(BODY_EXIT_M, BODY_EXIT_M - clear + 0.5)
+            nudged[0] = float(np.clip(nudged[0] + float(away[0]) * step, -self._lim_x(), self._lim_x()))
+            nudged[1] = float(np.clip(nudged[1] + float(away[1]) * step, -self._lim_y(), self._lim_y()))
+            nudged[2] = self._agl_z(nudged[0], nudged[1])
+            if self._building_clearance(nudged) >= clear + 1.0:
+                self.drone_positions[drone_index] = nudged
+                self._mask_cache = None
+                clear = self._building_clearance(nudged)
+        if clear >= BODY_KEEP_M:
+            self._exit_left[drone_index] = 0
+            return
+        opened = self._best_exit_action(self.drone_positions[drone_index])
+        if opened is None:
+            return
+        self._exit_action[drone_index] = int(opened)
+        self._exit_left[drone_index] = 2
 
     def _on_border(self, pos, margin=None):
         if margin is None:
@@ -2095,7 +2210,15 @@ class SurvivorSearchEnv(ParallelEnv):
         vel[2] = 0.0
         building_hit = False
         # Map edges slide. A step that would enter rubble stops short of it.
-        if self._path_hits_building(old, pos) or self._hits_building(pos):
+        new_clear = self._building_clearance(pos)
+        blocked = (
+            new_clear < BODY_KEEP_M
+            or self._path_hits_building(old, pos)
+            or self._hits_building(pos)
+        )
+        if blocked:
+            # Stay put. If the body is already in the ruin, the yank below
+            # places it clear in this same step instead of creeping out.
             building_hit = True
             pos = old.copy()
             pos[2] = float(self._agl_z(pos[0], pos[1]))
@@ -2244,6 +2367,7 @@ class SurvivorSearchEnv(ParallelEnv):
                 p.COV_ENABLE_WIREFRAME, 0, physicsClientId=self.client
             )
             apply_spectator_sun(self.client, shadows=True, spawn_disc=True)
+            p.removeAllUserDebugItems(physicsClientId=self.client)
             p.setRealTimeSimulation(0, physicsClientId=self.client)
         else:
             self.client = p.connect(p.DIRECT)
@@ -2350,10 +2474,15 @@ class SurvivorSearchEnv(ParallelEnv):
             bounds["zmax"] - bounds["zmin"],
         )
         dscale = DRONE_TARGET_LONG / longest if longest > 1e-6 else 1.0
+        # The file origin is not the body center. Shift the mesh so the label sits on it.
+        cx = 0.5 * (bounds["xmin"] + bounds["xmax"])
+        cy = 0.5 * (bounds["ymin"] + bounds["ymax"])
+        cz = 0.5 * (bounds["zmin"] + bounds["zmax"])
         self._drone_vis = p.createVisualShape(
             p.GEOM_MESH,
             fileName=drone_path,
             meshScale=[dscale, dscale, dscale],
+            visualFramePosition=[-cx * dscale, -cy * dscale, -cz * dscale],
             rgbaColor=_MESH_RGBA,
             physicsClientId=self.client,
         )
@@ -2526,6 +2655,8 @@ class SurvivorSearchEnv(ParallelEnv):
         self._pace_cached = np.full(self.num_drones, -1, dtype=np.int32)
         self.goal_is_person = np.zeros(self.num_drones, dtype=bool)
         self.wall_cooldown = np.zeros(self.num_drones, dtype=np.int32)
+        self._exit_action = np.full(self.num_drones, 24, dtype=np.int32)
+        self._exit_left = np.zeros(self.num_drones, dtype=np.int32)
         self.town = None
         self.forest_trees = 0
         self.person_ids = []
@@ -2710,15 +2841,15 @@ class SurvivorSearchEnv(ParallelEnv):
             into = _HEADING_XY[block[2]]
             top_tall = self._too_tall_to_clear(pos, block[1])
         self._free_dir[drone_index] = into
-        self._free_n[drone_index] = 0
-        self._free_xy[drone_index, 0] = float(pos[0])
-        self._free_xy[drone_index, 1] = float(pos[1])
         opened = self._open_escape_heading(drone_index, pos, into)
         if top_tall or opened is not None:
             if opened is None:
                 opened = self._heading_index(float(-into[0]), float(-into[1]))
                 if mask[opened] < 0.5:
                     return idx
+            self._free_n[drone_index] = 0
+            self._free_xy[drone_index, 0] = float(pos[0])
+            self._free_xy[drone_index, 1] = float(pos[1])
             self._free_up[drone_index] = False
             self._free_h[drone_index] = opened
             self._free_left[drone_index] = DETOUR_LOCK_STEPS
@@ -2746,9 +2877,13 @@ class SurvivorSearchEnv(ParallelEnv):
                 self.drone_velocities[i] = act * self.drone_max_speed
             else:
                 idx = int(np.clip(np.rint(float(raw[0])) if raw.size else 0, 0, self.n_actions - 1))
-                idx = self._unstick_action(i, idx, self.drone_positions[i])
-                idx = self._pace_override(i, self.drone_positions[i], idx, self.step_count - 1)
-                idx = self._mesh_keep_action(i, idx)
+                if int(self._exit_left[i]) > 0:
+                    idx = int(self._exit_action[i])
+                    self._exit_left[i] -= 1
+                else:
+                    idx = self._unstick_action(i, idx, self.drone_positions[i])
+                    idx = self._pace_override(i, self.drone_positions[i], idx, self.step_count - 1)
+                    idx = self._mesh_keep_action(i, idx)
                 if self.legacy_xy:
                     heading_idx, vz_sign = (8, 0.0) if idx >= 8 else (idx, 0.0)
                 else:
@@ -2781,6 +2916,11 @@ class SurvivorSearchEnv(ParallelEnv):
             elif building_hit:
                 rubble_blocks[i] = True
                 self.drone_velocities[i][:] = 0.0
+
+        for i in range(self.num_drones):
+            if not self.drone_alive[i]:
+                continue
+            self._keep_body_out_of_rubble(i)
 
         self._separate_drones()
         for i in range(self.num_drones):
