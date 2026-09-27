@@ -6,6 +6,7 @@ __pycache__/
 # Environments
 .env
 .venv
+.conda-env/
 env/
 venv/
 ENV/
@@ -17,14 +18,19 @@ ENV/
 *.swo
 
 # Project specific
-# Models generated during training
-models/
-*/models/
+# Trained weight files only (keep models/*.py source tracked)
 *.pth
 *.pt
 *.h5
 *.keras
 *.onnx
+
+# Generated terrain assets
+drone_mesh_rl/envs/ground_texture.png
+drone_mesh_rl/envs/minimap.png
+drone_mesh_rl/envs/rubble_town_road.png
+drone_mesh_rl/envs/terrain.obj
+drone_mesh_rl/envs/terrain.urdf
 
 # Training history and logs
 training_history.json

@@ -40,6 +40,7 @@ from .terrain import Terrain
 from .network import Satellite, calculate_throughput, calculate_link
 from .survivors import SurvivorCluster
 from .weather import WeatherSystem
+from .structures import point_hits_structure
 
 
 class DisasterMeshEnv(ParallelEnv):
@@ -108,7 +109,7 @@ class DisasterMeshEnv(ParallelEnv):
         self.agents = list(self.possible_agents)
 
         # Subsystems (initialized in reset)
-        self.terrain = Terrain(size_x=env_size, size_y=env_size, resolution=1.0)
+        self.terrain = Terrain(size_x=env_size, size_y=env_size, resolution=1.0, seed=seed)
         self.satellite = Satellite(sim_boundary_x=env_size)
         self.survivors = SurvivorCluster(
             num_clusters=num_clusters,
@@ -142,6 +143,7 @@ class DisasterMeshEnv(ParallelEnv):
         self.client = None
         self.drone_ids = []
         self.terrain_body = None
+        self.structure_ids = []
 
         # Observation & action spaces
         obs_dim = 25
@@ -206,11 +208,40 @@ class DisasterMeshEnv(ParallelEnv):
             rgbaColor=[0.2, 0.65, 0.2, 1],
             physicsClientId=self.client,
         )
+        self._spawn_structures()
+
+    def _spawn_structures(self):
+        """Draw the same AABBs the trainer uses as static PyBullet boxes."""
+        self.structure_ids = []
+        for box in self.terrain.structures:
+            half = box.half_extents
+            center = box.center
+            col = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=half.tolist(),
+                physicsClientId=self.client,
+            )
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=half.tolist(),
+                rgbaColor=list(box.rgba),
+                physicsClientId=self.client,
+            )
+            body = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=vis,
+                basePosition=center.tolist(),
+                physicsClientId=self.client,
+            )
+            self.structure_ids.append(body)
 
     def _spawn_drones(self):
         """Spawn drone bodies in PyBullet."""
         self.drone_ids = []
         max_z = float(self.terrain.heightmap.max())
+        if self.terrain.structures:
+            max_z = max(max_z, max(box.zmax for box in self.terrain.structures))
         spawn_z = max_z + 5.0
 
         # Try to load Crazyflie URDF
@@ -295,9 +326,16 @@ class DisasterMeshEnv(ParallelEnv):
         self.step_count = 0
 
         # Reset subsystems
-        self.terrain = Terrain(size_x=self.env_size, size_y=self.env_size, resolution=1.0)
+        self.terrain = Terrain(
+            size_x=self.env_size,
+            size_y=self.env_size,
+            resolution=1.0,
+            seed=self._seed if self._seed is not None else 42,
+        )
         self.satellite.reset()
         self.survivors.reset(seed=self._seed)
+        self.survivors.place_cluster_near(0, [-18.0, 16.0], spread=3.0)
+        self.survivors.keep_clear_of_structures(self.terrain.structures)
         self.weather.reset(seed=self._seed)
 
         # Reset drone state
@@ -389,10 +427,22 @@ class DisasterMeshEnv(ParallelEnv):
             terrain_z = self._get_terrain_height(new_pos[0], new_pos[1])
             new_pos[2] = np.clip(new_pos[2], terrain_z + 0.5, self.drone_max_altitude)
 
-            # Boundary clamping
-            new_pos[0] = np.clip(new_pos[0], -self.env_size / 2, self.env_size / 2)
-            new_pos[1] = np.clip(new_pos[1], -self.env_size / 2, self.env_size / 2)
-
+            # Stay inset on the map (do not allow sitting on / past the rim)
+            xy_lim = max(5.0, self.env_size / 2.0 - 8.0)
+            vel = self.drone_velocities[i].copy()
+            if new_pos[0] > xy_lim:
+                new_pos[0] = xy_lim
+                vel[0] = -abs(self.drone_max_speed) * 0.4
+            elif new_pos[0] < -xy_lim:
+                new_pos[0] = -xy_lim
+                vel[0] = abs(self.drone_max_speed) * 0.4
+            if new_pos[1] > xy_lim:
+                new_pos[1] = xy_lim
+                vel[1] = -abs(self.drone_max_speed) * 0.4
+            elif new_pos[1] < -xy_lim:
+                new_pos[1] = -xy_lim
+                vel[1] = abs(self.drone_max_speed) * 0.4
+            self.drone_velocities[i] = vel
             self.drone_positions[i] = new_pos
 
             # Update PyBullet body
@@ -400,6 +450,9 @@ class DisasterMeshEnv(ParallelEnv):
             p.resetBasePositionAndOrientation(
                 self.drone_ids[i], new_pos.tolist(), orn,
                 physicsClientId=self.client,
+            )
+            p.resetBaseVelocity(
+                self.drone_ids[i], [0, 0, 0], [0, 0, 0], physicsClientId=self.client
             )
 
             # Battery drain
@@ -506,6 +559,8 @@ class DisasterMeshEnv(ParallelEnv):
             pos = self.drone_positions[i]
             terrain_z = self._get_terrain_height(pos[0], pos[1])
             if pos[2] <= terrain_z + 0.2:
+                collisions[i] = True
+            elif point_hits_structure(pos, self.terrain.structures, margin=0.15):
                 collisions[i] = True
         return collisions
 
